@@ -1,0 +1,241 @@
+name: ichibi-lake
+
+services:
+  app:
+    build:
+      # Build from the repo root so the Dockerfile can COPY package.json
+      # and src/ directly.
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ichibi-lake
+    hostname: ichibi-lake
+    # The Node gateway listens on ${PORT:-3000}
+    ports:
+      - "${PORT:-3333}:${PORT:-3000}"
+    environment:
+      # DuckLake metadata Postgres (consumed by src/db.js).
+      - DUCKLAKE_PG_HOST=db
+      - DUCKLAKE_PG_PORT=5432
+      - DUCKLAKE_PG_USER=postgres
+      - DUCKLAKE_PG_PASSWORD=postgres
+      - DUCKLAKE_PG_DB=ducklake
+      # Where DuckLake writes Parquet data files. Persisted via the
+      # bind mount to docker/data/ducklake so records survive container restarts.
+      - DUCKLAKE_DATA_PATH=/app/data_files
+      # Allow the DuckPGQ community extension (SQL/PGQ graph queries).
+      - DUCKDB_ALLOW_COMMUNITY_EXTENSIONS=1
+      # Store BLOBs as separate files on the local filesystem instead of inline
+      # in Parquet. Only filesystem paths are stored in DuckLake tables.
+      - USE_FILESYSTEM_BLOBS=1
+      # Directory where BLOB files are written. Persisted via the bind mount
+      # to docker/data/blobs so files survive container restarts.
+      - BLOBS_PATH=/app/blobs
+      # Gateway API key(s). Comma-separate multiple keys. The default matches
+      # the test key baked into swagger.yaml / test-graphs.js.
+      - API_KEYS=${API_KEYS:-ICHIBI_LAKE_TEST_7a96c3e2-b1fe-4705-9064-fc1882674b13}
+      # Kafka broker(s) for the SSE subscription endpoint and internal consumer.
+      # Comma-separated list. Leave empty if not using Kafka.
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-}
+      # Port the Node gateway listens on.
+      - PORT=${PORT:-3000}
+      # Read-only SQL enforcement for user-supplied SQL endpoints
+      # (/query, /graphql sql resolver, /graphs/:graphName/query). Set to
+      # "false" to disable and allow DDL/DML.
+      - SQL_READ_ONLY=${SQL_READ_ONLY:-true}
+    volumes:
+      # Persist DuckLake Parquet data files across container rebuilds.
+      - ./data/ducklake:/app/data_files
+      # Persist BLOB files across container rebuilds when USE_FILESYSTEM_BLOBS=1.
+      - ./data/blobs:/app/blobs
+    extra_hosts:
+      # Allows the container to reach the Docker host for Kafka brokers etc.
+      - "host.docker.internal:host-gateway"
+    networks:
+      - app-network
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:${PORT:-3000}/swagger.yaml > /dev/null" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  db:
+    container_name: ichibi-lake-postgres
+    image: postgres:17
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=ducklake
+    # No explicit user: set — postgres image runs as root, chowns the data
+    # directory to the internal postgres user (uid 999), then drops privileges.
+    # This works on both macOS and Linux without UID/GID conflicts.
+    #
+    # Logging tuned so Postgres does not write huge log files:
+    # - log_statement=none            → do not log every query (blobs are huge)
+    # - log_min_duration_statement=2000 → only log queries slower than 2 s
+    # - logging_collector=on           → write logs to files inside PGDATA
+    # - log_filename=postgresql-%a.log → rotate by day-of-week name
+    # - log_truncate_on_rotation=on   → overwrite the same day-of-week file,
+    #                                     giving ~7 days retention with no
+    #                                     external cleanup needed.
+    command: >
+      postgres
+      -c log_statement=none
+      -c log_min_messages=warning
+      -c log_min_duration_statement=2000
+      -c log_checkpoints=on
+      -c log_connections=off
+      -c log_disconnections=off
+      -c logging_collector=on
+      -c log_directory=log
+      -c log_filename=postgresql-%a.log
+      -c log_rotation_age=1d
+      -c log_truncate_on_rotation=on
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - app-network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
+  # One-shot init that fixes ownership on the bind-mounted Kafka log dir.
+  # The apache/kafka:4.3.1 image runs as uid 1000 (appuser); a fresh host
+  # bind-mount directory is owned by root, which prevents the broker from
+  # writing meta.properties on first start. Runs as root, chowns, exits.
+  kafka-init:
+    image: apache/kafka:4.3.1
+    container_name: ichibi-lake-kafka-init
+    user: "0:0"
+    entrypoint: ["sh", "-c", "chown -R 1000:1000 /var/lib/kafka/data"]
+    volumes:
+      - ./data/kafka:/var/lib/kafka/data
+    restart: "no"
+
+  kafka:
+    image: apache/kafka:4.3.1
+    container_name: ichibi-lake-kafka
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "9092:9092"
+      # External listener for clients running on the docker host (e.g. the
+      # node integration tests in test/test-kafka-sse.js). The PLAINTEXT
+      # listener advertises kafka:9092 which only resolves inside the docker
+      # network; the EXTERNAL listener advertises localhost:9094 so kafkajs
+      # clients on the host can complete the bootstrap → metadata → produce
+      # round trip without DNS failures.
+      - "9094:9094"
+    environment:
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Allow larger produce requests / records so SSE DuckDB dumps with
+      # base64-encoded BLOB columns are not rejected with MESSAGE_TOO_LARGE.
+      # Must stay in sync with the producer-side KAFKA_MAX_REQUEST_SIZE in the
+      # app service environment.
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
+      # Persist KRaft logs under a bind-mounted directory instead of the
+      # image default (/tmp/kraft-combined-logs) so retention behaviour is
+      # observable on the host and survives container rebuilds.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Retention: cap how long and how big partition logs grow before the
+      # delete-policy cleaner removes old segments. Overridable via .env.
+      # Note: a segment must roll (KAFKA_LOG_SEGMENT_BYTES) before it is
+      # eligible for deletion, so segment size is kept well below retention.
+      KAFKA_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-48}
+      KAFKA_LOG_RETENTION_BYTES: ${KAFKA_LOG_RETENTION_BYTES:-1073741824}
+      KAFKA_LOG_SEGMENT_BYTES: ${KAFKA_LOG_SEGMENT_BYTES:-268435456}
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: ${KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS:-60000}
+      CLUSTER_ID: ichibi-lake-cluster
+    volumes:
+      # Persist Kafka KRaft logs across container rebuilds.
+      - ./data/kafka:/var/lib/kafka/data
+    networks:
+      - app-network
+    healthcheck:
+      test: [ "CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  duckdb-ui:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: ichibi-lake-duckdb-ui
+    # Toggle the DuckDB UI on/off via DUCKDB_UI_ENABLED in .env. Enabled by
+    # default (1); set to 0 to skip starting this service entirely. Implemented
+    # with deploy.replicas because Compose treats replicas=0 as "do not run".
+    deploy:
+      replicas: ${DUCKDB_UI_ENABLED:-1}
+    ports:
+      # The DuckDB UI HTTP server only binds to loopback inside the container
+      # (it resolves "localhost" to the IPv6 [::1] address), so Docker cannot
+      # forward to it directly. We publish the host port to an in-container
+      # socat proxy (listening on 0.0.0.0:14213) which forwards to the UI
+      # server on [::1]:${ui_local_port}. The UI also validates Origin/Referer
+      # against http://localhost:${ui_local_port}, so the host port and
+      # ui_local_port below must stay identical.
+      - "${DUCKDB_UI_PORT:-4213}:14213"
+    stdin_open: true
+    tty: true
+    environment:
+      - ui_local_port=${DUCKDB_UI_PORT:-4213}
+      - DUCKLAKE_PG_HOST=db
+      - DUCKLAKE_PG_PORT=5432
+      - DUCKLAKE_PG_USER=postgres
+      - DUCKLAKE_PG_PASSWORD=postgres
+      - DUCKLAKE_PG_DB=ducklake
+      - DUCKLAKE_DATA_PATH=/app/data_files
+    volumes:
+      - ./data/ducklake:/app/data_files
+    networks:
+      - app-network
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - >
+        socat TCP-LISTEN:14213,fork,reuseaddr TCP6:[::1]:$${ui_local_port} &
+        exec duckdb -unsigned
+        -cmd "INSTALL ducklake; LOAD ducklake;"
+        -cmd "CREATE SECRET (TYPE ducklake, METADATA_PATH 'postgres:host=$${DUCKLAKE_PG_HOST} port=$${DUCKLAKE_PG_PORT} user=$${DUCKLAKE_PG_USER} password=$${DUCKLAKE_PG_PASSWORD} dbname=$${DUCKLAKE_PG_DB}');"
+        -cmd "ATTACH 'ducklake:' AS ducklake (DATA_PATH '$${DUCKLAKE_DATA_PATH}', AUTOMATIC_MIGRATION true); USE ducklake; SET search_path = 'ducklake.main,memory.main';"
+        -ui
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
