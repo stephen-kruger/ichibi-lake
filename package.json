@@ -1,0 +1,35 @@
+{
+  "name": "duckserver",
+  "version": "1.6.18.1",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test/schema-evolution.test.js && node test/kafka-topic-filter.test.js && node test/api.test.js && node test/test-rest.js && node test/test-blob.js && node test/test-graphs.js && node test/test.js && node test/test-kafka-sse.js && node test/test-kafka-retroactive.js",
+    "test:unit": "node test/schema-evolution.test.js && node test/kafka-topic-filter.test.js",
+    "test:kafka-topic-filter": "node test/kafka-topic-filter.test.js",
+    "test:api": "node test/api.test.js",
+    "test:rest": "node test/test-rest.js",
+    "test:graphs": "node test/test-graphs.js",
+    "test:kafka-sink": "node test/test.js",
+    "test:kafka-sse": "node test/test-kafka-sse.js",
+    "test:kafka-retroactive": "node test/test-kafka-retroactive.js",
+    "test:blob": "node test/test-blob.js",
+    "test:stress": "node test/stress-test.js",
+    "superlake": "node scripts/superlake-wizard.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@duckdb/node-api": "1.5.4-r.1",
+    "compression": "^1.8.1",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "graphql": "^16.14.2",
+    "graphql-http": "^1.22.4",
+    "kafkajs": "^2.2.4",
+    "swagger-ui-express": "^5.0.1",
+    "yamljs": "^0.3.0"
+  }
+}

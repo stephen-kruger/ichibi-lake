@@ -1,0 +1,1400 @@
+openapi: 3.0.0
+info:
+  title: iChibi Lake Gateway
+  description: |
+    A set of API services that provide access to the ichibi-lake data lake.
+
+    ### Authorization (ACL-based Access Control)
+    Access to tables is managed via **per-table Access Control Lists (ACLs)**.
+    Each table has two lists of API keys:
+    - **Owner keys** — read-write access (create, read, update, delete rows).
+    - **Reader keys** — read-only access (query and download records).
+
+    The API key that creates a table automatically becomes an owner.
+    ACLs can be retrieved and updated through dedicated management endpoints.
+
+    Authentication is via the `x-api-key` header. Unauthenticated requests are rejected with HTTP 401.
+
+    ### BLOB Management
+    The gateway supports high-performance binary storage with flexible addressing:
+    - **Optional Table Name**: Methods without `{tableName}` default to `ichibi_table`.
+    - **Optional Record ID**: `POST` methods without `{idValue}` automatically generate a random UUID and return it in the response.
+    - **Arbitrary Metadata**: Any additional query parameters passed during `POST` (e.g., `?owner=sara&type=profile`) are automatically added as columns to the record at `/blobs/{blobColumn}`.
+    - **Record Updates**: Use `PATCH` to update metadata for existing records using a JSON body.
+
+    ### Graph Queries (SQL/PGQ)
+    The gateway exposes the DuckDB [DuckPGQ](https://duckpgq.org/) community extension for
+    SQL/PGQ property-graph queries:
+    - Define a named **Property Graph** mapping existing tables to vertices and edges via `POST /graphs`.
+    - List defined graphs via `GET /graphs` and drop them via `DELETE /graphs/{graphName}`.
+    - Run Cypher-like pattern-matching queries against a graph via `POST /graphs/{graphName}/query`.
+  version: 1.6.24.1
+servers:
+  - url: http://ichibi-lake:3333
+    description: ichibi-lake gateway
+security:
+  - ApiKeyAuth: []
+paths:
+  /blobs/{blobColumn}:
+    post:
+      summary: Upload binary BLOB (default table, generated ID)
+      description: Uploads raw binary data to the default 'ichibi_table' and generates a UUID as the record ID.
+      parameters:
+        - in: path
+          name: blobColumn
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+        - in: query
+          name: "[customProperty]"
+          schema: { type: string }
+          description: "Any other query parameter will be added as a column to the record (e.g. ?category=docs)."
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '200':
+          description: BLOB uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  id: { type: string, description: "Generated UUID" }
+                  created: { type: integer, description: "Epoch timestamp when the record was created" }
+                  updated: { type: integer, description: "Epoch timestamp when the record was last updated" }
+        '400':
+          description: Bad request (e.g. invalid blob column name)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /blobs/{idValue}/{blobColumn}:
+    get:
+      summary: Download binary BLOB (default table)
+      description: Returns the raw binary content of a BLOB column for a specific record in the default 'ichibi_table'.
+      parameters:
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: path
+          name: blobColumn
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+        - in: query
+          name: "[customProperty]"
+          schema: { type: string }
+          description: "Any other query parameter will be added as a column to the record (e.g. ?category=docs)."
+      responses:
+        '200':
+          description: Raw binary data
+          content:
+            application/octet-stream: { schema: { type: string, format: binary } }
+        '404':
+          description: Record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Upload binary BLOB (default table)
+      description: Uploads raw binary data to the default 'ichibi_table'.
+      parameters:
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: path
+          name: blobColumn
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+        - in: query
+          name: "[customProperty]"
+          schema: { type: string }
+          description: "Any other query parameter will be added as a column to the record (e.g. ?category=docs)."
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '200':
+          description: BLOB uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  created: { type: integer, description: "Epoch timestamp when the record was created" }
+                  updated: { type: integer, description: "Epoch timestamp when the record was last updated" }
+        '400':
+          description: Bad request (e.g. invalid blob column name)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete binary BLOB (default table)
+      description: Clears the named BLOB column for a specific record in the default 'ichibi_table'. The row itself is preserved; only the BLOB column is set to NULL and, in filesystem mode, the backing file is removed from disk.
+      parameters:
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: path
+          name: blobColumn
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+      responses:
+        '200':
+          description: BLOB cleared successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+        '404':
+          description: Record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /tables/{tableName}/blobs/{blobColumn}:
+    post:
+      summary: Upload binary BLOB (generated ID)
+      description: Uploads raw binary data to a specific table and generates a UUID as the record ID.
+      parameters:
+        - in: path
+          name: tableName
+          required: true
+          schema: { type: string }
+        - in: path
+          name: blobColumn
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+        - in: query
+          name: "[customProperty]"
+          schema: { type: string }
+          description: "Any other query parameter will be added as a column to the record (e.g. ?category=docs)."
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '200':
+          description: BLOB uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  id: { type: string, description: "Generated UUID" }
+                  created: { type: integer, description: "Epoch timestamp when the record was created" }
+                  updated: { type: integer, description: "Epoch timestamp when the record was last updated" }
+        '400':
+          description: Bad request (e.g. invalid blob column name)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /tables/{tableName}/blobs/{idValue}/{blobColumn}:
+    get:
+      summary: Download binary BLOB
+      description: Returns the raw binary content of a BLOB column for a specific record.
+      parameters:
+        - in: path
+          name: tableName
+          required: true
+          schema: { type: string }
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: path
+          name: blobColumn
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+          description: The column name to use for lookup (default 'id').
+      responses:
+        '200':
+          description: Raw binary data
+          content:
+            application/octet-stream: { schema: { type: string, format: binary } }
+        '404':
+          description: Record or BLOB not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Upload binary BLOB
+      description: Uploads raw binary data and associates it with a specific record as a BLOB.
+      parameters:
+        - in: path
+          name: tableName
+          required: true
+          schema: { type: string }
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: path
+          name: blobColumn
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+        - in: query
+          name: "[customProperty]"
+          schema: { type: string }
+          description: "Any other query parameter will be added as a column to the record (e.g. ?category=docs)."
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary } }
+      responses:
+        '200':
+          description: BLOB uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  created: { type: integer, description: "Epoch timestamp when the record was created" }
+                  updated: { type: integer, description: "Epoch timestamp when the record was last updated" }
+        '400':
+          description: Bad request (e.g. invalid blob column or missing data)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete binary BLOB
+      description: Clears the named BLOB column for a specific record. The row itself is preserved; only the BLOB column is set to NULL and, in filesystem mode, the backing file is removed from disk.
+      parameters:
+        - in: path
+          name: tableName
+          required: true
+          schema: { type: string }
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: path
+          name: blobColumn
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+          description: The column name to use for lookup (default 'id').
+      responses:
+        '200':
+          description: BLOB cleared successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+        '404':
+          description: Record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /tables/{tableName}/records/{idValue}:
+    patch:
+      summary: Update record metadata
+      description: Atomically updates arbitrary columns for a specific record using a JSON body.
+      parameters:
+        - in: path
+          name: tableName
+          required: true
+          schema: { type: string }
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+          description: The column name to use for lookup (default 'id').
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: { type: string }
+      responses:
+        '200':
+          description: Record updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  created: { type: integer, description: "Epoch timestamp when the record was created" }
+                  updated: { type: integer, description: "Epoch timestamp when the record was last updated" }
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Table or record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete a record
+      description: Deletes a specific record from the table by its ID value.
+      parameters:
+        - in: path
+          name: tableName
+          required: true
+          schema: { type: string }
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+          description: The column name to use for lookup (default 'id').
+      responses:
+        '200':
+          description: Record deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+        '404':
+          description: Table or record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /records/{idValue}:
+    patch:
+      summary: Update record metadata (default table)
+      description: Atomically updates arbitrary columns for a specific record in the default `ichibi_table`.
+      parameters:
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+          description: The column name to use for lookup (default 'id').
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: { type: string }
+      responses:
+        '200':
+          description: Record updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  created: { type: integer, description: "Epoch timestamp when the record was created" }
+                  updated: { type: integer, description: "Epoch timestamp when the record was last updated" }
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Delete a record (default table)
+      description: Deletes a specific record from the default `ichibi_table` by its ID value.
+      parameters:
+        - in: path
+          name: idValue
+          required: true
+          schema: { type: string }
+        - in: query
+          name: idColumn
+          schema: { type: string, default: id }
+          description: The column name to use for lookup (default 'id').
+      responses:
+        '200':
+          description: Record deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+        '404':
+          description: Record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /tables:
+    get:
+      summary: List all tables
+      description: Returns a list of all user-defined tables in the data lake.
+      responses:
+        '200':
+          description: A list of table names
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  tables:
+                    type: array
+                    items:
+                      type: string
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /tables/{tableName}/schema:
+    get:
+      summary: Get table schema
+      description: Returns the column names and data types for the specified table.
+      parameters:
+        - in: path
+          name: tableName
+          schema:
+            type: string
+          required: true
+          description: The name of the table.
+      responses:
+        '200':
+          description: The table schema
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  tableName:
+                    type: string
+                  schema:
+                    type: array
+                    items:
+                      type: object
+        '404':
+          description: Table not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /tables/{tableName}/acl:
+    get:
+      summary: Get table ACL
+      description: Retrieve the Access Control List for a table, including owner and reader keys. Requires write access to the table.
+      parameters:
+        - in: path
+          name: tableName
+          schema: { type: string }
+          required: true
+          description: The name of the table.
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: ACL data for the table
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  tableName: { type: string }
+                  ownerKeys: { type: array, items: { type: string } }
+                  readerKeys: { type: array, items: { type: string } }
+                  ownerCount: { type: integer }
+                  readerCount: { type: integer }
+        '403':
+          description: Forbidden - no write access to this table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Table not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      summary: Update table ACL
+      description: Update the Access Control List for a table. Requires write access to the table.
+      parameters:
+        - in: path
+          name: tableName
+          schema: { type: string }
+          required: true
+          description: The name of the table.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ownerKeys, readerKeys]
+              properties:
+                ownerKeys:
+                  type: array
+                  items: { type: string }
+                  description: API keys with read-write (owner) access
+                readerKeys:
+                  type: array
+                  items: { type: string }
+                  description: API keys with read-only access
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: ACL updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+        '400':
+          description: Bad request - invalid ownerKeys or readerKeys
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden - no write access to this table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Table not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /tables/{tableName}:
+    get:
+      summary: Query a table (RESTful)
+      description: |
+        Query data from a specific table using query parameters for filtering, sorting, and pagination.
+         Results are filtered based on the calling API key's table-level ACL (read access required).
+      parameters:
+        - in: path
+          name: tableName
+          schema:
+            type: string
+          required: true
+          description: The name of the table to query.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+          description: Maximum number of rows to return.
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+          description: Number of rows to skip.
+        - in: query
+          name: sort
+          schema:
+            type: string
+          description: Column name to sort by. Prefix with '-' for descending order (e.g., `-created_at`).
+        - in: query
+          name: "[columnName]"
+          schema:
+            type: string
+          description: Any other query parameter will be treated as an equality filter on that column (e.g., `?status=active`).
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  tableName:
+                    type: string
+                  rowCount:
+                    type: integer
+                  rows:
+                    type: array
+                    items:
+                      type: object
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /kafka-sink:
+    post:
+      summary: Kafka HTTP Sink Endpoint
+      description: |
+        An endpoint specifically tuned for Kafka Connect HTTP Sink Connectors.
+        It accepts an array of JSON objects. If the objects are wrapped with Kafka standard schemas (e.g. `{"key": ..., "value": ...}`), it safely unwraps to just the `value`.
+
+        ### Target table resolution
+        The target table name is resolved with the following precedence:
+        1. `X-Kafka-Topic` header (after trimming, if non-empty).
+        2. `?topic=` query parameter (after trimming, if non-empty; first non-empty value if the key is repeated).
+        3. The default table `ichibi_table`.
+
+        If both the header and the query parameter are provided and they disagree, the header wins and a warning is logged server-side; the request is **not** rejected.
+
+        ### Identifier validation
+        The resolved topic name is used as a DuckDB / DuckLake table identifier and must match <code>^[A-Za-z_][A-Za-z0-9_]{0,62}$</code> (start with a letter or underscore, only letters/digits/underscores, max 63 characters). Names that do not match are rejected with `400 Bad Request`; no DDL is executed, no row is written, and no entry is registered in the DuckLake metadata catalog.
+
+        ### Schema evolution
+        If the target table does not exist it is created from the incoming messages. If it already exists with a different schema (for example, the default `ichibi_table` was previously populated by `/upload`), any fields present in the incoming messages but missing from the table are added via `ALTER TABLE ... ADD COLUMN` as NULLable columns before the insert. Existing rows receive `NULL` for the newly added columns. Column types are inferred from the incoming JSON.
+      parameters:
+        - in: header
+          name: X-Kafka-Topic
+          schema:
+            type: string
+          required: false
+          description: The Kafka topic used to determine the table name. Defaults to "ichibi_table". Takes precedence over the `?topic=` query parameter.
+          example: user_events
+        - in: query
+          name: topic
+          schema:
+            type: string
+          required: false
+          description: An alternative to passing the topic via header. Ignored when `X-Kafka-Topic` is also provided and non-empty.
+          example: user_events
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+              example: [{"value": {"id": 1, "action": "login"}}]
+      responses:
+        '200':
+          description: Data successfully extracted and ingested
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  created:
+                    type: integer
+                    description: Epoch timestamp when the records were created
+                  updated:
+                    type: integer
+                    description: Epoch timestamp when the records were last updated
+        '400':
+          description: Bad request (body is not a JSON array, or topic name fails identifier validation)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /kafka-subscribe/{topicName}:
+    get:
+      summary: Subscribe to Kafka events via SSE
+      description: |
+        Opens a Server-Sent Events (SSE) stream for a given Kafka topic.
+        Events are streamed as JSON in real-time. The connection stays open
+        until the client disconnects.
+
+        Requires `KAFKA_BROKERS` to be configured on the server.
+        
+        ### Connection Management
+        Each SSE connection creates a dedicated Kafka consumer in its own
+        per-connection group to avoid broker rebalances. The default group ID is
+        `ichibi-lake-sse-<apiKey>-<random>`, so concurrent connections from
+        the same client do not force a broker rebalance on every reconnect. 
+        To share a group across connections (round-robin partition delivery),
+        pass an explicit `?groupId=`.
+        
+        ### Backpressure Handling
+        The server implements backpressure handling through:
+        - **Buffered queue**: Up to 10,000 messages buffered in memory before applying flow control
+        - **Client disconnect detection**: The server detects client disconnects via underlying TCP close event and tears down the Kafka consumer immediately
+        - **15s keepalive**: A 15s SSE keepalive comment is emitted so reverse proxies with idle timeouts do not silently drop the stream
+        
+        ### Retry Strategy
+        Failed Kafka publishes are retried up to 3 times with exponential backoff:
+        - Initial backoff: 100ms
+        - Maximum backoff: 5000ms
+        - Failed messages are logged with their error details for troubleshooting
+        
+        ### SSL/TLS Configuration
+        Kafka connections support SSL/TLS authentication. When connecting to brokers requiring TLS:
+        - Use `ssl.ca.location`, `ssl.certificate.location`, and `ssl.key.location` configuration options
+        - The server will validate broker certificates if `ssl.truststore.location` is configured
+        - SSL connections are secured with TLS 1.2 or higher minimum version
+
+        ### Historic data dump
+        The gateway publishes **all** existing DuckDB rows into Kafka upon
+        subscribe. To limit the dump to recent rows, pass the `?since=`
+        parameter. This triggers a one-time dump of DuckDB rows whose
+        specified column (default `updated`) is newer than the given value,
+        ordered ascending. When `?since=` is omitted, all rows are dumped in
+        ascending order of the specified column.
+      parameters:
+        - in: path
+          name: topicName
+          required: true
+          schema:
+            type: string
+          description: The Kafka topic to subscribe to.
+        - in: query
+          name: groupId
+          required: false
+          schema:
+            type: string
+          description: |
+            Kafka consumer group ID. Defaults to a per-connection unique value
+            `ichibi-lake-sse-<sanitized-api-key>-<random>`. Pass an explicit
+            value to share a group (round-robin delivery) across connections.
+        - in: query
+          name: since
+          required: false
+          schema:
+            type: string
+          description: |
+            Trigger a one-time dump of historic DuckDB rows whose specified
+            column (default `updated`, configurable via `sinceColumn`) is newer
+            than this value. Results are ordered by that column ascending.
+            Supports:
+            - **Absolute ISO 8601** (e.g. `2024-06-09T10:00:00Z`)
+            - **Relative duration** (e.g. `5m`, `1h`, `2d`)
+            - **Plain number** (treated as minutes, e.g. `5`)
+            When omitted, all rows are dumped in ascending order of the specified column.
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Each event is a JSON object in SSE `data:` format:
+                  `{"topic":"...","partition":0,"offset":"42","key":"...","value":"...","timestamp":"..."}`
+
+                  When `?since=` is used, an additional `event: dump-complete`
+                  is sent with a summary of how many rows were published:
+                  `{"table":"...","rowsPublished":N,"rowsSkipped":M}`
+        '400':
+          description: KAFKA_BROKERS not configured
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error (e.g. topic not found)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /graphql:
+    post:
+      summary: GraphQL Endpoint
+      description: |
+        A GraphQL API mapped directly over DuckDB.
+        It supports running raw SQL using the `sql` query, which returns results as JSON.
+        It also allows fetching tables with the `tables` query.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                  description: The GraphQL query.
+                  example: "{ sql(query: \"SELECT * FROM ichibi_table LIMIT 10\") }"
+      responses:
+        '200':
+          description: Query executed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+        '400':
+          description: Bad request (e.g. syntax error in GraphQL query)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+
+  /query:
+    post:
+      summary: Execute a SQL query
+      description: Allows executing arbitrary SQL queries against the DuckLake instance. Only read queries are allowed, any statements which can modify schema, or data, will trigger a security exception, for obvious reasons.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                sql:
+                  type: string
+                  description: The SQL query to execute. Optional if tableName is provided or defaults.
+                  example: "SELECT * FROM ichibi_table LIMIT 10"
+                tableName:
+                  type: string
+                  description: The target table name for the default query if sql is omitted.
+                  example: "ichibi_table"
+      responses:
+        '200':
+          description: Query executed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  rows:
+                    type: array
+                    description: An array of rows containing the query results.
+                    items:
+                      type: array
+                      items:
+                        type: string
+                    example: [["1", "duck"], ["2", "lake"]]
+        '400':
+          description: Bad request (e.g. missing SQL query)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error (e.g. syntax error in SQL)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /upload:
+    post:
+      summary: Upload JSON data to the default table (ichibi_table)
+      description: |
+        Uploads an array of JSON objects. If the table does not exist, it will be created dynamically.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              description: An array of JSON objects representing the rows to insert.
+              items:
+                type: object
+              example:
+                - id: 1
+                  name: duck
+                - id: 2
+                  name: lake
+      responses:
+        '200':
+          description: Data successfully uploaded and inserted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Inserted 2 records into ichibi_table
+                  created:
+                    type: integer
+                    description: Epoch timestamp when the records were created
+                  updated:
+                    type: integer
+                    description: Epoch timestamp when the records were last updated
+        '400':
+          description: Bad request (e.g. payload is not an array)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error or DuckDB catalog error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /upload/{tableName}:
+    post:
+      summary: Upload JSON data to a specific table
+      description: |
+        Uploads an array of JSON objects. If the table does not exist, it will be created dynamically
+        using DuckDB's automatic schema inference. If it exists, records will be appended.
+      parameters:
+        - in: path
+          name: tableName
+          schema:
+            type: string
+          required: true
+          description: The name of the table to insert data into.
+          example: ichibi_table
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              description: An array of JSON objects representing the rows to insert.
+              items:
+                type: object
+              example:
+                - id: 1
+                  name: duck
+                - id: 2
+                  name: lake
+      responses:
+        '200':
+          description: Data successfully uploaded and inserted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Inserted 2 records into test_table
+                  created:
+                    type: integer
+                    description: Epoch timestamp when the records were created
+                  updated:
+                    type: integer
+                    description: Epoch timestamp when the records were last updated
+        '400':
+          description: Bad request (e.g. payload is not an array)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error or DuckDB catalog error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /graphs:
+    get:
+      summary: List all Property Graphs
+      description: |
+        Returns a list of SQL/PGQ Property Graphs currently defined in the DuckLake
+        catalog. Requires the DuckPGQ community extension to be loaded.
+      responses:
+        '200':
+          description: List of property graphs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  graphs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+        '500':
+          description: Server Error (e.g. DuckPGQ extension not available)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Create a Property Graph
+      description: |
+        Defines a named SQL/PGQ Property Graph mapping existing relational tables to
+        vertex and edge tables. This is a wrapper around DuckPGQ's
+        `CREATE PROPERTY GRAPH` statement.
+
+        **Example body**:
+        ```json
+        {
+          "name": "my_graph",
+          "vertexTables": ["users"],
+          "edgeTables": [
+            { "name": "follows", "source": "users", "destination": "users" }
+          ]
+        }
+        ```
+
+        Optional `sourceKey` / `destinationKey` and `sourceRef` / `destinationRef`
+        fields may be supplied on edge entries to pin the joining columns (e.g.
+        `src_id REFERENCES users (id)`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, vertexTables, edgeTables]
+              properties:
+                name:
+                  type: string
+                  description: Graph name.
+                vertexTables:
+                  type: array
+                  description: |
+                    Vertex table definitions. Each item may be a plain table name
+                    or an object of the form `{ name, label?, key? }`.
+                  items:
+                    oneOf:
+                      - type: string
+                      - type: object
+                        properties:
+                          name: { type: string }
+                          label: { type: string }
+                          key: { type: string }
+                edgeTables:
+                  type: array
+                  description: Edge table definitions.
+                  items:
+                    type: object
+                    required: [name, source, destination]
+                    properties:
+                      name: { type: string }
+                      label: { type: string }
+                      source: { type: string, description: Source vertex table name. }
+                      destination: { type: string, description: Destination vertex table name. }
+                      sourceKey: { type: string, description: Column on the edge table referencing the source vertex. }
+                      destinationKey: { type: string, description: Column on the edge table referencing the destination vertex. }
+                      sourceRef: { type: string, description: Column on the source vertex table to reference. }
+                      destinationRef: { type: string, description: Column on the destination vertex table to reference. }
+            example:
+              name: my_graph
+              vertexTables: [users]
+              edgeTables:
+                - name: follows
+                  source: users
+                  destination: users
+      responses:
+        '200':
+          description: Graph created
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /graphs/{graphName}:
+    delete:
+      summary: Drop a Property Graph
+      description: Removes a SQL/PGQ Property Graph definition.
+      parameters:
+        - in: path
+          name: graphName
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Graph dropped
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /graphs/{graphName}/query:
+    post:
+      summary: Run a SQL/PGQ graph query
+      description: |
+        Execute a Cypher-like pattern matching query against the named Property
+        Graph. Either supply a structured request (`match` + `columns`) or pass a
+        raw `graphTable` body containing everything that would appear *inside*
+        `FROM GRAPH_TABLE ( <graphName> ... )`.
+
+        Examples from the DuckPGQ documentation:
+
+        Basic pattern match:
+        ```json
+        {
+          "match": "(a:User)-[f:Follows]->(b:User)",
+          "columns": "a.name AS follower, b.name AS followed"
+        }
+        ```
+
+        Shortest path:
+        ```json
+        {
+          "match": "p = ANY SHORTEST (a:User)-[f:Follows]->+ (b:User)",
+          "where": "a.name = 'Alice'",
+          "columns": "path_length(p) AS distance"
+        }
+        ```
+
+        Raw form (gateway simply wraps with `FROM GRAPH_TABLE (graphName ...)`):
+        ```json
+        {
+          "graphTable": "MATCH (a:User)-[:Follows]->(b:User) COLUMNS (a.name, b.name)"
+        }
+        ```
+      parameters:
+        - in: path
+          name: graphName
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                match:
+                  type: string
+                  description: The pattern portion after `MATCH` (excluding the keyword itself).
+                where:
+                  type: string
+                  description: Optional WHERE clause (excluding the keyword).
+                columns:
+                  type: string
+                  description: Column projection list (excluding the `COLUMNS ( )` wrapper).
+                graphTable:
+                  type: string
+                  description: |
+                    Raw body of the `GRAPH_TABLE(graphName ...)` call (everything
+                    after the graph name). If provided, overrides the structured
+                    fields.
+                limit:
+                  type: integer
+                  default: 100
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  rowCount: { type: integer }
+                  rows:
+                    type: array
+                    items: { type: object }
+        '400':
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
+  schemas:
+    Error:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: string
+          example: "Error message details"
