@@ -227,21 +227,9 @@ By default, all historic DuckDB data is dumped on subscribe.
 
 ---
 
-## 7. Operational Management (PM2)
 
-The gateway is managed by **PM2** for high availability.
 
-- **Restart Service**: `pm2 restart ichibi-lake-gw`
-- **View Logs**: `pm2 logs ichibi-lake-gw`
-- **Check Status**: `pm2 status`
-
-### Automated CI/CD
-The CI/CD monitor automatically redeploys the gateway on GitHub commits:
-```bash
-pm2 start cicd/run.bash --name "ichibi-lake-ci" --interpreter bash
-```
-
-## 8. Testing
+## 7. Testing
 
 ```sh
 npm test                       # run all suites (requires Docker: app, db, kafka)
