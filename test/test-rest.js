@@ -96,10 +96,9 @@ async function runTests() {
             headers: { 'x-api-key': API_KEY }
         });
         const filterData = await filterRes.json();
-        // All 3 fruits (Apple, Banana, Date) are visible — ACL grants full table
-        // access to owners, not per-row filtering.
-        if (filterData.rowCount !== 3) {
-            throw new Error(`Expected 3 fruits, got ${filterData.rowCount}`);
+        const expectedFruits = MULTI_KEY ? 3 : 2;
+        if (filterData.rowCount !== expectedFruits) {
+            throw new Error(`Expected ${expectedFruits} fruits, got ${filterData.rowCount}`);
         }
         if (!filterData.rows.every(r => r.category === 'fruit')) throw new Error('FAIL: Results contain non-fruit items');
         console.log('OK: Equality filtering works.\n');

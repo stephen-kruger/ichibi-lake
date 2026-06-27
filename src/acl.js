@@ -1,4 +1,5 @@
 import { execute, executeWithParams, invalidateColumnCache, VARCHAR } from './db.js';
+import { checkAccess as rbacCheckAccess, isRbacConfigured } from './rbac.js';
 
 const ACL_CACHE_TTL_MS = parseInt(process.env.ACL_CACHE_TTL_MS || '60000', 10);
 const aclCache = new Map();
@@ -57,6 +58,12 @@ export async function ensureTableAcl(tableName, apiKey) {
 }
 
 export async function checkReadAccess(tableName, apiKey) {
+    try {
+        const rbacResult = await rbacCheckAccess(apiKey, tableName, 'read');
+        if (rbacResult) return true;
+    } catch (_) {
+        // RBAC check failed (tables not initialized), fall through
+    }
     const acl = await getTableAcl(tableName);
     if (!acl) return false;
     const key = apiKey || 'public';
@@ -64,6 +71,12 @@ export async function checkReadAccess(tableName, apiKey) {
 }
 
 export async function checkWriteAccess(tableName, apiKey) {
+    try {
+        const rbacResult = await rbacCheckAccess(apiKey, tableName, 'write');
+        if (rbacResult) return true;
+    } catch (_) {
+        // RBAC check failed (tables not initialized), fall through
+    }
     const acl = await getTableAcl(tableName);
     if (!acl) return false;
     const key = apiKey || 'public';
