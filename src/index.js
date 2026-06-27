@@ -22,6 +22,8 @@ import { startKafkaConsumer } from './kafka-consumer.js';
 import { getKafka } from './kafka-producer.js';
 import { migrateTimestamps } from './migrate-timestamps.js';
 import { initAclTable, ensureTableAcl, checkReadAccess, checkWriteAccess, getTableAcl, updateTableAcl, invalidateAclCache, migrateToAcl } from './acl.js';
+import { initRbacTables, bootstrapRbac, isValidApiKey, checkAccess, isRbacConfigured, legacyBootstrap } from './rbac.js';
+import adminRouter from './rbac-api.js';
 import swaggerUi from 'swagger-ui-express';
 import YAML from 'yamljs';
 import { createHandler } from 'graphql-http/lib/use/express';
@@ -182,27 +184,38 @@ app.get('/swagger.yaml', (req, res) => {
 // --- 3. Authenticated API Routes ---
 
 /**
- * Parse valid API keys from environment.
+ * Auth middleware: validates x-api-key against the RBAC user table.
+ * Falls back to legacy API_KEYS env var set when RBAC is not configured.
  */
-function getValidApiKeys() {
-    const multi = process.env.API_KEYS;
-    if (multi) return new Set(multi.split(',').map(k => k.trim()).filter(Boolean));
-    const single = process.env.API_KEY;
-    if (single) return new Set([single]);
-    return new Set();
-}
-
-app.use(['/graphql', '/query', '/kafka-sink', '/kafka-subscribe/:topicName', '/upload', '/upload/:tableName', '/tables', '/tables/:tableName', '/tables/:tableName/schema', '/tables/:tableName/blobs/:idValue/:blobColumn', '/blobs/:idValue/:blobColumn', '/tables/:tableName/blobs/:blobColumn', '/blobs/:blobColumn', '/tables/:tableName/records/:idValue', '/records/:idValue', '/graphs', '/graphs/:graphName', '/graphs/:graphName/query'], (req, res, next) => {
-    const validKeys = getValidApiKeys();
-    if (validKeys.size > 0) {
-        const providedKey = req.headers['x-api-key'];
-        if (!providedKey || !validKeys.has(providedKey)) {
-            console.error(`[Auth] 401 Unauthorized from ${req.ip}. Rejected x-api-key: ${providedKey || 'NONE'}`);
-            return res.status(401).json({ error: 'Unauthorized: Missing or invalid x-api-key' });
-        }
-        req.apiKey = providedKey;
+app.use(['/admin', '/graphql', '/query', '/kafka-sink', '/kafka-subscribe/:topicName', '/upload', '/upload/:tableName', '/tables', '/tables/:tableName', '/tables/:tableName/schema', '/tables/:tableName/blobs/:idValue/:blobColumn', '/blobs/:idValue/:blobColumn', '/tables/:tableName/blobs/:blobColumn', '/blobs/:blobColumn', '/tables/:tableName/records/:idValue', '/records/:idValue', '/graphs', '/graphs/:graphName', '/graphs/:graphName/query'], async (req, res, next) => {
+    const providedKey = req.headers['x-api-key'];
+    if (!providedKey) {
+        return res.status(401).json({ error: 'Unauthorized: Missing x-api-key header' });
     }
-    next();
+
+    try {
+        const rbacValid = await isValidApiKey(providedKey);
+        if (rbacValid) {
+            req.apiKey = providedKey;
+            return next();
+        }
+    } catch (_) {
+        // If RBAC query fails (e.g. tables not initialized yet), fall through
+    }
+
+    const validKeys = (process.env.API_KEYS || process.env.API_KEY || '').split(',').map(k => k.trim()).filter(Boolean);
+    if (validKeys.length > 0 && !validKeys.includes(providedKey)) {
+        console.error(`[Auth] 401 Unauthorized from ${req.ip}. Rejected x-api-key: ${providedKey?.slice(0, 20)}...`);
+        return res.status(401).json({ error: 'Unauthorized: Invalid x-api-key' });
+    }
+
+    if (validKeys.length > 0) {
+        req.apiKey = providedKey;
+        return next();
+    }
+
+    console.error(`[Auth] 401 Unauthorized from ${req.ip}. No valid API keys configured.`);
+    return res.status(401).json({ error: 'Unauthorized: No API keys configured' });
 });
 
 // POST /blobs/:blobColumn - Upload raw binary BLOB (default table, generated ID)
@@ -1593,7 +1606,10 @@ app.post(['/upload', '/upload/:tableName'], async (req, res) => {
     }
 });
 
-// --- 4. Swagger UI ---
+// --- 4. Admin API (RBAC management) ---
+app.use('/admin', adminRouter);
+
+// --- 5. Swagger UI ---
 const swaggerDocument = YAML.load(path.join(process.cwd(), 'swagger.yaml'));
 app.use('/', swaggerUi.serve);
 app.get('/', swaggerUi.setup(swaggerDocument));
@@ -1602,6 +1618,12 @@ app.get('/', swaggerUi.setup(swaggerDocument));
 app.listen(port, '0.0.0.0', async () => {
     console.log(`ichibi-lake server listening on 0.0.0.0:${port}`);
     try {
+        await initRbacTables();
+        if (isRbacConfigured()) {
+            await bootstrapRbac();
+        } else {
+            await legacyBootstrap();
+        }
         await initAclTable();
         await migrateExistingTables();
         await migrateToAcl();

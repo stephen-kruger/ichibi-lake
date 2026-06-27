@@ -33,6 +33,10 @@ services:
       # Gateway API key(s). Comma-separate multiple keys. The default matches
       # the test key baked into swagger.yaml / test-graphs.js.
       - API_KEYS=${API_KEYS:-ICHIBI_LAKE_TEST_7a96c3e2-b1fe-4705-9064-fc1882674b13}
+      # RBAC configuration (overrides API_KEYS when set)
+      - RBAC_SUPERUSERS=${RBAC_SUPERUSERS:-}
+      - RBAC_USERS=${RBAC_USERS:-}
+      - RBAC_TABLE_PERMISSIONS=${RBAC_TABLE_PERMISSIONS:-}
       # Kafka broker(s) for the SSE subscription endpoint and internal consumer.
       # Comma-separated list. Leave empty if not using Kafka.
       - KAFKA_BROKERS=${KAFKA_BROKERS:-}

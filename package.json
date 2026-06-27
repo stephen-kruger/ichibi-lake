@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "node test/schema-evolution.test.js && node test/kafka-topic-filter.test.js && node test/api.test.js && node test/test-rest.js && node test/test-blob.js && node test/test-graphs.js && node test/test.js && node test/test-kafka-sse.js && node test/test-kafka-retroactive.js",
+    "test:rbac": "node test/test-rbac.js",
     "test:unit": "node test/schema-evolution.test.js && node test/kafka-topic-filter.test.js",
     "test:kafka-topic-filter": "node test/kafka-topic-filter.test.js",
     "test:api": "node test/api.test.js",
