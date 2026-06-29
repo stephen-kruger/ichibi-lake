@@ -1,6 +1,5 @@
 import { DuckDBInstance, VARCHAR, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE } from '@duckdb/node-api';
 import fs from 'fs/promises';
-import zlib from 'zlib';
 
 export { VARCHAR, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE };
 
@@ -60,19 +59,11 @@ async function _attachDuckLake(label) {
         console.warn(`[DB:${label}] DuckPGQ disabled via DISABLE_DUCKPGQ=1 (graph queries unavailable).`);
     } else {
         try {
-            // DuckPGQ has no published binary for DuckDB ≥1.5.2, so we
-            // download the last available build (v1.3.1) from the CWI S3
-            // bucket and install it from a local path.
-            const pgqUrl = 'http://duckpgq.s3.eu-north-1.amazonaws.com/v1.3.1/linux_arm64/duckpgq.duckdb_extension.gz';
-            const pgqDest = '/tmp/duckpgq.duckdb_extension';
-            try { await fs.unlink(pgqDest); } catch (_) { /* never mind */ }
-            const resp = await fetch(pgqUrl);
-            if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching DuckPGQ extension`);
-            const buf = Buffer.from(await resp.arrayBuffer());
-            const decompressed = zlib.gunzipSync(buf);
-            await fs.writeFile(pgqDest, decompressed);
-            await conn.run(`FORCE INSTALL '${pgqDest}';`);
-            await conn.run("LOAD 'duckpgq';");
+            // DuckPGQ ships from the DuckDB community extensions repo for this
+            // DuckDB version. INSTALL resolves the correct platform/version
+            // automatically; community extensions are enabled via
+            // DUCKDB_ALLOW_COMMUNITY_EXTENSIONS=1 (see Dockerfile/compose).
+            await conn.run('INSTALL duckpgq FROM community; LOAD duckpgq;');
             console.log(`[DB:${label}] DuckPGQ graph extension loaded.`);
         } catch (pgqErr) {
             console.warn(`[DB:${label}] DuckPGQ extension failed to load (graph queries disabled):`, pgqErr.message || pgqErr);
