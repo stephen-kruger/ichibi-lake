@@ -1,0 +1,29 @@
+# The compose build context is the repo root (see docker/compose.yaml:
+# `context: ..`). Everything below is excluded from the context sent to the
+# Docker daemon. The Dockerfile only needs package.json, package-lock.json,
+# src/ and swagger.yaml, so we keep those and drop the rest.
+
+# Runtime bind-mount state. docker/data/postgres is owned by the postgres
+# user (uid 999) with 0700 perms (set by the postgres-init service), so the
+# host user cannot read it — including it in the build context fails with
+# "error from sender: ... permission denied". It is never a build input.
+docker/data/
+
+# Dependencies are reinstalled inside the image via `npm ci` in the Dockerfile.
+node_modules/
+
+# VCS, local scratch, and editor metadata.
+.git/
+.gitignore
+scratch/
+
+# Tests, examples, and docs are not needed to build/run the gateway image.
+test/
+examples/
+graphics/
+*.md
+image.png
+
+# Local env files must never leak into the image.
+.env
+docker/.env
