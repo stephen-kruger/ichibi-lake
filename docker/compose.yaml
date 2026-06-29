@@ -74,6 +74,27 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # One-shot init that fixes ownership and permissions on the bind-mounted
+  # Postgres data dir before the db service starts. The postgres:17 image runs
+  # the server as its internal postgres user (uid 999) and refuses to start
+  # unless PGDATA is owned by that user AND has 0700/0750 permissions
+  # ("FATAL: data directory ... has invalid permissions"). On host bind mounts
+  # those bits can drift across `docker compose down`/`up` cycles, which is
+  # what breaks the db service on restart. Runs as root, normalises ownership
+  # to 999:999 and the top-level dir to 0700, then exits. This keeps restarts
+  # deterministic without hard-coding host UIDs into the db service itself.
+  postgres-init:
+    image: postgres:17
+    container_name: ichibi-lake-postgres-init
+    user: "0:0"
+    entrypoint:
+      - sh
+      - -c
+      - mkdir -p /var/lib/postgresql/data && chown -R 999:999 /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    restart: "no"
+
   db:
     container_name: ichibi-lake-postgres
     image: postgres:17
@@ -83,9 +104,13 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=ducklake
-    # No explicit user: set — postgres image runs as root, chowns the data
-    # directory to the internal postgres user (uid 999), then drops privileges.
-    # This works on both macOS and Linux without UID/GID conflicts.
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+    # The postgres-init one-shot above normalises PGDATA ownership (uid 999)
+    # and permissions (0700) on every `up`, so the server starts cleanly across
+    # restarts without an explicit user: set and without UID/GID conflicts on
+    # either macOS or Linux.
     #
     # Logging tuned so Postgres does not write huge log files:
     # - log_statement=none            → do not log every query (blobs are huge)
