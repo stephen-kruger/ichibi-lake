@@ -45,6 +45,10 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [10.3 SSE Subscription](#103-sse-subscription)
 - [11. GraphQL](#11-graphql)
 - [12. Graph Queries (SQL/PGQ)](#12-graph-queries-sqlpgq)
+  - [12.1 Architecture: Durable Registry & Lazy Materialization](#121-architecture-durable-registry--lazy-materialization)
+  - [12.2 Defining a Property Graph](#122-defining-a-property-graph)
+  - [12.3 Querying a Graph](#123-querying-a-graph)
+  - [12.4 Listing & Deleting Graphs](#124-listing--deleting-graphs)
 - [13. Testing](#13-testing)
 
 ---
@@ -74,7 +78,7 @@ ICHIBI_LAKE_TEST_7a96c3e2-b1fe-4705-9064-fc1882674b13
 
 ## 2. Architecture
 
-ichibi-lake is a Node.js gateway that wraps a **DuckDB** in-memory instance backed by the **DuckLake** storage extension. Parquet data files are persisted to disk; table metadata (schemas, ACLs) lives in a companion **PostgreSQL** database. BLOBs can be stored as standalone files or inline in Parquet.
+ichibi-lake is a Node.js gateway that wraps a **DuckDB** in-memory instance backed by the **DuckLake** storage extension. Parquet data files are persisted to disk; table metadata (schemas, ACLs, and graph definitions) lives in a companion **PostgreSQL** database. BLOBs can be stored as standalone files or inline in Parquet.
 
 ```
 Client → REST/GraphQL → ichibi-lake gateway → DuckDB (DuckLake) → Parquet files
@@ -82,6 +86,8 @@ Client → REST/GraphQL → ichibi-lake gateway → DuckDB (DuckLake) → Parque
                               ├── Kafka (sink / SSE / consumer)
                               └── Filesystem (blobs)
 ```
+
+The gateway maintains two classes of DuckDB connection: a **primary** pool for DDL, ingestion, and registry writes, and an isolated **user-query** instance for read-only SQL and graph traversals so heavy queries cannot stall ingestion. Durable state (table data, ACLs, RBAC, and **property-graph definitions**) is persisted through DuckLake so it survives restarts and is shared across instances. Property graphs are an exception that DuckPGQ stores only in the in-memory catalog of whichever DuckDB instance created them — ichibi-lake works around this with a **durable graph registry** (see [§12.1](#121-architecture-durable-registry--lazy-materialization)).
 
 ---
 
@@ -640,16 +646,147 @@ A GraphQL endpoint is available at `/graphql` with a dynamic schema built from D
 
 ## 12. Graph Queries (SQL/PGQ)
 
-ichibi-lake supports graph property queries via the **DuckPGQ** community extension (SQL/PGQ). Define named graphs over your relational tables and query them with PGQ `GRAPH_TABLE` syntax.
+ichibi-lake supports graph property queries via the **DuckPGQ** community extension (SQL/PGQ). Define named graphs over your relational tables and query them with PGQ `GRAPH_TABLE` syntax. The extension is loaded automatically at startup and can be disabled with `DISABLE_DUCKPGQ=1`.
+
+> **Compatibility:** DuckPGQ is pinned to **DuckDB 1.5.0**. Running a different DuckDB version may leave the extension unavailable; graph endpoints then return an error indicating DuckPGQ is not loaded.
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `POST` | `/graphs` | Create a named graph from table relationships |
-| `GET` | `/graphs` | List named graphs |
-| `GET` | `/graphs/:graphName` | Get graph metadata |
-| `POST` | `/graphs/:graphName/query` | Execute a PGQ query against the graph |
+| `POST` | `/graphs` | Create (or replace) a named graph from table relationships |
+| `GET` | `/graphs` | List all registered graphs with their definitions |
+| `DELETE` | `/graphs/:graphName` | Drop a graph and remove its registration |
+| `POST` | `/graphs/:graphName/query` | Execute a SQL/PGQ pattern query against the graph |
 
-Disabled by setting `DISABLE_DUCKPGQ=1`.
+### 12.1 Architecture: Durable Registry & Lazy Materialization
+
+DuckPGQ registers a property graph only in the **in-memory catalog** of the single DuckDB instance that ran the `CREATE PROPERTY GRAPH` statement. It is **not** persisted into DuckLake. Without intervention this causes two problems: graph definitions vanish on every restart or instance recreation, and a graph created on the primary instance is invisible to the isolated user-query instance that actually runs `GRAPH_TABLE` queries.
+
+ichibi-lake solves this with a **durable graph registry** plus **lazy materialization**:
+
+1. **Registry (source of truth).** Each definition is stored as JSON in a persistent `_graph_registry` table in DuckLake (`name`, `definition`, `created_at`, `created_by`). Because it lives in DuckLake, it survives restarts and is shared by every gateway instance.
+2. **Write path.** `POST /graphs` validates the body, builds the `CREATE PROPERTY GRAPH` DDL, persists it to the registry, then materializes it on the **primary** instance (dropping any prior version so edits take effect immediately).
+3. **Read path.** `POST /graphs/:graphName/query` runs on the isolated **user-query** instance. Just before executing, a `prepare` hook calls `ensureGraphMaterialized`, which loads the definition from the registry and (re)creates the graph in that instance's catalog if missing. An "already exists" error is treated as success (DuckPGQ has no `CREATE ... IF NOT EXISTS`), and an unregistered graph surfaces as **HTTP 404**.
+
+```
+POST /graphs ─► validate ─► _graph_registry (DuckLake, durable) ─► CREATE on primary
+                                      │
+POST /graphs/:name/query ─► user instance ─► ensureGraphMaterialized() ◄─ reads registry
+                                      └─► graph (re)created in user catalog ─► GRAPH_TABLE runs
+```
+
+The net effect: graphs created on the primary are queryable from the user instance, and definitions survive instance recreation. The registry — not any in-memory catalog — is the single source of truth, so `DELETE` removes the registration and a subsequent query returns 404.
+
+### 12.2 Defining a Property Graph
+
+`POST /graphs` maps relational tables to graph vertices and edges. The body fields are:
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `name` | string | Graph name. Must be a simple identifier (`[A-Za-z_][A-Za-z0-9_]*`). |
+| `vertexTables` | array | Non-empty list of vertex tables. Each entry is a table-name string, or an object `{ name, label?, key? }`. A `key` is only emitted when an explicit `label` is also given (DuckPGQ requires `KEY` to accompany `LABEL`); otherwise DuckPGQ auto-discovers the primary key. |
+| `edgeTables` | array | List of edge definitions (may be empty). |
+
+Each `edgeTables` entry is an object:
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `name` | string | Edge table name (required). |
+| `source` | string | Source vertex table (required). |
+| `destination` | string | Destination vertex table (required). |
+| `sourceKey` | string | Foreign-key column on the edge table referencing the source. |
+| `sourceRef` | string | Referenced column on the source table (used with `sourceKey`). |
+| `destinationKey` | string | Foreign-key column on the edge table referencing the destination. |
+| `destinationRef` | string | Referenced column on the destination table (used with `destinationKey`). |
+| `label` | string | Optional edge label. |
+
+All identifiers are validated; malformed bodies return **HTTP 400**. Re-posting an existing `name` replaces the definition.
+
+```sh
+curl -X POST "http://ichibi-lake:3333/graphs" \
+  -H "x-api-key: YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "social",
+    "vertexTables": ["users"],
+    "edgeTables": [
+      {
+        "name": "follows",
+        "source": "users",
+        "destination": "users",
+        "sourceKey": "src_id",
+        "sourceRef": "id",
+        "destinationKey": "dst_id",
+        "destinationRef": "id"
+      }
+    ]
+  }'
+```
+
+### 12.3 Querying a Graph
+
+`POST /graphs/:graphName/query` runs a SQL/PGQ pattern match. Provide **either** the structured fields or a raw `graphTable` clause:
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `match` | string | PGQ `MATCH` pattern, e.g. `(a:users)-[f:follows]->(b:users)`. |
+| `columns` | string | Projection list for the `COLUMNS (...)` clause. Required with `match`. |
+| `where` | string | Optional `WHERE` predicate. |
+| `graphTable` | string | Raw body placed inside `GRAPH_TABLE (graphName ...)`. Mutually exclusive with `match`/`columns`. |
+| `limit` | number | Optional row limit. |
+
+You must supply either `graphTable`, or **both** `match` and `columns`; otherwise the request returns **HTTP 400**. Queries are subject to the read-only guard (`SQL_READ_ONLY`). Querying a graph that is not registered returns **HTTP 404**.
+
+**Basic MATCH:**
+
+```sh
+curl -X POST "http://ichibi-lake:3333/graphs/social/query" \
+  -H "x-api-key: YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "match": "(a:users)-[f:follows]->(b:users)",
+    "columns": "a.name AS follower, b.name AS followed"
+  }'
+```
+
+**Shortest path:**
+
+```sh
+curl -X POST "http://ichibi-lake:3333/graphs/social/query" \
+  -H "x-api-key: YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "match": "p = ANY SHORTEST (a:users)-[f:follows]->+ (b:users)",
+    "where": "a.name = '\''Alice'\''",
+    "columns": "path_length(p) AS distance"
+  }'
+```
+
+*Response:* `{ "success": true, "rowCount": 2, "rows": [...], "sql": "FROM GRAPH_TABLE (...)" }`
+
+### 12.4 Listing & Deleting Graphs
+
+`GET /graphs` returns every registered graph from the durable registry, regardless of which instance has it materialized:
+
+```sh
+curl -H "x-api-key: YOUR_KEY" "http://ichibi-lake:3333/graphs"
+```
+
+*Response:*
+
+```json
+{
+  "success": true,
+  "graphs": [
+    { "name": "social", "created_at": "...", "created_by": "...", "definition": { "name": "social", "vertexTables": ["users"], "edgeTables": [ ... ] } }
+  ]
+}
+```
+
+`DELETE /graphs/:graphName` removes the registration (source of truth) and drops the materialized catalog entry on the primary instance. After deletion the graph is absent from the listing and querying it returns **HTTP 404**.
+
+```sh
+curl -X DELETE "http://ichibi-lake:3333/graphs/social" -H "x-api-key: YOUR_KEY"
+```
 
 ---
 
@@ -657,11 +794,12 @@ Disabled by setting `DISABLE_DUCKPGQ=1`.
 
 ```sh
 npm test                       # Run all suites (requires Docker: app, db, kafka)
-npm run test:unit              # Unit tests only (schema evolution, topic filter)
+npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter)
+npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
 npm run test:api               # Integration tests
 npm run test:rest              # REST API tests
 npm run test:blob              # BLOB tests
-npm run test:graphs            # Graph query tests
+npm run test:graphs            # Graph query integration tests (registry + lazy materialization)
 npm run test:kafka-sink        # Kafka sink tests
 npm run test:kafka-sse         # Kafka SSE tests
 npm run test:kafka-retroactive # Kafka retroactive (history dump) tests

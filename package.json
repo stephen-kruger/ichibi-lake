@@ -4,9 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node test/schema-evolution.test.js && node test/kafka-topic-filter.test.js && node test/api.test.js && node test/test-rest.js && node test/test-blob.js && node test/test-graphs.js && node test/test.js && node test/test-kafka-sse.js && node test/test-kafka-retroactive.js",
+    "test": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js && node test/api.test.js && node test/test-rest.js && node test/test-blob.js && node test/test-graphs.js && node test/test.js && node test/test-kafka-sse.js && node test/test-kafka-retroactive.js",
     "test:rbac": "node test/test-rbac.js",
-    "test:unit": "node test/schema-evolution.test.js && node test/kafka-topic-filter.test.js",
+    "test:unit": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js",
+    "test:graphs-unit": "node test/graphs.test.js",
     "test:kafka-topic-filter": "node test/kafka-topic-filter.test.js",
     "test:api": "node test/api.test.js",
     "test:rest": "node test/test-rest.js",

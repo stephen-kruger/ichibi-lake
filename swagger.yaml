@@ -28,6 +28,13 @@ info:
     - Define a named **Property Graph** mapping existing tables to vertices and edges via `POST /graphs`.
     - List defined graphs via `GET /graphs` and drop them via `DELETE /graphs/{graphName}`.
     - Run Cypher-like pattern-matching queries against a graph via `POST /graphs/{graphName}/query`.
+
+    Graph definitions are persisted in a **durable registry** in DuckLake, so they survive
+    restarts and are shared across instances. DuckPGQ itself keeps graphs only in the
+    in-memory catalog of the instance that created them, so the gateway lazily re-materializes
+    a graph from the registry on whichever instance runs a query. The registry is the single
+    source of truth; querying a graph that is not registered returns `404`.
+    DuckPGQ is pinned to DuckDB 1.5.0 and can be disabled with `DISABLE_DUCKPGQ=1`.
   version: 1.6.24.1
 servers:
   - url: http://ichibi-lake:3333
@@ -1167,8 +1174,10 @@ paths:
     get:
       summary: List all Property Graphs
       description: |
-        Returns a list of SQL/PGQ Property Graphs currently defined in the DuckLake
-        catalog. Requires the DuckPGQ community extension to be loaded.
+        Returns every SQL/PGQ Property Graph registered in the durable registry
+        (a persistent table in DuckLake), regardless of which instance has it
+        materialized in memory. Each entry includes the parsed `definition` that
+        was used to create it. Requires the DuckPGQ community extension to be loaded.
       responses:
         '200':
           description: List of property graphs
@@ -1184,6 +1193,12 @@ paths:
                       type: object
                       properties:
                         name: { type: string }
+                        created_at: { type: string, format: date-time, description: When the graph was registered. }
+                        created_by: { type: string, nullable: true, description: API key that registered the graph (may be null). }
+                        definition:
+                          type: object
+                          nullable: true
+                          description: The original JSON definition (name, vertexTables, edgeTables) used to build the graph.
         '500':
           description: Server Error (e.g. DuckPGQ extension not available)
           content:
@@ -1196,6 +1211,11 @@ paths:
         Defines a named SQL/PGQ Property Graph mapping existing relational tables to
         vertex and edge tables. This is a wrapper around DuckPGQ's
         `CREATE PROPERTY GRAPH` statement.
+
+        The definition is validated, persisted to the durable registry in DuckLake,
+        then materialized on the primary instance (replacing any prior version of the
+        same name). Other instances re-materialize it lazily on first query. Re-posting
+        an existing `name` therefore replaces the definition everywhere.
 
         **Example body**:
         ```json
@@ -1260,6 +1280,14 @@ paths:
       responses:
         '200':
           description: Graph created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+                  sql: { type: string, description: The CREATE PROPERTY GRAPH statement that was executed. }
         '400':
           description: Invalid request body
           content:
@@ -1276,7 +1304,11 @@ paths:
   /graphs/{graphName}:
     delete:
       summary: Drop a Property Graph
-      description: Removes a SQL/PGQ Property Graph definition.
+      description: |
+        Removes a SQL/PGQ Property Graph from the durable registry (the source of
+        truth) and drops its materialized catalog entry on the primary instance.
+        After deletion the graph no longer appears in `GET /graphs` and querying it
+        returns `404`.
       parameters:
         - in: path
           name: graphName
@@ -1285,6 +1317,12 @@ paths:
       responses:
         '200':
           description: Graph dropped
+        '400':
+          description: Invalid graph name
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Server Error
           content:
@@ -1326,6 +1364,11 @@ paths:
           "graphTable": "MATCH (a:User)-[:Follows]->(b:User) COLUMNS (a.name, b.name)"
         }
         ```
+
+        The query runs on the isolated user-query instance, where the graph is
+        lazily re-materialized from the durable registry just before execution. If
+        the graph is not registered, the request returns `404`. You must provide
+        either `graphTable`, or both `match` and `columns`; otherwise `400`.
       parameters:
         - in: path
           name: graphName
@@ -1369,8 +1412,15 @@ paths:
                   rows:
                     type: array
                     items: { type: object }
+                  sql: { type: string, description: The GRAPH_TABLE query that was executed. }
         '400':
-          description: Invalid request body
+          description: Invalid request body (missing graph name, or neither graphTable nor match+columns supplied)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Property graph is not registered
           content:
             application/json:
               schema:

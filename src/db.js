@@ -1,5 +1,6 @@
 import { DuckDBInstance, VARCHAR, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE } from '@duckdb/node-api';
 import fs from 'fs/promises';
+import { buildCreatePropertyGraphSql } from './graphs.js';
 
 export { VARCHAR, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE };
 
@@ -375,13 +376,20 @@ function releaseUserSlot() {
  * interrupted on a best-effort basis (DuckDB does not guarantee that
  * every operator honours interruption immediately).
  */
-export async function executeUserSql(sql, { timeoutMs = USER_QUERY_TIMEOUT_MS } = {}) {
+export async function executeUserSql(sql, { timeoutMs = USER_QUERY_TIMEOUT_MS, prepare = null } = {}) {
     await acquireUserSlot();
     let conn;
     let timer;
     let timedOut = false;
     try {
         conn = await getUserConnection();
+
+        // Optional per-connection setup (e.g. lazily materializing a property
+        // graph from the durable registry) that must run on this exact
+        // connection before the user SQL — and before the deadline below.
+        if (typeof prepare === 'function') {
+            await prepare(conn);
+        }
 
         // Engine-level deadline (DuckDB ≥ recent versions). If the SET fails
         // we silently fall back to the wall-clock race below.
@@ -427,6 +435,15 @@ export async function executeUserSql(sql, { timeoutMs = USER_QUERY_TIMEOUT_MS } 
  * prevent the gateway from coming up.
  */
 export async function compactDuckLake() {
+    // DuckLake 0.4 (DuckDB 1.5.0, the version pinned here for DuckPGQ
+    // compatibility) has a compaction bug that throws a *fatal* on a background
+    // task thread ("DuckLakeCompaction - expected a single output file"),
+    // poisoning the whole DuckDB instance. Allow skipping maintenance until a
+    // fixed DuckLake build is available for our DuckDB version.
+    if (process.env.DISABLE_DUCKLAKE_COMPACTION === '1') {
+        console.warn('[Compact] Skipped: DISABLE_DUCKLAKE_COMPACTION=1.');
+        return;
+    }
     const start = Date.now();
     console.log('[Compact] Running DuckLake CHECKPOINT (merge_adjacent_files + cleanup)...');
     try {
@@ -446,4 +463,105 @@ export async function compactDuckLake() {
     } catch (err) {
         console.warn('[Compact] merge_adjacent_files also failed:', err.message || err);
     }
+}
+
+// --- Durable property-graph registry ---
+// DuckPGQ property graphs live in a DuckDB instance's in-memory catalog and
+// therefore vanish on restart and are invisible to the isolated user-query
+// instance. To make graphs a durable, cross-instance feature we persist their
+// JSON definitions in a DuckLake table and lazily re-materialize the
+// `CREATE PROPERTY GRAPH` statement on whichever instance needs it.
+
+/**
+ * Create the registry table if it does not yet exist. Persisted in DuckLake so
+ * definitions survive restarts and are shared by every gateway instance.
+ */
+export async function initGraphRegistry() {
+    await execute(`
+        CREATE TABLE IF NOT EXISTS _graph_registry (
+            name VARCHAR,
+            definition VARCHAR,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by VARCHAR
+        )
+    `);
+}
+
+/**
+ * Persist (upsert) a graph definition. DuckLake has no ON CONFLICT support, so
+ * we delete-then-insert. `def` is the raw JSON body accepted by
+ * buildCreatePropertyGraphSql().
+ */
+export async function saveGraphDefinition(name, def, createdBy = null) {
+    const json = JSON.stringify(def);
+    await executeWithParams(`DELETE FROM _graph_registry WHERE name = ?`, [name], [VARCHAR]);
+    await executeWithParams(
+        `INSERT INTO _graph_registry (name, definition, created_by) VALUES (?, ?, ?)`,
+        [name, json, createdBy],
+        [VARCHAR, VARCHAR, VARCHAR]
+    );
+}
+
+/**
+ * Return the parsed JSON definition for a graph, or null when it is not
+ * registered.
+ */
+export async function loadGraphDefinition(name) {
+    const rows = await executeWithParams(
+        `SELECT definition FROM _graph_registry WHERE name = ?`,
+        [name],
+        [VARCHAR]
+    );
+    if (rows.length === 0) return null;
+    try {
+        return JSON.parse(rows[0].definition);
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
+ * List every registered graph with its parsed definition and metadata.
+ */
+export async function listGraphDefinitions() {
+    const rows = await execute(
+        `SELECT name, definition, created_at, created_by FROM _graph_registry ORDER BY name`
+    );
+    return rows.map((r) => {
+        let definition = null;
+        try { definition = JSON.parse(r.definition); } catch (_) { /* leave null */ }
+        return { name: r.name, created_at: r.created_at, created_by: r.created_by, definition };
+    });
+}
+
+/**
+ * Remove a graph definition from the registry. Materialized in-memory catalog
+ * entries are dropped separately by the caller.
+ */
+export async function deleteGraphDefinition(name) {
+    await executeWithParams(`DELETE FROM _graph_registry WHERE name = ?`, [name], [VARCHAR]);
+}
+
+/**
+ * Ensure the named property graph exists in the catalog of `conn`'s instance,
+ * recreating it from the durable registry when missing. Idempotent: DuckPGQ has
+ * no `CREATE PROPERTY GRAPH IF NOT EXISTS`, so an "already exists" error is
+ * treated as success. Throws a 404-tagged error when the graph is unregistered.
+ */
+export async function ensureGraphMaterialized(conn, name) {
+    const def = await loadGraphDefinition(name);
+    if (!def) {
+        const err = new Error(`Property graph '${name}' is not registered.`);
+        err.statusCode = 404;
+        throw err;
+    }
+    const sql = buildCreatePropertyGraphSql(def);
+    try {
+        await conn.run(sql);
+    } catch (err) {
+        const msg = err.message || String(err);
+        if (/already exists/i.test(msg)) return def;
+        throw err;
+    }
+    return def;
 }

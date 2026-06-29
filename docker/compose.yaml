@@ -24,6 +24,11 @@ services:
       - DUCKLAKE_DATA_PATH=/app/data_files
       # Allow the DuckPGQ community extension (SQL/PGQ graph queries).
       - DUCKDB_ALLOW_COMMUNITY_EXTENSIONS=1
+      # DuckLake 0.4 (pinned via DuckDB 1.5.0 for DuckPGQ availability) crashes
+      # during background compaction ("DuckLakeCompaction - expected a single
+      # output file"), which poisons the DuckDB instance. Skip the startup
+      # maintenance until a fixed DuckLake ships for our DuckDB version.
+      - DISABLE_DUCKLAKE_COMPACTION=1
       # Store BLOBs as separate files on the local filesystem instead of inline
       # in Parquet. Only filesystem paths are stored in DuckLake tables.
       - USE_FILESYSTEM_BLOBS=1
