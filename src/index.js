@@ -13,10 +13,17 @@ import {
     getTableColumns,
     invalidateColumnCache,
     compactDuckLake,
+    initGraphRegistry,
+    saveGraphDefinition,
+    loadGraphDefinition,
+    listGraphDefinitions,
+    deleteGraphDefinition,
+    ensureGraphMaterialized,
     VARCHAR,
     BLOB,
     blobValue,
 } from './db.js';
+import { isSafeIdentifier, buildCreatePropertyGraphSql } from './graphs.js';
 import { resolveTypeConflict, formatSchemaDefinition } from './schema-evolution.js';
 import { startKafkaConsumer } from './kafka-consumer.js';
 import { getKafka } from './kafka-producer.js';
@@ -31,6 +38,21 @@ import { buildSchema } from 'graphql';
 
 // Support BigInt serialization in JSON
 BigInt.prototype.toJSON = function () { return this.toString(); };
+
+// Silence a benign, noisy warning from kafkajs. Its RequestQueue computes
+// `throttledUntil - Date.now()` (RequestQueue.scheduleCheckPendingRequests);
+// when not throttled and the pending queue is empty this is a large negative
+// number passed straight to setTimeout, which Node clamps to 1ms and reports as
+// a TimeoutNegativeWarning on every fulfilled request. We drop only that exact
+// kafkajs-originated warning and let every other process warning through.
+const _originalEmitWarning = process.emitWarning.bind(process);
+process.emitWarning = (warning, ...args) => {
+    const type = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].type);
+    if (type === 'TimeoutNegativeWarning' && (new Error().stack || '').includes('kafkajs')) {
+        return;
+    }
+    return _originalEmitWarning(warning, ...args);
+};
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -871,158 +893,59 @@ app.all('/graphql', createHandler({
 }));
 
 // --- Graph Query Endpoints (SQL/PGQ via DuckPGQ) ---
+// Identifier validation (isSafeIdentifier) and CREATE PROPERTY GRAPH DDL
+// generation (buildCreatePropertyGraphSql) live in src/graphs.js so they can be
+// unit-tested in isolation and reused by the durable registry in src/db.js.
 
-/**
- * Lightweight validation: graph, table and column identifiers must match
- * [A-Za-z_][A-Za-z0-9_]*. We do not quote them in emitted DDL because DuckPGQ's
- * parser is strict about graph identifiers.
- */
-function isSafeIdentifier(name) {
-    return typeof name === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
-}
-
-/**
- * Build a `CREATE PROPERTY GRAPH` statement from a JSON definition.
- */
-function buildCreatePropertyGraphSql(def) {
-    const { name, vertexTables, edgeTables } = def || {};
-    if (!isSafeIdentifier(name)) {
-        throw new Error('Invalid or missing "name" (must be a simple identifier).');
-    }
-    if (!Array.isArray(vertexTables) || vertexTables.length === 0) {
-        throw new Error('"vertexTables" must be a non-empty array.');
-    }
-    if (!Array.isArray(edgeTables)) {
-        throw new Error('"edgeTables" must be an array.');
-    }
-
-    const formatVertex = (v) => {
-        if (typeof v === 'string') {
-            if (!isSafeIdentifier(v)) throw new Error(`Invalid vertex table name: ${v}`);
-            return v;
-        }
-        if (v && typeof v === 'object' && isSafeIdentifier(v.name)) {
-            let out = v.name;
-            // DuckPGQ only accepts `KEY (col)` in conjunction with an
-            // explicit `LABEL`. When a label is not provided, omit KEY and
-            // let DuckPGQ auto-discover the primary key.
-            if (v.label) {
-                if (!isSafeIdentifier(v.label)) throw new Error(`Invalid vertex label: ${v.label}`);
-                if (v.key) {
-                    if (!isSafeIdentifier(v.key)) throw new Error(`Invalid vertex key: ${v.key}`);
-                    out += ` KEY (${v.key})`;
-                }
-                out += ` LABEL ${v.label}`;
-            } else if (v.key) {
-                // Key provided without label: silently drop it, since DuckPGQ
-                // does not accept KEY without LABEL. Callers who need an
-                // explicit key must also supply a label.
-            }
-            return out;
-        }
-        throw new Error('Vertex entries must be a string or { name, label?, key? }.');
-    };
-
-    const formatEdge = (e) => {
-        if (!e || typeof e !== 'object') throw new Error('Edge entries must be objects.');
-        const { name: edgeName, source, destination, sourceKey, destinationKey, sourceRef, destinationRef, label } = e;
-        if (!isSafeIdentifier(edgeName)) throw new Error(`Invalid edge table name: ${edgeName}`);
-        if (!isSafeIdentifier(source)) throw new Error(`Invalid edge source: ${source}`);
-        if (!isSafeIdentifier(destination)) throw new Error(`Invalid edge destination: ${destination}`);
-
-        let out = edgeName;
-        if (label) {
-            if (!isSafeIdentifier(label)) throw new Error(`Invalid edge label: ${label}`);
-            out += ` LABEL ${label}`;
-        }
-        // SOURCE [KEY (col) REFERENCES] vertex [(ref)]
-        out += ' SOURCE';
-        if (sourceKey) {
-            if (!isSafeIdentifier(sourceKey)) throw new Error(`Invalid sourceKey: ${sourceKey}`);
-            out += ` KEY (${sourceKey}) REFERENCES ${source}`;
-            if (sourceRef) {
-                if (!isSafeIdentifier(sourceRef)) throw new Error(`Invalid sourceRef: ${sourceRef}`);
-                out += ` (${sourceRef})`;
-            }
-        } else {
-            out += ` ${source}`;
-        }
-        out += ' DESTINATION';
-        if (destinationKey) {
-            if (!isSafeIdentifier(destinationKey)) throw new Error(`Invalid destinationKey: ${destinationKey}`);
-            out += ` KEY (${destinationKey}) REFERENCES ${destination}`;
-            if (destinationRef) {
-                if (!isSafeIdentifier(destinationRef)) throw new Error(`Invalid destinationRef: ${destinationRef}`);
-                out += ` (${destinationRef})`;
-            }
-        } else {
-            out += ` ${destination}`;
-        }
-        return out;
-    };
-
-    const vertexClause = `VERTEX TABLES (${vertexTables.map(formatVertex).join(', ')})`;
-    const edgeClause = edgeTables.length > 0
-        ? ` EDGE TABLES (${edgeTables.map(formatEdge).join(', ')})`
-        : '';
-
-    return `CREATE PROPERTY GRAPH ${name} ${vertexClause}${edgeClause}`;
-}
-
-// GET /graphs - List all property graphs
+// GET /graphs - List all registered property graphs.
+// The durable registry (DuckLake table) is the source of truth, so graphs are
+// listed consistently regardless of which in-memory instance has materialized
+// them.
 app.get('/graphs', async (req, res) => {
     try {
-        // DuckPGQ persists property-graph definitions in an internal table
-        // attached to the in-memory catalog. The exact schema name has
-        // varied across versions; try the ones we know about and return
-        // the first match. We also try a direct PRAGMA which some builds
-        // expose.
-        const candidateQueries = [
-            "SELECT DISTINCT property_graph AS name FROM memory.__duckpgq_internal",
-            "SELECT DISTINCT property_graph AS name FROM __duckpgq_internal",
-            "SELECT property_graph_name AS name FROM __duckpgq_internal.property_graphs",
-            "SELECT property_graph_name AS name FROM duckpgq_show_property_graphs()",
-            "SELECT name FROM duckpgq_property_graphs()",
-        ];
-        let graphs = null;
-        let lastErr;
-        for (const q of candidateQueries) {
-            try {
-                graphs = await execute(q);
-                break;
-            } catch (err) {
-                lastErr = err;
-            }
-        }
-        if (graphs === null) {
-            throw lastErr || new Error('Unable to enumerate property graphs');
-        }
+        const graphs = await listGraphDefinitions();
         res.json({ success: true, graphs });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// POST /graphs - Create a property graph
+// POST /graphs - Create (or replace) a property graph.
+// The definition is validated, persisted to the durable registry, then
+// materialized on the primary instance. Other instances materialize it lazily
+// on first query (see ensureGraphMaterialized).
 app.post('/graphs', async (req, res) => {
     try {
+        // Validate + build first so malformed bodies fail with 400 before we
+        // touch the registry.
         const sql = buildCreatePropertyGraphSql(req.body);
+        const name = req.body.name;
+
+        await saveGraphDefinition(name, req.body, req.apiKey || null);
+
+        // Materialize on the primary instance, replacing any prior version so
+        // an edited definition takes effect immediately here.
+        try { await execute(`DROP PROPERTY GRAPH ${name}`); } catch (_) { /* not yet materialized */ }
         await execute(sql);
-        res.json({ success: true, message: `Property graph ${req.body.name} created`, sql });
+
+        res.json({ success: true, message: `Property graph ${name} created`, sql });
     } catch (error) {
         const status = /Invalid|must be/.test(error.message) ? 400 : 500;
         res.status(status).json({ success: false, error: error.message });
     }
 });
 
-// DELETE /graphs/:graphName - Drop a property graph
+// DELETE /graphs/:graphName - Drop a property graph and remove its registration.
 app.delete('/graphs/:graphName', async (req, res) => {
     try {
         const { graphName } = req.params;
         if (!isSafeIdentifier(graphName)) {
             return res.status(400).json({ success: false, error: 'Invalid graph name' });
         }
-        await execute(`DROP PROPERTY GRAPH ${graphName}`);
+        await deleteGraphDefinition(graphName);
+        // Drop the materialized catalog entry on the primary instance too. The
+        // user instance simply stops being able to re-materialize it.
+        try { await execute(`DROP PROPERTY GRAPH ${graphName}`); } catch (_) { /* not materialized here */ }
         res.json({ success: true, message: `Property graph ${graphName} dropped` });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -1065,8 +988,14 @@ app.post('/graphs/:graphName/query', async (req, res) => {
 
         assertReadOnlySql(sql);
         // Graph queries run on the isolated user instance so a heavy
-        // GRAPH_TABLE traversal cannot stall the primary REST pool.
-        const rows = await executeUserSql(sql);
+        // GRAPH_TABLE traversal cannot stall the primary REST pool. The graph
+        // is lazily (re)materialized from the durable registry on that
+        // instance's connection just before the query runs — this is what makes
+        // graphs created on the primary visible to the user instance. A missing
+        // registration surfaces as a 404 via ensureGraphMaterialized.
+        const rows = await executeUserSql(sql, {
+            prepare: (conn) => ensureGraphMaterialized(conn, graphName),
+        });
         res.json({ success: true, rowCount: rows.length, rows, sql });
     } catch (error) {
         res.status(error.statusCode || 500).json({ success: false, error: error.message });
@@ -1262,6 +1191,7 @@ async function writeHistoricRowsToSSE(topicName, { res, isCancelled, since, sinc
             [tableName], [VARCHAR]
         );
         const colRows = await colResult.getRows();
+        const colTypeMap = new Map(colRows.map(([col, type]) => [col, type]));
         const selectCols = colRows.map(([col, type]) => {
             const safeCol = col.replace(/"/g, '""');
             if (type.toUpperCase().startsWith('TIMESTAMP') || type.toUpperCase().startsWith('DATE')) {
@@ -1271,11 +1201,24 @@ async function writeHistoricRowsToSSE(topicName, { res, isCancelled, since, sinc
         });
         let sql = `SELECT ${selectCols.join(', ')} FROM ${quoted}`;
         const params = [];
+        // Only apply the `since` time filter when the target column actually
+        // exists on the table. Tables without the filter column (default
+        // `updated`) would otherwise raise "column does not exist" and abort
+        // the dump before the dump-complete event is emitted.
         if (since) {
             const filterColumn = sinceColumn || 'updated';
-            const sinceTs = new Date(since).toISOString();
-            sql += ` WHERE "${filterColumn.replace(/"/g, '""')}" >= ? ORDER BY "${filterColumn.replace(/"/g, '""')}" ASC`;
-            params.push(sinceTs);
+            if (colTypeMap.has(filterColumn)) {
+                const colType = (colTypeMap.get(filterColumn) || '').toUpperCase();
+                // Epoch-seconds columns (e.g. BIGINT/INTEGER timestamps that
+                // predate the timestamp migration) can't be compared against an
+                // ISO-8601 string — DuckDB raises a conversion error and the
+                // dump aborts. Detect numeric columns and bind epoch seconds;
+                // otherwise bind an ISO string for native TIMESTAMP/DATE/VARCHAR.
+                const isNumeric = !colType.startsWith('TIMESTAMP') && !colType.startsWith('DATE')
+                    && /INT|DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL/.test(colType);
+                sql += ` WHERE "${filterColumn.replace(/"/g, '""')}" >= ? ORDER BY "${filterColumn.replace(/"/g, '""')}" ASC`;
+                params.push(isNumeric ? Math.floor(new Date(since).getTime() / 1000) : new Date(since).toISOString());
+            }
         }
         const result = await conn.run(sql, params);
         const columns = result.columnNames();
@@ -1625,6 +1568,7 @@ app.listen(port, '0.0.0.0', async () => {
             await legacyBootstrap();
         }
         await initAclTable();
+        await initGraphRegistry();
         await migrateExistingTables();
         await migrateToAcl();
         await migrateTimestamps();

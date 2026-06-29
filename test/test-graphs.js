@@ -187,6 +187,29 @@ async function runTests() {
         if (!dropRes.ok) throw new Error(`FAIL: drop returned ${dropRes.status}`);
         console.log('OK: graph dropped.\n');
 
+        // 9. Durable registry is the source of truth: after the registration is
+        // removed, the graph must no longer appear in the listing and querying
+        // it must fail (the user instance can no longer re-materialize it).
+        console.log('[Test] GET /graphs  — dropped graph no longer listed');
+        const listAfter = await get('/graphs');
+        if (!listAfter.ok) throw new Error(`FAIL: graph list returned ${listAfter.status}`);
+        const namesAfter = (listAfter.body.graphs || []).map((g) => (g.name || '').toLowerCase());
+        if (namesAfter.includes(GRAPH_NAME.toLowerCase())) {
+            throw new Error(`FAIL: dropped graph ${GRAPH_NAME} still present in listing.`);
+        }
+        console.log('OK: dropped graph absent from listing.\n');
+
+        console.log('[Test] POST /graphs/:name/query  — querying a dropped graph fails');
+        const goneRes = await post(`/graphs/${GRAPH_NAME}/query`, {
+            match: `(a:${USERS_TABLE})-[f:${FOLLOWS_TABLE}]->(b:${USERS_TABLE})`,
+            columns: 'a.name AS follower, b.name AS followed',
+        });
+        if (goneRes.ok) throw new Error('FAIL: query against dropped graph unexpectedly succeeded.');
+        if (goneRes.status !== 404) {
+            throw new Error(`FAIL: expected 404 querying dropped graph, got ${goneRes.status}: ${JSON.stringify(goneRes.body)}`);
+        }
+        console.log('OK: querying a dropped graph returns 404 (registry is source of truth).\n');
+
         console.log('--- ALL GRAPH INTEGRATION TESTS PASSED ---');
     } catch (err) {
         console.error('\n!!! GRAPH TEST SUITE FAILED !!!');
