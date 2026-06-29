@@ -29,7 +29,7 @@ RUN arch=$(dpkg --print-architecture) && \
       arm64) cli_arch=linux-arm64 ;; \
       *) echo "Unsupported arch: $arch"; exit 1 ;; \
     esac && \
-    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-${cli_arch}.zip" \
+    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v1.5.0/duckdb_cli-${cli_arch}.zip" \
       -o /tmp/duckdb_cli.zip && \
     unzip -o /tmp/duckdb_cli.zip duckdb -d /usr/local/bin/ && \
     rm /tmp/duckdb_cli.zip && \
