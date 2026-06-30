@@ -31,6 +31,35 @@ const primaryPool = [];
 // tiny row groups (which kills scan performance). Overridable via env var.
 const PARQUET_ROW_GROUP_SIZE = Math.max(1000, parseInt(process.env.PARQUET_ROW_GROUP_SIZE || '100000', 10));
 
+// Optimizers that must be disabled to avoid a DuckDB engine bug that corrupts
+// VARCHAR columns read from DuckLake inline (Postgres-resident) row data under
+// blocking operators (ORDER BY / DISTINCT / GROUP BY). DuckLake exposes
+// *truncated* min/max string statistics for inline columns; DuckDB then (a)
+// propagates those bounds via statistics_propagation and (b) compresses
+// sort/group keys from them via compressed_materialization. Both paths
+// mis-reconstruct the strings, yielding either single-character garbage (a
+// 9-char person_id collapsing to "9") or truncation (e.g. "102020058" ->
+// "1020200" when sorting on the column itself). Disabling statistics_propagation
+// alone fixes every observed case; we also disable compressed_materialization so
+// neither consumer of the bad statistics can resurface the bug.
+//
+// Exported so the regression test (test/order-by-corruption.test.js) asserts the
+// workaround is applied through this exact production path: if the fix is removed
+// or weakened, the test fails.
+export const DISABLED_OPTIMIZERS = 'statistics_propagation,compressed_materialization';
+
+// Apply the DISABLED_OPTIMIZERS workaround instance-wide. SET GLOBAL persists
+// across every connection opened from the same DuckDBInstance, so this is run
+// once per instance during attach. Non-destructive; logs and swallows errors so
+// a setting failure does not prevent the gateway from coming up.
+export async function applyOptimizerWorkaround(conn, label = 'db') {
+    try {
+        await conn.run(`SET GLOBAL disabled_optimizers = '${DISABLED_OPTIMIZERS}';`);
+    } catch (optErr) {
+        console.warn(`[DB:${label}] Could not disable corruption-triggering optimizers:`, optErr.message || optErr);
+    }
+}
+
 // Configure a fresh in-memory DuckDB instance to act as a DuckLake gateway.
 // Used for both the primary instance (writes + reads) and the isolated user-
 // query instance (read-only ad-hoc SQL) so they share the same setup path.
@@ -82,6 +111,11 @@ async function _attachDuckLake(label) {
     const escapedDataPath = dataPath.replace(/'/g, "''");
     await conn.run(`ATTACH 'ducklake:' AS ducklake (DATA_PATH '${escapedDataPath}', AUTOMATIC_MIGRATION true);`);
     await conn.run("USE ducklake;");
+
+    // Workaround for a DuckDB optimizer bug that corrupts inline DuckLake VARCHAR
+    // columns under blocking operators. See DISABLED_OPTIMIZERS above for the full
+    // rationale; applied instance-wide so every connection inherits it.
+    await applyOptimizerWorkaround(conn, label);
 
     console.log(`[DB:${label}] Successfully attached to remote DuckLake database '${pgDb}'.`);
 
@@ -212,7 +246,7 @@ async function _readRows(result) {
     };
 
     if (typeof rowSet[Symbol.asyncIterator] === 'function' || typeof rowSet[Symbol.iterator] === 'function') {
-        for await (const row of rowSet) {
+        for (const row of rowSet) {
             const obj = {};
             columns.forEach((col, idx) => { obj[col] = convertValue(row[idx]); });
             results.push(obj);

@@ -266,7 +266,7 @@ services:
         exec duckdb -unsigned
         -cmd "INSTALL ducklake; LOAD ducklake;"
         -cmd "CREATE SECRET (TYPE ducklake, METADATA_PATH 'postgres:host=$${DUCKLAKE_PG_HOST} port=$${DUCKLAKE_PG_PORT} user=$${DUCKLAKE_PG_USER} password=$${DUCKLAKE_PG_PASSWORD} dbname=$${DUCKLAKE_PG_DB}');"
-        -cmd "ATTACH 'ducklake:' AS ducklake (DATA_PATH '$${DUCKLAKE_DATA_PATH}', AUTOMATIC_MIGRATION true); USE ducklake; SET search_path = 'ducklake.main,memory.main';"
+        -cmd "ATTACH 'ducklake:' AS ducklake (DATA_PATH '$${DUCKLAKE_DATA_PATH}', AUTOMATIC_MIGRATION true); USE ducklake; SET GLOBAL disabled_optimizers = 'statistics_propagation,compressed_materialization'; SET search_path = 'ducklake.main,memory.main';"
         -ui
     restart: unless-stopped
 
