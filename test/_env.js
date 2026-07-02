@@ -32,6 +32,6 @@ export const KEYS = KEYS_RAW ? KEYS_RAW.split(',').map(s => s.trim()).filter(Boo
 
 const PORT_FROM_ENV = envValue('PORT') || envValue('TAILSCALE_PORT') || '3333';
 
-export const API_KEY  = process.env.API_KEY     || KEYS[0] || '';
+export const API_KEY  = process.env.API_KEY     || KEYS[0] || 'ICHIBI_LAKE_TEST_7a96c3e2-b1fe-4705-9064-fc1882674b13';
 export const ALT_KEY  = process.env.ALT_API_KEY || KEYS[1] || API_KEY;
 export const BASE_URL = process.env.BASE_URL    || `http://localhost:${PORT_FROM_ENV}`;
