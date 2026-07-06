@@ -157,6 +157,25 @@ function assertReadOnlySql(sql) {
 
 console.log(`[Security] SQL_READ_ONLY=${SQL_READ_ONLY} (user-supplied SQL endpoints ${SQL_READ_ONLY ? 'will reject' : 'will accept'} DDL/DML).`);
 
+// Reject SQL/PGQ pattern fragments (match / where / columns / graphTable) that
+// contain statement terminators or comment sequences. These are the injection
+// vectors for the GRAPH_TABLE(...) body: a semicolon allows statement stacking
+// (e.g. "...) ; SELECT * FROM _table_acls --") and comment sequences let an
+// attacker smuggle tokens past the read-only keyword scanner (which strips
+// comments before scanning). None of these appear in valid PGQ patterns
+// (which use ->, ->+ and -[...]->), so rejecting them is safe.
+const GRAPH_FRAGMENT_FORBIDDEN_RE = /;|--|\/\*|\*\//;
+function assertSafeGraphFragment(value, kind = 'graph query fragment') {
+    if (value == null) return;
+    if (GRAPH_FRAGMENT_FORBIDDEN_RE.test(String(value))) {
+        const err = new Error(
+            `Invalid ${kind}: statement terminators (";") and SQL comments ("--", "/*", "*/") are not allowed.`
+        );
+        err.statusCode = 400;
+        throw err;
+    }
+}
+
 // Ensure the blobs directory exists at startup when filesystem mode is enabled.
 if (USE_FILESYSTEM_BLOBS) {
     fsSync.mkdirSync(BLOBS_PATH, { recursive: true });
@@ -268,57 +287,82 @@ app.post(['/tables/:tableName/blobs/:idValue/:blobColumn', '/blobs/:idValue/:blo
         // When filesystem mode is enabled, the blob column stores a file path (VARCHAR).
         // Column type checking/adjustment is handled consistently below.
         await withConnection(async (conn) => {
+            // All schema probes and DDL below MUST run on this same `conn` — the
+            // one that later performs the INSERT/UPDATE. DuckLake gives each
+            // connection its own catalog snapshot, so running an
+            // `ALTER TABLE ADD COLUMN` on a *different* pooled connection (via
+            // execute()/executeWithParams()) can leave `conn` with a stale view
+            // in which the freshly-added column silently binds to NULL instead of
+            // persisting the supplied metadata. Keeping DDL + DML on one
+            // connection guarantees the INSERT sees the columns it just created.
+            const columnExists = async (col) => {
+                const r = await conn.run(
+                    `SELECT count(*) as count FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
+                    [tableName, col], [VARCHAR, VARCHAR]
+                );
+                const rows = await r.getRows();
+                return rows && rows[0] && parseInt(rows[0][0]) > 0;
+            };
+
             // 0. Check table existence and ACL before proceeding.
-            const tableExistsCheck = await executeWithParams(
+            const tableExistsResult = await conn.run(
                 `SELECT count(*) as count FROM information_schema.tables WHERE table_name = ?`,
                 [tableName], [VARCHAR]
             );
-            const tableExists = tableExistsCheck[0] && parseInt(tableExistsCheck[0].count) > 0;
+            const tableExistsRows = await tableExistsResult.getRows();
+            const tableExists = tableExistsRows && tableExistsRows[0] && parseInt(tableExistsRows[0][0]) > 0;
             if (tableExists) {
                 await requireWriteAccess(tableName, req);
             }
 
             // 1. Ensure row and metadata columns exist (shared logic for both modes).
-            const checkResult = await executeWithParams(
-                `SELECT count(*) as count FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
-                [tableName, blobColumn], [VARCHAR, VARCHAR]
-            );
-            const colExists = checkResult[0] && parseInt(checkResult[0].count) > 0;
+            const colExists = await columnExists(blobColumn);
 
             let tableCreated = false;
+            let raceExisting = false;
             if (!colExists) {
-                if (tableExists) {
+                if (!tableExists) {
                     const colType = USE_FILESYSTEM_BLOBS ? 'VARCHAR' : 'BLOB';
-                    await execute(`ALTER TABLE "${tableName}" ADD COLUMN "${blobColumn}" ${colType}`);
+                    try {
+                        await conn.run(`CREATE TABLE "${tableName}" ("${idColumn}" VARCHAR, "${blobColumn}" ${colType}, "created" TIMESTAMP, "updated" TIMESTAMP)`);
+                        tableCreated = true;
+                        await ensureTableAcl(tableName, req.apiKey);
+                        invalidateColumnCache(tableName);
+                    } catch (createErr) {
+                        // A concurrent request created the table between our
+                        // existence check and this CREATE. Treat it as an
+                        // existing table: enforce write access before touching
+                        // its data and fall through to the ALTER path below.
+                        if (/already exists/i.test(createErr.message || '')) {
+                            invalidateColumnCache(tableName);
+                            await requireWriteAccess(tableName, req);
+                            raceExisting = true;
+                        } else {
+                            throw createErr;
+                        }
+                    }
+                }
+
+                if (tableExists || raceExisting) {
+                    const colType = USE_FILESYSTEM_BLOBS ? 'VARCHAR' : 'BLOB';
+                    if (!(await columnExists(blobColumn))) {
+                        await conn.run(`ALTER TABLE "${tableName}" ADD COLUMN "${blobColumn}" ${colType}`);
+                    }
 
                     for (const metaCol of ['created', 'updated']) {
-                        const metaColCheck = await executeWithParams(
-                            `SELECT count(*) as count FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
-                            [tableName, metaCol], [VARCHAR, VARCHAR]
-                        );
-                        if (!metaColCheck[0] || parseInt(metaColCheck[0].count) === 0) {
-                            await execute(`ALTER TABLE "${tableName}" ADD COLUMN "${metaCol}" TIMESTAMP`);
+                        if (!(await columnExists(metaCol))) {
+                            await conn.run(`ALTER TABLE "${tableName}" ADD COLUMN "${metaCol}" TIMESTAMP`);
                         }
                     }
 
-                    invalidateColumnCache(tableName);
-                } else {
-                    const colType = USE_FILESYSTEM_BLOBS ? 'VARCHAR' : 'BLOB';
-                    await execute(`CREATE TABLE "${tableName}" ("${idColumn}" VARCHAR, "${blobColumn}" ${colType}, "created" TIMESTAMP, "updated" TIMESTAMP)`);
-                    tableCreated = true;
-                    await ensureTableAcl(tableName, req.apiKey);
                     invalidateColumnCache(tableName);
                 }
             }
 
             // 1b. Ensure metadata columns exist
             for (const metaKey of Object.keys(metadata)) {
-                const metaCheck = await executeWithParams(
-                    `SELECT count(*) as count FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
-                    [tableName, metaKey], [VARCHAR, VARCHAR]
-                );
-                if (!metaCheck[0] || parseInt(metaCheck[0].count) === 0) {
-                    await execute(`ALTER TABLE "${tableName}" ADD COLUMN "${metaKey}" VARCHAR`);
+                if (!(await columnExists(metaKey))) {
+                    await conn.run(`ALTER TABLE "${tableName}" ADD COLUMN "${metaKey}" VARCHAR`);
                     invalidateColumnCache(tableName);
                     console.log(`[Metadata] Added column ${metaKey} to ${tableName}`);
                 }
@@ -329,19 +373,29 @@ app.post(['/tables/:tableName/blobs/:idValue/:blobColumn', '/blobs/:idValue/:blo
                 await applyDefaultPartitioning(tableName);
             }
 
-            // 2. Check if record exists
-            let existSql = `SELECT count(*) as count FROM "${tableName}" WHERE CAST("${idColumn}" AS VARCHAR) = ?`;
-            const existParams = [idValue];
-            const existTypes = [VARCHAR];
-            const existRes = await executeWithParams(existSql, existParams, existTypes);
-            const recordExists = existRes[0] && parseInt(existRes[0].count) > 0;
+            // 2. Check if record exists (on `conn` so it shares the catalog
+            // snapshot with the DDL above and the INSERT/UPDATE below).
+            const existResult = await conn.run(
+                `SELECT count(*) as count FROM "${tableName}" WHERE CAST("${idColumn}" AS VARCHAR) = ?`,
+                [idValue], [VARCHAR]
+            );
+            const existRows = await existResult.getRows();
+            const recordExists = existRows && existRows[0] && parseInt(existRows[0][0]) > 0;
 
             // 3. Persist blob data
             if (USE_FILESYSTEM_BLOBS) {
                 // --- Filesystem mode: write binary data to a file, store the file path ---
-                const filePath = path.join(BLOBS_PATH, idValue);
-                await fs.writeFile(filePath, Buffer.from(binaryData));
-                console.log(`[Blobs] Saved file to filesystem: ${filePath} (${binaryData.length} bytes)`);
+                
+                // Validate and sanitize idValue for filesystem safety
+                const safeId = idValue.replace(/[^a-zA-Z0-9\-_\.]/g, '_');
+                const filePath = path.join(BLOBS_PATH, safeId);
+                
+                try {
+                    await fs.writeFile(filePath, Buffer.from(binaryData));
+                    console.log(`[Blobs] Saved file to filesystem: ${filePath} (${binaryData.length} bytes)`);
+                } catch (fsErr) {
+                    throw new Error(`Failed to write blob file: ${fsErr.message}`);
+                }
 
                 if (recordExists) {
                     // UPDATE: set blob file path + metadata
@@ -363,11 +417,12 @@ app.post(['/tables/:tableName/blobs/:idValue/:blobColumn', '/blobs/:idValue/:blo
                     await conn.run(updateSql, params, types);
                 } else {
                     // Ensure idColumn is VARCHAR to support UUID-based blob IDs
-                    const idColCheck = await executeWithParams(
+                    const idColResult = await conn.run(
                         `SELECT data_type FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
                         [tableName, idColumn], [VARCHAR, VARCHAR]
                     );
-                    const idColType = idColCheck[0]?.data_type;
+                    const idColRows = await idColResult.getRows();
+                    const idColType = idColRows && idColRows[0] ? idColRows[0][0] : undefined;
                     if (idColType && (idColType.includes('INT') || idColType.includes('FLOAT') || idColType.includes('DOUBLE'))) {
                         console.log(`[Blobs] Converting ${idColumn} from ${idColType} to VARCHAR to accept UUID-based IDs`);
                         await conn.run(`ALTER TABLE "${tableName}" ALTER COLUMN "${idColumn}" SET DATA TYPE VARCHAR`);
@@ -416,11 +471,12 @@ app.post(['/tables/:tableName/blobs/:idValue/:blobColumn', '/blobs/:idValue/:blo
                     await conn.run(updateSql, params, types);
                 } else {
                     // Ensure idColumn is VARCHAR to support UUID-based blob IDs
-                    const idColCheck = await executeWithParams(
+                    const idColResult = await conn.run(
                         `SELECT data_type FROM information_schema.columns WHERE table_name = ? AND column_name = ?`,
                         [tableName, idColumn], [VARCHAR, VARCHAR]
                     );
-                    const idColType = idColCheck[0]?.data_type;
+                    const idColRows = await idColResult.getRows();
+                    const idColType = idColRows && idColRows[0] ? idColRows[0][0] : undefined;
                     if (idColType && (idColType.includes('INT') || idColType.includes('FLOAT') || idColType.includes('DOUBLE'))) {
                         console.log(`[Blobs] Converting ${idColumn} from ${idColType} to VARCHAR to accept UUID-based IDs`);
                         await conn.run(`ALTER TABLE "${tableName}" ALTER COLUMN "${idColumn}" SET DATA TYPE VARCHAR`);
@@ -449,7 +505,7 @@ app.post(['/tables/:tableName/blobs/:idValue/:blobColumn', '/blobs/:idValue/:blo
         res.json({ success: true, message: `BLOB uploaded to ${tableName}.${blobColumn}`, id: idValue });
     } catch (error) {
         console.error('Blob upload error:', error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
 });
 
@@ -510,7 +566,7 @@ app.get(['/tables/:tableName/blobs/:idValue/:blobColumn', '/blobs/:idValue/:blob
         res.setHeader('Content-Length', buffer.length);
         res.send(buffer);
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
 });
 
@@ -641,7 +697,7 @@ app.patch(['/tables/:tableName/records/:idValue', '/records/:idValue'], async (r
         });
     } catch (error) {
         console.error('Update error:', error);
-        res.status(500).json({ success: false, error: error.message });
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
 });
 
@@ -680,17 +736,28 @@ app.delete(['/tables/:tableName/records/:idValue', '/records/:idValue'], async (
     }
 });
 
-// GET /tables - List all tables
+// GET /tables - List tables the caller is allowed to read.
+//
+// Previously this returned every table (including internal "_"-prefixed
+// bookkeeping tables like _table_acls / _rbac_config) to any authenticated
+// key, which is an information-disclosure gap. We now hide internal tables and
+// filter the remainder through the same read-ACL check used by the data
+// endpoints so the catalog can never reveal tables the caller cannot access.
 app.get('/tables', async (req, res) => {
     try {
         const dbList = await execute('PRAGMA database_list');
         console.log(`[Diagnostic] Database List: ${JSON.stringify(dbList)}`);
 
         const rows = await execute('SHOW TABLES');
-        const uniqueTables = [...new Set(rows.map(r => r.name))];
-        res.json({ success: true, tables: uniqueTables });
+        const candidates = [...new Set(rows.map(r => r.name))].filter(name => !name.startsWith('_'));
+
+        const visible = [];
+        for (const name of candidates) {
+            if (await checkReadAccess(name, req.apiKey)) visible.push(name);
+        }
+        res.json({ success: true, tables: visible });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
 });
 
@@ -880,7 +947,9 @@ const root = {
     tables: async () => {
         try {
             const rows = await execute('SHOW TABLES');
-            return [...new Set(rows.map(r => r.name))];
+            // Hide internal "_"-prefixed bookkeeping tables (_table_acls,
+            // _rbac_config, ...) from the catalog, matching GET /tables.
+            return [...new Set(rows.map(r => r.name))].filter(name => !name.startsWith('_'));
         } catch (error) {
             throw new Error(error.message);
         }
@@ -962,6 +1031,15 @@ app.post('/graphs/:graphName/query', async (req, res) => {
 
         const body = req.body || {};
         const { match, where, columns, graphTable, limit } = body;
+
+        // Block statement stacking / comment injection in the user-supplied
+        // pattern fragments before they are concatenated into the GRAPH_TABLE
+        // body below. assertReadOnlySql (further down) only blocks DDL/DML
+        // keywords and cannot see tokens hidden behind a stacked statement.
+        assertSafeGraphFragment(graphTable, 'graphTable');
+        assertSafeGraphFragment(match, 'match');
+        assertSafeGraphFragment(where, 'where');
+        assertSafeGraphFragment(columns, 'columns');
 
         let innerBody;
         if (graphTable && typeof graphTable === 'string' && graphTable.trim()) {
@@ -1056,10 +1134,11 @@ app.post('/kafka-sink', async (req, res) => {
         return res.status(400).json({ error: 'Expected an array of messages' });
     }
 
+    const tempFileName = `kafka_sink_${randomUUID()}.json`;
+    const tempFilePath = path.join(process.cwd(), tempFileName);
+
     try {
         const targetApiKey = req.apiKey || '';
-        const tempFileName = `kafka_sink_${randomUUID()}.json`;
-        const tempFilePath = path.join(process.cwd(), tempFileName);
 
         // Write incrementally to avoid memory exhaustion on large payloads
         const fileHandle = await fs.open(tempFilePath, 'w');
@@ -1086,12 +1165,29 @@ app.post('/kafka-sink', async (req, res) => {
         let createdTable = false;
 
         await withConnection(async (conn) => {
+            // Create the table when it does not appear to exist yet. Catch the
+            // "already exists" race (concurrent sink/upload for the same topic)
+            // and fall through to the existing-table path, which enforces write
+            // access before appending the losing request's messages.
+            let mustEvolveExisting = tableExists;
             if (!tableExists) {
-                await conn.run(`CREATE TABLE "${topic}" AS SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-                createdTable = true;
-                await ensureTableAcl(topic, targetApiKey);
-                invalidateColumnCache(topic);
-            } else {
+                try {
+                    await conn.run(`CREATE TABLE "${topic}" AS SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
+                    createdTable = true;
+                    await ensureTableAcl(topic, targetApiKey);
+                    invalidateColumnCache(topic);
+                } catch (createErr) {
+                    if (/already exists/i.test(createErr.message || '')) {
+                        invalidateColumnCache(topic);
+                        mustEvolveExisting = true;
+                    } else {
+                        throw createErr;
+                    }
+                }
+            }
+
+            if (mustEvolveExisting) {
+                await requireWriteAccess(topic, req);
                 // Schema Evolution: add any columns present in the incoming
                 // messages that the existing target table does not yet have.
                 // For STRUCT columns with different shapes, widen the column
@@ -1153,10 +1249,13 @@ app.post('/kafka-sink', async (req, res) => {
 
         if (createdTable) await applyDefaultPartitioning(topic);
 
-        await fs.unlink(tempFilePath);
         res.json({ success: true, message: `Sinked ${data.length} messages to ${topic}` });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    } finally {
+        // Always remove the spooled payload, even on the error paths, so a
+        // failed sink cannot leak the request's JSON to disk indefinitely.
+        try { await fs.unlink(tempFilePath); } catch (e) { /* already gone */ }
     }
 });
 
@@ -1473,12 +1572,29 @@ app.post(['/upload', '/upload/:tableName'], async (req, res) => {
         let createdTable = false;
 
         await withConnection(async (conn) => {
+            // Attempt to create the table when it does not appear to exist yet.
+            // A concurrent /upload for the same name can win the race between our
+            // existence check above and this CREATE; we catch "already exists"
+            // and fall through to the existing-table path, which enforces write
+            // access before inserting the losing request's rows.
+            let mustEvolveExisting = tableExists;
             if (!tableExists) {
-                await conn.run(`CREATE TABLE "${tableName}" AS SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-                createdTable = true;
-                await ensureTableAcl(tableName, targetApiKey);
-                invalidateColumnCache(tableName);
-            } else {
+                try {
+                    await conn.run(`CREATE TABLE "${tableName}" AS SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
+                    createdTable = true;
+                    await ensureTableAcl(tableName, targetApiKey);
+                    invalidateColumnCache(tableName);
+                } catch (createErr) {
+                    if (/already exists/i.test(createErr.message || '')) {
+                        invalidateColumnCache(tableName);
+                        mustEvolveExisting = true;
+                    } else {
+                        throw createErr;
+                    }
+                }
+            }
+
+            if (mustEvolveExisting) {
                 await requireWriteAccess(tableName, req);
                 // Schema Evolution: Add missing columns.
                 // For STRUCT columns with different shapes, widen the column

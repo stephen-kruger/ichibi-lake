@@ -2,8 +2,13 @@
 import { API_KEY, BASE_URL } from './_env.js';
 
 async function test() {
+    // Use an isolated, uniquely-suffixed table for the default-upload smoke
+    // test so it never collides with test-blob.js on the shared 'ichibi_table'
+    // (test.js seeds numeric ids; test-blob.js needs VARCHAR ids).
+    const uploadTable = `upload_smoke_${Date.now()}`;
+
     console.log('Testing upload...');
-    const uploadRes = await fetch(`${BASE_URL}/upload`, {
+    const uploadRes = await fetch(`${BASE_URL}/upload/${uploadTable}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
         body: JSON.stringify([{ id: 1, name: "duck" }, { id: 2, name: "lake" }])
@@ -34,11 +39,11 @@ async function test() {
     const queryRes = await fetch(`${BASE_URL}/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
-        body: JSON.stringify({ sql: "SELECT * FROM ichibi_table" })
+        body: JSON.stringify({ sql: `SELECT * FROM "${uploadTable}"` })
     });
 
     if (!queryRes.ok) throw new Error(`Query failed: ${queryRes.status} ${queryRes.statusText}`);
-    console.log('Query Response (ichibi_table):', await queryRes.json());
+    console.log(`Query Response (${uploadTable}):`, await queryRes.json());
 
     const queryKafkaRes = await fetch(`${BASE_URL}/query`, {
         method: 'POST',
