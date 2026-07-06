@@ -8,6 +8,14 @@ let instance = null;
 // Promise-based guard: prevents concurrent callers from racing into fromCache()
 // while initialization is already in progress.
 let initPromise = null;
+// Monotonic generation counter for the primary instance. A DuckLake native
+// fatal error (e.g. the DuckLakeInsert crash on tables with stale inline data)
+// invalidates the ENTIRE DuckDBInstance, and every connection opened from it is
+// permanently dead. When getDbInstance() rebuilds the instance we bump this
+// counter; pooled connections are tagged with the generation they were born
+// under (see getConnection/releaseConnection) so we can discard the poisoned
+// ones instead of handing them back out.
+let instanceGeneration = 0;
 
 // Per-table column-name cache. Avoids the per-request `SELECT * LIMIT 0` probe
 // and repeated information_schema lookups. Invalidated by callers after any
@@ -109,7 +117,17 @@ async function _attachDuckLake(label) {
     `);
 
     const escapedDataPath = dataPath.replace(/'/g, "''");
-    await conn.run(`ATTACH 'ducklake:' AS ducklake (DATA_PATH '${escapedDataPath}', AUTOMATIC_MIGRATION true);`);
+    // DATA_INLINING_ROW_LIMIT 0 forces every write straight to Parquet instead
+    // of DuckLake's inline (Postgres-resident) row storage. Inline data has a
+    // read bug in our pinned DuckLake build: rows written to columns that were
+    // added via ALTER TABLE ADD COLUMN (i.e. any schema-evolved column, such as
+    // the arbitrary blob metadata columns) read back as NULL even though the
+    // values are physically stored. The normal remedy — CHECKPOINT to flush
+    // inline data to Parquet — crashes with "DuckLakeCompaction - expected a
+    // single output file" (the same defect behind DISABLE_DUCKLAKE_COMPACTION),
+    // so the inline rows would otherwise be stuck and unreadable. Writing
+    // directly to Parquet reconstructs evolved columns correctly on read.
+    await conn.run(`ATTACH 'ducklake:' AS ducklake (DATA_PATH '${escapedDataPath}', AUTOMATIC_MIGRATION true, DATA_INLINING_ROW_LIMIT 0);`);
     await conn.run("USE ducklake;");
 
     // Workaround for a DuckDB optimizer bug that corrupts inline DuckLake VARCHAR
@@ -147,8 +165,7 @@ async function getDbInstance() {
             } else {
                 console.warn('[DB] DuckDB health check failed:', msg);
             }
-            instance = null;
-            initPromise = null;
+            invalidatePrimaryInstance();
         }
     }
 
@@ -169,6 +186,21 @@ async function getDbInstance() {
     return initPromise;
 }
 
+// Tear down the current primary instance and every connection pooled against
+// it. Bumping the generation ensures any in-flight connection released after
+// this point is discarded rather than re-pooled onto the dead instance.
+function invalidatePrimaryInstance() {
+    instanceGeneration++;
+    instance = null;
+    initPromise = null;
+    while (primaryPool.length > 0) {
+        const stale = primaryPool.pop();
+        if (stale && typeof stale.close === 'function') {
+            stale.close().catch(() => {});
+        }
+    }
+}
+
 /**
  * Creates a fresh connection to the singleton instance.
  * Using per-request connections is safer for high-concurrency than a singleton connection.
@@ -176,12 +208,25 @@ async function getDbInstance() {
 export async function getConnection() {
     const db = await getDbInstance();
 
-    // Reuse a warmed connection from the pool if one is available.
-    if (primaryPool.length > 0) {
-        return primaryPool.pop();
+    // Reuse a warmed connection from the pool if one is available, but only if
+    // it belongs to the current instance generation. A pooled connection from a
+    // prior (crashed) instance is dead; drain and close any such stragglers so
+    // we never hand a poisoned connection back to a caller.
+    while (primaryPool.length > 0) {
+        const pooled = primaryPool.pop();
+        if (pooled && pooled._generation === instanceGeneration) {
+            return pooled;
+        }
+        if (pooled && typeof pooled.close === 'function') {
+            pooled.close().catch(() => {});
+        }
     }
 
     const conn = await db.connect();
+    // Tag the connection with the generation it was born under so
+    // releaseConnection() and future getConnection() calls can detect and
+    // discard it after an instance-invalidating fatal error.
+    conn._generation = instanceGeneration;
     // Ensure every connection defaults to the DuckLake catalog.
     // Testing shows that session state like 'USE' does not persist across connections.
     try {
@@ -217,7 +262,11 @@ export async function getConnection() {
  */
 export function releaseConnection(conn) {
     if (!conn) return;
-    if (primaryPool.length < PRIMARY_POOL_SIZE) {
+    // Never re-pool a connection from a superseded instance generation: the
+    // instance it belongs to was invalidated by a fatal error and the
+    // connection is dead. Close it instead.
+    const stale = conn._generation !== instanceGeneration;
+    if (!stale && primaryPool.length < PRIMARY_POOL_SIZE) {
         primaryPool.push(conn);
     } else {
         if (typeof conn.close === 'function') {

@@ -34,18 +34,18 @@ async function testBlobs() {
     console.log(`OK: Downloaded ${downloadedBuffer.length} bytes.`);
     if (originalBuffer.equals(downloadedBuffer)) console.log('OK: Data integrity verified.');
 
-    // 3. Test Optional tableName (Default to ichibi_table)
-    // First, clear any existing ichibi_table to ensure fresh schema (VARCHAR id)
-    console.log(`[Cleanup] Dropping existing 'ichibi_table' for clean test...`);
-    await fetch(`${BASE_URL}/query`, {
-        method: 'POST',
-        headers: { 'x-api-key': API_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sql: 'DROP TABLE IF EXISTS ichibi_table' })
-    });
+    // 3. Test optional/default-behaviour endpoints (no tableName in path).
+    // These exercise the same handler paths as the global 'ichibi_table'
+    // default, but against an isolated, uniquely-suffixed table so this suite
+    // never collides with test.js on the shared 'ichibi_table' (test.js seeds
+    // numeric ids there; this suite needs VARCHAR ids). Using the explicit
+    // /tables/:tableName/... variants keeps identical coverage without relying
+    // on a DROP that SQL_READ_ONLY=true silently blocks.
+    const defaultTable = `blob_default_test_${Date.now()}`;
 
     const defaultTestId = `default_blob_${Date.now()}`;
-    console.log(`[Optional Table] Testing upload to default 'ichibi_table' via /blobs/...`);
-    const defaultUploadRes = await fetch(`${BASE_URL}/blobs/${defaultTestId}/${blobColumn}`, {
+    console.log(`[Optional Table] Testing upload to isolated default-style table '${defaultTable}'...`);
+    const defaultUploadRes = await fetch(`${BASE_URL}/tables/${defaultTable}/blobs/${defaultTestId}/${blobColumn}`, {
         method: 'POST',
         headers: {
             'x-api-key': API_KEY,
@@ -57,8 +57,8 @@ async function testBlobs() {
     if (!defaultUploadRes.ok) throw new Error(`Default upload failed: ${defaultUploadRes.status} ${await defaultUploadRes.text()}`);
     console.log('OK: Upload to default table successful.');
 
-    console.log(`[Optional Table] Fetching from default 'ichibi_table' via /blobs/...`);
-    const defaultDownloadRes = await fetch(`${BASE_URL}/blobs/${defaultTestId}/${blobColumn}`, {
+    console.log(`[Optional Table] Fetching from isolated default-style table '${defaultTable}'...`);
+    const defaultDownloadRes = await fetch(`${BASE_URL}/tables/${defaultTable}/blobs/${defaultTestId}/${blobColumn}`, {
         headers: { 'x-api-key': API_KEY }
     });
     if (!defaultDownloadRes.ok) throw new Error(`Default download failed: ${defaultDownloadRes.status}`);
@@ -66,8 +66,8 @@ async function testBlobs() {
     if (originalBuffer.equals(defaultDownloadedBuffer)) console.log('OK: Default table data integrity verified.');
 
     // 4. Test Generated UUID (idValue omitted)
-    console.log(`[Generated UUID] Testing anonymous upload via /blobs/:blobColumn...`);
-    const anonUploadRes = await fetch(`${BASE_URL}/blobs/${blobColumn}`, {
+    console.log(`[Generated UUID] Testing anonymous upload via /tables/${defaultTable}/blobs/:blobColumn...`);
+    const anonUploadRes = await fetch(`${BASE_URL}/tables/${defaultTable}/blobs/${blobColumn}`, {
         method: 'POST',
         headers: {
             'x-api-key': API_KEY,
@@ -82,7 +82,7 @@ async function testBlobs() {
     console.log(`OK: Anonymous upload successful. Generated ID: ${generatedId}`);
 
     console.log(`[Generated UUID] Verifying retrieval of generated ID: ${generatedId}...`);
-    const anonDownloadRes = await fetch(`${BASE_URL}/blobs/${generatedId}/${blobColumn}`, {
+    const anonDownloadRes = await fetch(`${BASE_URL}/tables/${defaultTable}/blobs/${generatedId}/${blobColumn}`, {
         headers: { 'x-api-key': API_KEY }
     });
     if (!anonDownloadRes.ok) throw new Error(`Anonymous download failed: ${anonDownloadRes.status}`);
@@ -95,7 +95,7 @@ async function testBlobs() {
     const importance = 'high';
     console.log(`[Metadata] Uploading with metadata ?category=${category}&importance=${importance}...`);
 
-    const metaUploadRes = await fetch(`${BASE_URL}/blobs/${metaId}/${blobColumn}?category=${category}&importance=${importance}`, {
+    const metaUploadRes = await fetch(`${BASE_URL}/tables/${defaultTable}/blobs/${metaId}/${blobColumn}?category=${category}&importance=${importance}`, {
         method: 'POST',
         headers: {
             'x-api-key': API_KEY,
@@ -108,7 +108,7 @@ async function testBlobs() {
     console.log('OK: Metadata upload successful.');
 
     console.log(`[Metadata] Verifying metadata in table query...`);
-    const metaVerifyRes = await fetch(`${BASE_URL}/tables/ichibi_table?id=${metaId}`, {
+    const metaVerifyRes = await fetch(`${BASE_URL}/tables/${defaultTable}?id=${metaId}`, {
         headers: { 'x-api-key': API_KEY }
     });
     const metaVerifyData = await metaVerifyRes.json();
@@ -126,7 +126,7 @@ async function testBlobs() {
     const newStatus = 'approved';
     const newTag = 'vital';
 
-    const patchRes = await fetch(`${BASE_URL}/records/${metaId}`, {
+    const patchRes = await fetch(`${BASE_URL}/tables/${defaultTable}/records/${metaId}`, {
         method: 'PATCH',
         headers: {
             'x-api-key': API_KEY,
@@ -139,7 +139,7 @@ async function testBlobs() {
     console.log('OK: PATCH update successful.');
 
     console.log(`[Update] Verifying updated fields in table query...`);
-    const updateVerifyRes = await fetch(`${BASE_URL}/tables/ichibi_table?id=${metaId}`, {
+    const updateVerifyRes = await fetch(`${BASE_URL}/tables/${defaultTable}?id=${metaId}`, {
         headers: { 'x-api-key': API_KEY }
     });
     const updateData = await updateVerifyRes.json();
