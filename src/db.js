@@ -122,11 +122,11 @@ async function _attachDuckLake(label) {
     // read bug in our pinned DuckLake build: rows written to columns that were
     // added via ALTER TABLE ADD COLUMN (i.e. any schema-evolved column, such as
     // the arbitrary blob metadata columns) read back as NULL even though the
-    // values are physically stored. The normal remedy — CHECKPOINT to flush
-    // inline data to Parquet — crashes with "DuckLakeCompaction - expected a
-    // single output file" (the same defect behind DISABLE_DUCKLAKE_COMPACTION),
-    // so the inline rows would otherwise be stuck and unreadable. Writing
-    // directly to Parquet reconstructs evolved columns correctly on read.
+    // values are physically stored. Writing directly to Parquet reconstructs
+    // evolved columns correctly on read. (This inline-read bug is distinct from
+    // the CHECKPOINT/compaction crashes discussed in compactDuckLake() below and
+    // package.json's "_comments" entry; it has not been re-verified against the
+    // currently pinned DuckDB/DuckLake version.)
     await conn.run(`ATTACH 'ducklake:' AS ducklake (DATA_PATH '${escapedDataPath}', AUTOMATIC_MIGRATION true, DATA_INLINING_ROW_LIMIT 0);`);
     await conn.run("USE ducklake;");
 
@@ -509,42 +509,72 @@ export async function executeUserSql(sql, { timeoutMs = USER_QUERY_TIMEOUT_MS, p
 }
 
 /**
- * Run DuckLake maintenance (compaction, snapshot expiry, orphaned-file
- * cleanup) on the primary instance. Safe to call repeatedly.
+ * Run DuckLake maintenance (flush inlined data, snapshot expiry, file
+ * compaction, orphaned-file cleanup) on the primary instance. Safe to call
+ * repeatedly.
  *
  * Invoked at startup so that gateways that have been ingesting one row
  * per request for a long time don't accumulate millions of tiny Parquet
  * files. Logs and swallows errors so a maintenance failure does not
  * prevent the gateway from coming up.
+ *
+ * This deliberately does NOT run a single `CHECKPOINT ducklake`. CHECKPOINT
+ * is sugar for the same six calls below run back-to-back on one connection,
+ * which is exactly what triggers duckdb/ducklake#1108: a schema-cache key
+ * collision after DuckLake's automatic v0.3->v0.4 ducklake_schema_versions
+ * migration, provoked by per-table schema evolution (we do ALTER TABLE ADD
+ * COLUMN for blob metadata — see the DATA_INLINING_ROW_LIMIT comment above).
+ * Per the upstream-confirmed workaround, ducklake_merge_adjacent_files and
+ * ducklake_rewrite_data_files run on a fresh, unpooled connection per table so
+ * no single connection's schema cache ever holds more than one table's entry.
+ * See package.json's "_comments"."@duckdb/node-api" entry for the full history
+ * (including the now-fixed #525 crash this replaced) and what to re-check
+ * before changing this again.
  */
 export async function compactDuckLake() {
-    // DuckLake 0.4 (DuckDB 1.5.0, the version pinned here for DuckPGQ
-    // compatibility) has a compaction bug that throws a *fatal* on a background
-    // task thread ("DuckLakeCompaction - expected a single output file"),
-    // poisoning the whole DuckDB instance. Allow skipping maintenance until a
-    // fixed DuckLake build is available for our DuckDB version.
     if (process.env.DISABLE_DUCKLAKE_COMPACTION === '1') {
         console.warn('[Compact] Skipped: DISABLE_DUCKLAKE_COMPACTION=1.');
         return;
     }
     const start = Date.now();
-    console.log('[Compact] Running DuckLake CHECKPOINT (merge_adjacent_files + cleanup)...');
+    console.log('[Compact] Running DuckLake maintenance...');
+    let tableCount = 0;
     try {
         await withConnection(async (conn) => {
-            await conn.run('CHECKPOINT ducklake');
+            await conn.run("CALL ducklake_flush_inlined_data('ducklake')");
+            await conn.run("CALL ducklake_expire_snapshots('ducklake')");
         });
-        console.log(`[Compact] CHECKPOINT done in ${Date.now() - start}ms`);
-        return;
-    } catch (err) {
-        console.warn('[Compact] CHECKPOINT failed, falling back to merge_adjacent_files:', err.message || err);
-    }
-    try {
+
+        const tables = await execute(
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = 'ducklake'"
+        );
+        tableCount = tables.length;
+
+        for (const { table_name } of tables) {
+            // Deliberately bypasses getConnection()/the pool: a genuinely fresh
+            // DuckDBInstance connection is what keeps this table's schema-cache
+            // entry isolated (see function doc above).
+            const inst = await getDbInstance();
+            const conn = await inst.connect();
+            try {
+                await conn.run('USE ducklake;');
+                await conn.run("CALL ducklake_merge_adjacent_files('ducklake', ?)", [table_name], [VARCHAR]);
+                await conn.run("CALL ducklake_rewrite_data_files('ducklake', ?)", [table_name], [VARCHAR]);
+            } catch (err) {
+                console.warn(`[Compact] Maintenance failed for table "${table_name}":`, err.message || err);
+            } finally {
+                try { await conn.close(); } catch (e) { }
+            }
+        }
+
         await withConnection(async (conn) => {
-            await conn.run('CALL ducklake.merge_adjacent_files()');
+            await conn.run("CALL ducklake_cleanup_old_files('ducklake')");
+            await conn.run("CALL ducklake_delete_orphaned_files('ducklake')");
         });
-        console.log(`[Compact] merge_adjacent_files done in ${Date.now() - start}ms`);
+
+        console.log(`[Compact] DuckLake maintenance done in ${Date.now() - start}ms (${tableCount} tables)`);
     } catch (err) {
-        console.warn('[Compact] merge_adjacent_files also failed:', err.message || err);
+        console.warn('[Compact] DuckLake maintenance failed:', err.message || err);
     }
 }
 
