@@ -22,14 +22,23 @@ RUN npm ci --omit=dev || npm install --omit=dev
 COPY src ./src
 COPY swagger.yaml ./swagger.yaml
 
-# Install DuckDB CLI for debugging / inspection via `docker exec ... duckdb -ui`.
+# Install DuckDB CLI for debugging / inspection via `docker exec ... duckdb -ui`
+# and for the duckdb-ui compose service that browses the DuckLake catalog.
+#
+# IMPORTANT: keep this CLI version in lockstep with the DuckDB version bundled by
+# `@duckdb/node-api` in package.json (currently 1.5.4-r.1 => DuckDB v1.5.4). The
+# Node gateway writes/migrates the DuckLake catalog with its bundled `ducklake`
+# extension; an older CLI ships an older `ducklake` that cannot read the newer
+# catalog format and fails ATTACH with "Not implemented Error: Only DuckLake
+# versions ... are supported", which leaves the DuckDB UI showing only the empty
+# in-memory `memory` database instead of the lake's tables.
 RUN arch=$(dpkg --print-architecture) && \
     case "$arch" in \
       amd64) cli_arch=linux-amd64 ;; \
       arm64) cli_arch=linux-arm64 ;; \
       *) echo "Unsupported arch: $arch"; exit 1 ;; \
     esac && \
-    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v1.5.0/duckdb_cli-${cli_arch}.zip" \
+    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-${cli_arch}.zip" \
       -o /tmp/duckdb_cli.zip && \
     unzip -o /tmp/duckdb_cli.zip duckdb -d /usr/local/bin/ && \
     rm /tmp/duckdb_cli.zip && \
