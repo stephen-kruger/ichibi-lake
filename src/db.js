@@ -610,7 +610,7 @@ export async function compactDuckLake() {
     try {
         await withConnection(async (conn) => {
             await conn.run("CALL ducklake_flush_inlined_data('ducklake')");
-            await conn.run("CALL ducklake_expire_snapshots('ducklake')");
+            await expireSnapshots(conn);
         });
 
         const tables = await execute(
@@ -636,7 +636,7 @@ export async function compactDuckLake() {
         }
 
         await withConnection(async (conn) => {
-            await conn.run("CALL ducklake_cleanup_old_files('ducklake')");
+            await cleanupOldFiles(conn);
             await conn.run("CALL ducklake_delete_orphaned_files('ducklake')");
         });
 
@@ -644,6 +644,74 @@ export async function compactDuckLake() {
     } catch (err) {
         console.warn('[Compact] DuckLake maintenance failed:', err.message || err);
     }
+}
+
+/**
+ * Days of DuckLake snapshot history to keep (SNAPSHOT_RETENTION_DAYS, editable
+ * in the admin console). Unset means snapshots are never expired: time travel
+ * is unlimited, but rows deleted by pruning keep occupying storage because old
+ * snapshots still reference their files. Calling ducklake_expire_snapshots()
+ * without older_than is a no-op unless the catalog has an expiry option set.
+ */
+export function snapshotRetentionDays() {
+    const raw = String(process.env.SNAPSHOT_RETENTION_DAYS ?? '').trim();
+    if (!raw) return null;
+    const n = parseInt(raw, 10);
+    return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+// Files no snapshot references are only deleted after this grace period, so a
+// query that started before a rewrite/expiry can finish reading them.
+const FILE_CLEANUP_GRACE_MINUTES = 5;
+
+async function cleanupOldFiles(conn) {
+    // With no arguments ducklake_cleanup_old_files() keeps recently scheduled
+    // files much longer, so replaced files would linger on disk.
+    await conn.run(`CALL ducklake_cleanup_old_files('ducklake', older_than => now() - INTERVAL ${FILE_CLEANUP_GRACE_MINUTES} MINUTE)`);
+}
+
+async function expireSnapshots(conn) {
+    const days = snapshotRetentionDays();
+    if (days === null) return false;
+    await conn.run(`CALL ducklake_expire_snapshots('ducklake', older_than => now() - INTERVAL ${days} DAY)`);
+    return true;
+}
+
+/**
+ * Reclaim storage after rows were deleted from `tables`: rewrite their data
+ * files without the deleted rows, expire snapshots past the retention window
+ * (if one is set) and remove files no snapshot references any more. Each
+ * rewrite uses a fresh connection, as in compactDuckLake() (ducklake#1108).
+ * Returns a short human-readable summary.
+ */
+export async function reclaimTableStorage(tables) {
+    let rewritten = 0;
+    for (const tableName of tables) {
+        const inst = await getDbInstance();
+        const conn = await inst.connect();
+        try {
+            await conn.run('USE ducklake;');
+            await conn.run("CALL ducklake_rewrite_data_files('ducklake', ?)", [tableName], [VARCHAR]);
+            rewritten++;
+        } finally {
+            try { await conn.close(); } catch (e) { }
+        }
+    }
+    let expired = false;
+    await withConnection(async (conn) => {
+        expired = await expireSnapshots(conn);
+        await cleanupOldFiles(conn);
+    });
+    // Files replaced just now are still inside the grace period; delete them
+    // once it has passed (startup maintenance also catches any left over).
+    const deferred = setTimeout(() => {
+        withConnection(cleanupOldFiles).catch(err => console.warn('[Prune] Deferred file cleanup failed:', err.message || err));
+    }, (FILE_CLEANUP_GRACE_MINUTES + 1) * 60 * 1000);
+    deferred.unref?.();
+    const days = snapshotRetentionDays();
+    return `rewrote data files for ${rewritten} table(s); ` + (expired
+        ? `expired snapshots older than ${days} day(s); replaced files are deleted after a ${FILE_CLEANUP_GRACE_MINUTES}-minute grace period`
+        : 'snapshot retention is not set, so files still referenced by older snapshots are kept');
 }
 
 // --- Durable property-graph registry ---

@@ -128,11 +128,12 @@ export const SETTINGS = [
     { key: 'KAFKA_BATCH_TIMEOUT_MS', section: 'kafka', type: 'number', default: '5000', editable: false, label: 'Batch timeout (ms)' },
     { key: 'KAFKA_PRODUCER_COMPRESSION', section: 'kafka', type: 'enum', options: ['gzip', 'snappy', 'lz4', 'zstd', 'none'], default: 'gzip', editable: false, label: 'Producer compression' },
 
-    // --- Retention (rendered on the Retention page, not a settings form) ------
     {
-        key: 'RETENTION_INTERVAL_MINUTES', section: 'retention', type: 'number', default: '60',
-        min: 1, max: 10080, editable: true, live: true, label: 'Prune interval (minutes)',
-        help: 'How often enabled retention rules run.',
+        key: 'SNAPSHOT_RETENTION_DAYS', section: 'storage', type: 'number', default: '',
+        min: 0, max: 3650, editable: true, live: true, label: 'Snapshot retention (days)',
+        help: 'DuckLake keeps every snapshot (time travel) until it is expired, so pruned rows keep using storage. ' +
+            'When set, startup maintenance and pruning rules with "reclaim storage" expire snapshots older than this ' +
+            'and delete files no longer referenced. Empty: never expire (unlimited time travel, storage is not reclaimed).',
     },
 ];
 

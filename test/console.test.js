@@ -11,7 +11,9 @@ import {
     generateSetupCode, generateApiKey,
 } from '../src/console/auth.js';
 import { SECTIONS, SETTINGS, getSettingDef, normaliseSettingValue, maskSecret } from '../src/console/registry.js';
-import { buildCutoffPredicate, containedBlobPath, validateRule, isSystemTable } from '../src/console/retention.js';
+import { containedBlobPath, isSystemTable, matchTables, normaliseRule, buildPredicates, PROTECTED_TABLES } from '../src/console/retention.js';
+import { parseCron, nextRun, nextRuns, validateCron } from '../src/console/cron.js';
+import { intervalToCron } from '../src/console/store.js';
 import { normaliseType, quoteIdent, quoteLiteral, buildWhere, wideningTargets, isEditableType, cleanDuckDbError } from '../src/console/data.js';
 
 let passed = 0, failed = 0;
@@ -150,20 +152,101 @@ async function run() {
         assert.equal(maskSecret(''), '');
     });
 
-    console.log('\n▸ console: retention helpers');
-    await test('rule validation rejects unsafe identifiers, system tables and bad day counts', () => {
-        assert.equal(validateRule({ tableName: 'events', columnName: 'created', keepDays: 30 }), null);
-        assert.ok(validateRule({ tableName: 'events"; DROP', columnName: 'created', keepDays: 30 }));
-        assert.ok(validateRule({ tableName: '_rbac_users', columnName: 'created_at', keepDays: 30 }));
-        assert.ok(validateRule({ tableName: 'events', columnName: 'created', keepDays: 0 }));
-        assert.ok(validateRule({ tableName: 'events', columnName: 'created', keepDays: 2.5 }));
-        assert.ok(isSystemTable('_console_audit'));
+    console.log('\n▸ console: pruning — table selectors and protected tables');
+    const tables = ['events', 'events_2026', 'sensor_a', 'sensor_b', 'sensor_archive', 'logs', '_rbac_users', '_table_acls',
+        '_console_users', '_console_settings', '_graph_registry', '_gateway_meta'];
+    await test('wildcards match by name, case-insensitively, with exclusions', () => {
+        assert.deepEqual(matchTables(tables, 'sensor_*'), ['sensor_a', 'sensor_archive', 'sensor_b']);
+        assert.deepEqual(matchTables(tables, 'sensor_*', '*_archive'), ['sensor_a', 'sensor_b']);
+        assert.deepEqual(matchTables(tables, 'EVENTS, logs'), ['events', 'logs']);
+        assert.deepEqual(matchTables(tables, 'events_????'), ['events_2026']);
     });
-    await test('cutoff predicate uses whole days and the right clock per type', () => {
-        assert.equal(buildCutoffPredicate('created', 'TIMESTAMP', 30), `"created" < CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL 30 DAY`);
-        assert.equal(buildCutoffPredicate('day', 'DATE', 7), `"day" < CURRENT_DATE - INTERVAL 7 DAY`);
-        assert.throws(() => buildCutoffPredicate('x"y', 'DATE', 7));
-        assert.throws(() => buildCutoffPredicate('x', 'DATE', '7; DROP'));
+    await test('system and password tables never match, even with "*"', () => {
+        const all = matchTables(tables, '*');
+        assert.deepEqual(all, ['events', 'events_2026', 'logs', 'sensor_a', 'sensor_archive', 'sensor_b']);
+        assert.deepEqual(matchTables(tables, '*users*, *acl*, *console*, *registry*, *meta*'), []);
+        for (const t of ['_rbac_users', '_console_users', '_console_settings', '_table_acls', '_graph_registry', '_gateway_meta']) {
+            assert.ok(isSystemTable(t), t);
+            assert.ok(PROTECTED_TABLES.has(t), `${t} in PROTECTED_TABLES`);
+        }
+    });
+    await test('rules cannot target system tables or use unsafe patterns', () => {
+        const base = { name: 'r', maxAgeValue: 1, dateColumn: 'created', schedule: '@daily' };
+        assert.throws(() => normaliseRule({ ...base, tablePattern: '_rbac_users' }), /reserved for system tables/);
+        assert.throws(() => normaliseRule({ ...base, tablePattern: '_*' }), /reserved for system tables/);
+        assert.throws(() => normaliseRule({ ...base, tablePattern: 'events; DROP TABLE x' }), /Invalid table pattern/);
+        assert.throws(() => normaliseRule({ ...base, tablePattern: 'events', excludePattern: 'a"b' }), /Invalid table pattern/);
+    });
+
+    console.log('\n▸ console: pruning — rule validation and SQL');
+    await test('a rule needs a criterion, and age needs a date column', () => {
+        assert.throws(() => normaliseRule({ name: 'r', tablePattern: 'events', schedule: '@daily' }), /at least one criterion/);
+        assert.throws(() => normaliseRule({ name: 'r', tablePattern: 'events', maxAgeValue: 5, schedule: '@daily' }), /date\/timestamp column/);
+        assert.throws(() => normaliseRule({ name: 'r', tablePattern: 'events', maxRows: 0, schedule: '@daily' }), /Rows to keep/);
+        assert.throws(() => normaliseRule({ name: 'r', tablePattern: 'events', maxRows: 10, schedule: 'every day' }), /Invalid schedule/);
+        const ok = normaliseRule({ name: ' r ', tablePattern: 'a, b ,c', maxAgeValue: 12, maxAgeUnit: 'hours', dateColumn: 'ts', maxRows: 100, schedule: '0 2 * * *' });
+        assert.equal(ok.tablePattern, 'a, b, c');
+        assert.equal(ok.name, 'r');
+        assert.equal(ok.maxAgeUnit, 'hours');
+    });
+    const types = new Map([['created', 'TIMESTAMP'], ['day', 'DATE'], ['name', 'VARCHAR'], ['seq', 'BIGINT']]);
+    await test('age predicate compares in whole units, per column type', () => {
+        const ts = buildPredicates({ maxAgeValue: 30, maxAgeUnit: 'days', dateColumn: 'created' }, 'events', types);
+        assert.equal(ts.age, `"created" < CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL 30 DAY`);
+        const hours = buildPredicates({ maxAgeValue: 6, maxAgeUnit: 'hours', dateColumn: 'created' }, 'events', types);
+        assert.match(hours.age, /INTERVAL 6 HOUR$/);
+        const date = buildPredicates({ maxAgeValue: 7, maxAgeUnit: 'days', dateColumn: 'day' }, 'events', types);
+        assert.equal(date.age, `"day" < CAST(CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL 7 DAY AS DATE)`);
+    });
+    await test('count predicate keeps the newest N by column or insertion order', () => {
+        const byCol = buildPredicates({ maxRows: 1000, orderColumn: 'seq' }, 'events', types);
+        assert.equal(byCol.count, `rowid IN (SELECT rowid FROM "events" ORDER BY "seq" DESC NULLS LAST, rowid DESC OFFSET 1000)`);
+        const byInsert = buildPredicates({ maxRows: 5 }, 'events', types);
+        assert.equal(byInsert.count, `rowid IN (SELECT rowid FROM "events" ORDER BY rowid DESC OFFSET 5)`);
+    });
+    await test('tables without the needed columns are skipped with a reason', () => {
+        assert.match(buildPredicates({ maxAgeValue: 1, dateColumn: 'missing' }, 't', types).skip, /no "missing" column/);
+        assert.match(buildPredicates({ maxAgeValue: 1, dateColumn: 'name' }, 't', types).skip, /not a date/);
+        assert.match(buildPredicates({ maxRows: 1, orderColumn: 'nope' }, 't', types).skip, /no "nope" column/);
+    });
+
+    console.log('\n▸ console: pruning — schedules (cron, UTC)');
+    const at = (iso) => new Date(iso);
+    await test('next run for common schedules', () => {
+        assert.equal(nextRun('*/15 * * * *', at('2026-10-24T10:07:30Z')).toISOString(), '2026-10-24T10:15:00.000Z');
+        assert.equal(nextRun('0 2 * * *', at('2026-10-24T10:00:00Z')).toISOString(), '2026-10-25T02:00:00.000Z');
+        assert.equal(nextRun('0 3 * * 0', at('2026-10-24T10:00:00Z')).toISOString(), '2026-10-25T03:00:00.000Z'); // Sunday
+        assert.equal(nextRun('0 4 1 * *', at('2026-10-24T10:00:00Z')).toISOString(), '2026-11-01T04:00:00.000Z');
+        assert.equal(nextRun('@hourly', at('2026-12-31T23:30:00Z')).toISOString(), '2027-01-01T00:00:00.000Z');
+    });
+    await test('next run is strictly after the reference time', () => {
+        assert.equal(nextRun('0 * * * *', at('2026-10-24T10:00:00Z')).toISOString(), '2026-10-24T11:00:00.000Z');
+    });
+    await test('ranges, lists, steps and names', () => {
+        assert.deepEqual([...parseCron('0-10/5 * * * *').minutes], [0, 5, 10]);
+        assert.deepEqual([...parseCron('0 9-17/4 * * MON-FRI').weekdays], [1, 2, 3, 4, 5]);
+        assert.deepEqual([...parseCron('0 0 * JAN,JUL *').months], [1, 7]);
+        assert.ok(parseCron('0 0 * * 7').weekdays.has(0), '7 means Sunday');
+        assert.equal(nextRuns('0 12 * * *', 3, at('2026-10-24T13:00:00Z')).length, 3);
+    });
+    await test('day-of-month OR day-of-week when both are restricted (standard cron)', () => {
+        // 13th of the month OR Friday: from Thu 2026-10-22 the next match is Fri 23rd.
+        assert.equal(nextRun('0 0 13 * 5', at('2026-10-22T12:00:00Z')).toISOString(), '2026-10-23T00:00:00.000Z');
+    });
+    await test('invalid schedules are rejected with a reason', () => {
+        assert.match(validateCron('* * * *'), /5 fields/);
+        assert.match(validateCron('60 * * * *'), /minute must be 0-59/);
+        assert.match(validateCron('*/0 * * * *'), /Invalid step/);
+        assert.match(validateCron('0 0 * * FUNDAY'), /Invalid day of week/);
+        assert.equal(validateCron('0 0 31 2 *'), null);
+        assert.equal(nextRun('0 0 31 2 *', at('2026-01-01T00:00:00Z')), null, 'Feb 31 never occurs');
+    });
+    await test('the old global interval converts to an equivalent cron', () => {
+        assert.equal(intervalToCron(60), '0 * * * *');
+        assert.equal(intervalToCron(15), '*/15 * * * *');
+        assert.equal(intervalToCron(360), '0 */6 * * *');
+        assert.equal(intervalToCron(1440), '0 0 * * *');
+        assert.equal(intervalToCron(7), '0 * * * *');
     });
     await test('blob paths are only accepted inside the blobs root', () => {
         const root = path.resolve('/app/blobs');

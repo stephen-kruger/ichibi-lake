@@ -12,9 +12,12 @@ import { SETTINGS, getSettingDef } from './registry.js';
 const table = (name) => `${CONSOLE_CATALOG}.main.${name}`;
 export const USERS = table('_console_users');
 const SETTINGS_T = table('_console_settings');
-export const RETENTION = table('_console_retention');
+// Legacy single-table retention rules (pre prune-rules); migrated on startup.
+const LEGACY_RETENTION = table('_console_retention');
+export const PRUNE_RULES = table('_console_prune_rules');
+export const PRUNE_RUNS = table('_console_prune_runs');
 const AUDIT = table('_console_audit');
-const CONSOLE_TABLES = ['_console_users', '_console_settings', '_console_retention', '_console_audit'];
+const CONSOLE_TABLES = ['_console_users', '_console_settings', '_console_audit'];
 
 // Internal (non-registry) keys in _console_settings. Never returned by the API.
 export const INTERNAL_KEYS = {
@@ -48,16 +51,50 @@ export async function initConsoleTables() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_by VARCHAR
     )`);
-    await execute(`CREATE TABLE IF NOT EXISTS ${RETENTION} (
-        table_name VARCHAR,
-        column_name VARCHAR,
-        keep_days BIGINT,
+    // Pruning rules and their run log. Times used for scheduling are epoch
+    // milliseconds (UTC), independent of the DuckDB session time zone.
+    await execute(`CREATE TABLE IF NOT EXISTS ${PRUNE_RULES} (
+        id VARCHAR,
+        name VARCHAR,
+        table_pattern VARCHAR,
+        exclude_pattern VARCHAR,
+        date_column VARCHAR,
+        max_age_value BIGINT,
+        max_age_unit VARCHAR,
+        max_rows BIGINT,
+        order_column VARCHAR,
+        schedule VARCHAR,
         enabled VARCHAR,
-        last_run TIMESTAMP,
+        safety_limit BIGINT,
+        reclaim_storage VARCHAR,
+        next_run_ms BIGINT,
+        claim_token VARCHAR,
+        last_run_ms BIGINT,
+        last_status VARCHAR,
         last_deleted BIGINT,
-        last_error VARCHAR,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_ms BIGINT,
+        created_by VARCHAR,
+        updated_ms BIGINT,
         updated_by VARCHAR
+    )`);
+    await execute(`CREATE TABLE IF NOT EXISTS ${PRUNE_RUNS} (
+        run_id VARCHAR,
+        job_id VARCHAR,
+        kind VARCHAR,
+        rule_id VARCHAR,
+        rule_name VARCHAR,
+        table_name VARCHAR,
+        trigger VARCHAR,
+        status VARCHAR,
+        started_ms BIGINT,
+        finished_ms BIGINT,
+        rows_by_age BIGINT,
+        rows_by_count BIGINT,
+        rows_deleted BIGINT,
+        blob_files BIGINT,
+        message VARCHAR,
+        instance VARCHAR,
+        username VARCHAR
     )`);
     await execute(`CREATE TABLE IF NOT EXISTS ${AUDIT} (
         ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -67,6 +104,54 @@ export async function initConsoleTables() {
         ip VARCHAR
     )`);
     await migrateFromMainCatalog();
+    await migrateLegacyRetention();
+}
+
+/** Cron expression approximating the old global RETENTION_INTERVAL_MINUTES. */
+export function intervalToCron(minutes) {
+    const m = Number(minutes);
+    if (!Number.isInteger(m) || m <= 0) return '0 * * * *';
+    if (m < 60 && 60 % m === 0) return m === 1 ? '* * * * *' : `*/${m} * * * *`;
+    if (m % 60 === 0) {
+        const h = m / 60;
+        if (h === 24) return '0 0 * * *';
+        if (h < 24 && 24 % h === 0) return h === 1 ? '0 * * * *' : `0 */${h} * * *`;
+    }
+    return '0 * * * *';
+}
+
+/**
+ * Convert legacy one-table-per-rule retention rows (in the main catalog from
+ * early releases, or the console catalog from the previous release) into
+ * prune rules, using the old global interval as each rule's schedule.
+ */
+async function migrateLegacyRetention() {
+    const sources = [`ducklake.main._console_retention`, LEGACY_RETENTION];
+    const catalogs = [['ducklake', '_console_retention'], [CONSOLE_CATALOG, '_console_retention']];
+    const intervalRow = await executeWithParams(`SELECT value FROM ${SETTINGS_T} WHERE key = ?`, ['RETENTION_INTERVAL_MINUTES'], [VARCHAR]);
+    const schedule = intervalToCron(intervalRow[0]?.value ?? process.env.RETENTION_INTERVAL_MINUTES ?? 60);
+    for (let i = 0; i < sources.length; i++) {
+        const [catalog, name] = catalogs[i];
+        const exists = await executeWithParams(
+            `SELECT count(*) AS n FROM information_schema.tables WHERE table_catalog = ? AND table_schema = 'main' AND table_name = ?`,
+            [catalog, name], [VARCHAR, VARCHAR]);
+        if (Number(exists[0]?.n || 0) === 0) continue;
+        const legacy = await execute(`SELECT table_name, column_name, keep_days, enabled, updated_by FROM ${sources[i]}`);
+        for (const r of legacy) {
+            const already = await executeWithParams(`SELECT count(*) AS n FROM ${PRUNE_RULES} WHERE table_pattern = ? AND name = ?`,
+                [r.table_name, r.table_name], [VARCHAR, VARCHAR]);
+            if (Number(already[0]?.n || 0) > 0) continue;
+            await createPruneRule({
+                id: randomBytes(8).toString('hex'), name: r.table_name, tablePattern: r.table_name, excludePattern: '',
+                dateColumn: r.column_name, maxAgeValue: Number(r.keep_days), maxAgeUnit: 'days', maxRows: null, orderColumn: null,
+                schedule, enabled: r.enabled === 'true', safetyLimit: null, reclaimStorage: false,
+                nextRunMs: null, user: r.updated_by || 'migration',
+            });
+        }
+        await execute(`DROP TABLE ${sources[i]}`);
+        console.log(`[Console] Converted ${legacy.length} legacy retention rule(s) from ${catalog} to prune rules (schedule ${schedule}).`);
+    }
+    await executeWithParams(`DELETE FROM ${SETTINGS_T} WHERE key = ?`, ['RETENTION_INTERVAL_MINUTES'], [VARCHAR]);
 }
 
 /**
@@ -245,42 +330,170 @@ export function describeSetting(def) {
     };
 }
 
-// --- Retention rules -----------------------------------------------------------
+// --- Prune rules -----------------------------------------------------------------
 
-export async function listRetentionRules() {
-    return execute(
-        `SELECT table_name, column_name, keep_days, enabled, ${ts('last_run')}, last_deleted, last_error, ${ts('updated_at')}, updated_by
-         FROM ${RETENTION} ORDER BY table_name`
-    );
+const num = (v) => (v === null || v === undefined ? null : Number(v));
+const big = (v) => (v === null || v === undefined || v === '' ? null : BigInt(Math.trunc(Number(v))));
+
+function ruleFromRow(r) {
+    return {
+        id: r.id, name: r.name, tablePattern: r.table_pattern, excludePattern: r.exclude_pattern || '',
+        dateColumn: r.date_column || null, maxAgeValue: num(r.max_age_value), maxAgeUnit: r.max_age_unit || 'days',
+        maxRows: num(r.max_rows), orderColumn: r.order_column || null, schedule: r.schedule,
+        enabled: r.enabled === 'true', safetyLimit: num(r.safety_limit), reclaimStorage: r.reclaim_storage === 'true',
+        nextRunMs: num(r.next_run_ms), lastRunMs: num(r.last_run_ms), lastStatus: r.last_status || null,
+        lastDeleted: num(r.last_deleted), createdMs: num(r.created_ms), createdBy: r.created_by,
+        updatedMs: num(r.updated_ms), updatedBy: r.updated_by,
+    };
 }
 
-export async function getRetentionRule(tableName) {
+const RULE_COLUMNS = `id, name, table_pattern, exclude_pattern, date_column, max_age_value, max_age_unit, max_rows,
+    order_column, schedule, enabled, safety_limit, reclaim_storage, next_run_ms, last_run_ms, last_status, last_deleted,
+    created_ms, created_by, updated_ms, updated_by`;
+
+export async function listPruneRules() {
+    return (await execute(`SELECT ${RULE_COLUMNS} FROM ${PRUNE_RULES} ORDER BY lower(name)`)).map(ruleFromRow);
+}
+
+export async function getPruneRule(id) {
+    const rows = await executeWithParams(`SELECT ${RULE_COLUMNS} FROM ${PRUNE_RULES} WHERE id = ?`, [id], [VARCHAR]);
+    return rows.length ? ruleFromRow(rows[0]) : null;
+}
+
+export async function createPruneRule(rule) {
+    const now = Date.now();
+    await executeWithParams(
+        `INSERT INTO ${PRUNE_RULES} (id, name, table_pattern, exclude_pattern, date_column, max_age_value, max_age_unit, max_rows,
+            order_column, schedule, enabled, safety_limit, reclaim_storage, next_run_ms, created_ms, created_by, updated_ms, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [rule.id, rule.name, rule.tablePattern, rule.excludePattern || '', rule.dateColumn || null, big(rule.maxAgeValue),
+            rule.maxAgeUnit || 'days', big(rule.maxRows), rule.orderColumn || null, rule.schedule, rule.enabled ? 'true' : 'false',
+            big(rule.safetyLimit), rule.reclaimStorage ? 'true' : 'false', big(rule.nextRunMs), BigInt(now), rule.user, BigInt(now), rule.user],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT,
+            BIGINT, VARCHAR, BIGINT, VARCHAR]);
+}
+
+export async function updatePruneRule(id, rule) {
+    await executeWithParams(
+        `UPDATE ${PRUNE_RULES} SET name = ?, table_pattern = ?, exclude_pattern = ?, date_column = ?, max_age_value = ?,
+            max_age_unit = ?, max_rows = ?, order_column = ?, schedule = ?, enabled = ?, safety_limit = ?, reclaim_storage = ?,
+            next_run_ms = ?, updated_ms = ?, updated_by = ?
+         WHERE id = ?`,
+        [rule.name, rule.tablePattern, rule.excludePattern || '', rule.dateColumn || null, big(rule.maxAgeValue),
+            rule.maxAgeUnit || 'days', big(rule.maxRows), rule.orderColumn || null, rule.schedule, rule.enabled ? 'true' : 'false',
+            big(rule.safetyLimit), rule.reclaimStorage ? 'true' : 'false', big(rule.nextRunMs), BigInt(Date.now()), rule.user, id],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, BIGINT, VARCHAR, VARCHAR]);
+}
+
+export async function deletePruneRule(id) {
+    await executeWithParams(`DELETE FROM ${PRUNE_RULES} WHERE id = ?`, [id], [VARCHAR]);
+}
+
+/** Rules that are enabled and due at `nowMs` (next_run_ms unset counts as due). */
+export async function dueRuleIds(nowMs) {
     const rows = await executeWithParams(
-        `SELECT table_name, column_name, keep_days, enabled, ${ts('last_run')}, last_deleted, last_error
-         FROM ${RETENTION} WHERE table_name = ?`,
-        [tableName], [VARCHAR]
-    );
-    return rows[0] || null;
+        `SELECT id FROM ${PRUNE_RULES} WHERE enabled = 'true' AND (next_run_ms IS NULL OR next_run_ms <= ?)`,
+        [BigInt(nowMs)], [BIGINT]);
+    return rows.map(r => r.id);
 }
 
-export async function upsertRetentionRule({ tableName, columnName, keepDays, enabled, updatedBy }) {
-    await executeWithParams(`DELETE FROM ${RETENTION} WHERE table_name = ?`, [tableName], [VARCHAR]);
+/**
+ * Claim a due rule for this instance. DuckLake does not make concurrent
+ * conditional UPDATEs exclusive (both transactions can commit), so the claim
+ * writes a unique token and re-reads it: only the instance whose token
+ * survived runs the job. Returns true when this instance owns the run.
+ */
+export async function claimRule(id, token, nowMs, nextRunMs) {
     await executeWithParams(
-        `INSERT INTO ${RETENTION} (table_name, column_name, keep_days, enabled, updated_by) VALUES (?, ?, ?, ?, ?)`,
-        [tableName, columnName, BigInt(keepDays), enabled ? 'true' : 'false', updatedBy],
-        [VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR]
-    );
+        `UPDATE ${PRUNE_RULES} SET claim_token = ?, next_run_ms = ?
+         WHERE id = ? AND enabled = 'true' AND (next_run_ms IS NULL OR next_run_ms <= ?)`,
+        [token, big(nextRunMs), id, BigInt(nowMs)], [VARCHAR, BIGINT, VARCHAR, BIGINT]);
+    const rows = await executeWithParams(`SELECT claim_token FROM ${PRUNE_RULES} WHERE id = ?`, [id], [VARCHAR]);
+    return rows[0]?.claim_token === token;
 }
 
-export async function deleteRetentionRule(tableName) {
-    await executeWithParams(`DELETE FROM ${RETENTION} WHERE table_name = ?`, [tableName], [VARCHAR]);
+export async function setRuleNextRun(id, nextRunMs) {
+    await executeWithParams(`UPDATE ${PRUNE_RULES} SET next_run_ms = ? WHERE id = ?`, [big(nextRunMs), id], [BIGINT, VARCHAR]);
 }
 
-export async function recordRetentionRun(tableName, deleted, error) {
+export async function recordRuleResult(id, status, deleted) {
     await executeWithParams(
-        `UPDATE ${RETENTION} SET last_run = CURRENT_TIMESTAMP, last_deleted = ?, last_error = ? WHERE table_name = ?`,
-        [BigInt(deleted), error || '', tableName], [BIGINT, VARCHAR, VARCHAR]
-    );
+        `UPDATE ${PRUNE_RULES} SET last_run_ms = ?, last_status = ?, last_deleted = ? WHERE id = ?`,
+        [BigInt(Date.now()), status, big(deleted), id], [BIGINT, VARCHAR, BIGINT, VARCHAR]);
+}
+
+/** Point exact-name rules at a renamed table (wildcard rules re-match at run time). */
+export async function renameTableInRules(oldName, newName) {
+    await executeWithParams(`UPDATE ${PRUNE_RULES} SET table_pattern = ? WHERE lower(table_pattern) = lower(?)`,
+        [newName, oldName], [VARCHAR, VARCHAR]);
+}
+
+// --- Prune runs (job log) ----------------------------------------------------------
+
+export async function insertRun(run) {
+    await executeWithParams(
+        `INSERT INTO ${PRUNE_RUNS} (run_id, job_id, kind, rule_id, rule_name, table_name, trigger, status, started_ms, instance, username)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [run.runId, run.jobId, run.kind, run.ruleId, run.ruleName, run.tableName || null, run.trigger, run.status,
+            BigInt(run.startedMs), run.instance, run.username || null],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR]);
+}
+
+export async function finishRun(runId, r) {
+    await executeWithParams(
+        `UPDATE ${PRUNE_RUNS} SET status = ?, finished_ms = ?, rows_by_age = ?, rows_by_count = ?, rows_deleted = ?,
+            blob_files = ?, message = ? WHERE run_id = ?`,
+        [r.status, BigInt(Date.now()), big(r.rowsByAge), big(r.rowsByCount), big(r.rowsDeleted), big(r.blobFiles),
+            String(r.message || '').slice(0, 2000), runId],
+        [VARCHAR, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, VARCHAR, VARCHAR]);
+}
+
+/** Recent jobs (newest first) with their per-table runs. */
+export async function listRuns({ ruleId = null, limit = 50 } = {}) {
+    const n = Math.max(1, Math.min(500, Number(limit) || 50));
+    const jobs = ruleId
+        ? await executeWithParams(`SELECT * FROM ${PRUNE_RUNS} WHERE kind = 'job' AND rule_id = ? ORDER BY started_ms DESC LIMIT ${n}`, [ruleId], [VARCHAR])
+        : await execute(`SELECT * FROM ${PRUNE_RUNS} WHERE kind = 'job' ORDER BY started_ms DESC LIMIT ${n}`);
+    if (!jobs.length) return [];
+    const ids = jobs.map(j => j.job_id);
+    const tables = await executeWithParams(
+        `SELECT * FROM ${PRUNE_RUNS} WHERE kind = 'table' AND job_id IN (${ids.map(() => '?').join(', ')}) ORDER BY table_name`,
+        ids, ids.map(() => VARCHAR));
+    const shape = (r) => ({
+        runId: r.run_id, jobId: r.job_id, ruleId: r.rule_id, ruleName: r.rule_name, table: r.table_name, trigger: r.trigger,
+        status: r.status, startedMs: num(r.started_ms), finishedMs: num(r.finished_ms), rowsByAge: num(r.rows_by_age),
+        rowsByCount: num(r.rows_by_count), rowsDeleted: num(r.rows_deleted), blobFiles: num(r.blob_files),
+        message: r.message || '', instance: r.instance, username: r.username,
+    });
+    return jobs.map(j => ({ ...shape(j), tables: tables.filter(t => t.job_id === j.job_id).map(shape) }));
+}
+
+/** Mark runs left 'running' by a crashed or restarted instance as abandoned. */
+export async function abandonStaleRuns(olderThanMs) {
+    await executeWithParams(
+        `UPDATE ${PRUNE_RUNS} SET status = 'abandoned', finished_ms = ?, message = 'The gateway stopped before this run finished.'
+         WHERE status = 'running' AND started_ms < ?`,
+        [BigInt(Date.now()), BigInt(olderThanMs)], [BIGINT, BIGINT]);
+}
+
+export async function abandonRunsOfHost(hostPrefix) {
+    await executeWithParams(
+        `UPDATE ${PRUNE_RUNS} SET status = 'abandoned', finished_ms = ?, message = 'The gateway restarted before this run finished.'
+         WHERE status = 'running' AND starts_with(instance, ?)`,
+        [BigInt(Date.now()), hostPrefix], [BIGINT, VARCHAR]);
+}
+
+/** Keep exact-name rules in step with a renamed column of that table. */
+export async function renameColumnInRules(tableName, oldName, newName) {
+    for (const col of ['date_column', 'order_column']) {
+        await executeWithParams(
+            `UPDATE ${PRUNE_RULES} SET ${col} = ? WHERE lower(table_pattern) = lower(?) AND ${col} = ?`,
+            [newName, tableName, oldName], [VARCHAR, VARCHAR, VARCHAR]);
+    }
+}
+
+export async function trimRuns(olderThanMs) {
+    await executeWithParams(`DELETE FROM ${PRUNE_RUNS} WHERE started_ms < ? AND status <> 'running'`, [BigInt(olderThanMs)], [BIGINT]);
 }
 
 // --- Audit log -----------------------------------------------------------------

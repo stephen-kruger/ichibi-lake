@@ -176,7 +176,7 @@ input[readonly] { background: var(--surface-2); color: var(--text-muted); }
 .setting .control-row { display: flex; gap: 8px; align-items: center; }
 .setting .meta { font-size: 12px; color: var(--text-muted); }
 
-.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
+.badge { display: inline-block; white-space: nowrap; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
 .badge.console { background: var(--warn-soft); color: var(--ochre); border-color: transparent; }
 .badge.env { background: rgba(62, 109, 134, 0.12); color: var(--accent); border-color: transparent; }
 .badge.ok { background: var(--success-soft); color: var(--success); border-color: transparent; }
@@ -190,7 +190,7 @@ input[readonly] { background: var(--surface-2); color: var(--text-muted); }
 .secret-box { font-family: var(--mono); background: var(--surface-2); border: 1px dashed var(--border); padding: 12px; border-radius: 8px; word-break: break-all; user-select: all; }
 
 /* Toggle switch */
-.switch { position: relative; width: 42px; height: 24px; flex: none; }
+.switch { position: relative; display: inline-block; vertical-align: middle; width: 42px; height: 24px; flex: none; }
 .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
 .switch span { position: absolute; inset: 0; background: var(--border); border-radius: 999px; cursor: pointer; transition: background 0.15s; }
 .switch span::before { content: ""; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: transform 0.15s; box-shadow: 0 1px 2px rgba(0,0,0,0.25); }
@@ -200,10 +200,11 @@ input[readonly] { background: var(--surface-2); color: var(--text-muted); }
 
 /* --- Modal and toasts -------------------------------------------------------------- */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(13, 19, 27, 0.55); display: grid; place-items: center; padding: 16px; z-index: 50; }
-.modal { background: var(--surface); border-radius: 14px; width: 100%; max-width: 480px; box-shadow: 0 20px 50px rgba(0,0,0,0.3); border: 1px solid var(--border); }
+.modal { background: var(--surface); border-radius: 14px; width: 100%; max-width: 480px; box-shadow: 0 20px 50px rgba(0,0,0,0.3); border: 1px solid var(--border);
+    max-height: calc(100vh - 32px); display: flex; flex-direction: column; }
 .modal-header { padding: 18px 22px 0; }
 .modal-header h2 { font-size: 17px; }
-.modal-body { padding: 14px 22px; }
+.modal-body { padding: 14px 22px; overflow-y: auto; min-height: 0; }
 .modal-footer { padding: 4px 22px 20px; display: flex; justify-content: flex-end; gap: 10px; }
 
 #toasts { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 10px; z-index: 60; }
@@ -281,6 +282,26 @@ table.grid tr.selected td { background: rgba(163, 99, 44, 0.08); }
 .col-editor-row { display: grid; grid-template-columns: 1.3fr 1fr auto 1fr auto; gap: 8px; align-items: center; }
 .col-editor-row .checkbox { font-size: 13px; white-space: nowrap; }
 
+/* --- Retention & pruning ---------------------------------------------------------- */
+.rule-name { font-weight: 600; }
+.small { font-size: 12.5px; }
+select.compact { width: auto; padding: 5px 8px; font-size: 13px; }
+.rule-form { display: flex; flex-direction: column; gap: 12px; }
+.rule-form > .btn { align-self: flex-start; }
+.rule-form .field { margin-bottom: 0; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.rule-form fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px 12px; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.rule-form legend { font-weight: 600; padding: 0 6px; }
+.criterion { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.criterion input.narrow, .criterion select.narrow, .criterion input[type=number] { width: auto; max-width: 160px; }
+.criterion select { width: auto; }
+.criterion input.mono { font-family: var(--mono); max-width: 180px; }
+.error-text { color: var(--danger); }
+tr.job-row td { vertical-align: top; }
+tr.job-detail > td { background: var(--surface-2); padding: 8px 20px 14px; }
+table.inner { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+table.inner th, table.inner td { padding: 6px 12px; font-size: 12.5px; }
+
 /* --- Responsive ---------------------------------------------------------------------- */
 @media (max-width: 860px) {
     .shell { grid-template-columns: 1fr; }
@@ -299,4 +320,5 @@ table.grid tr.selected td { background: rgba(163, 99, 44, 0.08); }
     .grid-wrap { max-height: none; }
     .toolbar-search { max-width: none; flex: 1 1 100%; }
     .col-editor-row { grid-template-columns: 1fr 1fr; }
+    .form-grid { grid-template-columns: 1fr; }
 }
