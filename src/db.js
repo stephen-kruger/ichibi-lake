@@ -1,10 +1,11 @@
-import { DuckDBInstance, VARCHAR, BIGINT, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE } from '@duckdb/node-api';
+import { DuckDBInstance, VARCHAR, BIGINT, BOOLEAN, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE } from '@duckdb/node-api';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { buildCreatePropertyGraphSql } from './graphs.js';
+import { storageConfig, describeStorage, buildS3SecretSql, joinDataPath, dataInliningRowLimit } from './storage.js';
 
-export { VARCHAR, BIGINT, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE };
+export { VARCHAR, BIGINT, BOOLEAN, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE };
 
 let instance = null;
 // Promise-based guard: prevents concurrent callers from racing into fromCache()
@@ -120,21 +121,36 @@ async function _attachDuckLake(label) {
     const pgUser = process.env.DUCKLAKE_PG_USER || 'postgres';
     const pgPass = process.env.DUCKLAKE_PG_PASSWORD || 'postgres';
     const pgDb = process.env.DUCKLAKE_PG_DB || 'ducklake';
-    const dataPath = process.env.DUCKLAKE_DATA_PATH || 'data_files/';
+    // Local directory or s3:// URL (see src/storage.js).
+    const storage = storageConfig();
+    const dataPath = storage.dataPath;
+    const remote = storage.kind !== 'local';
 
     const inst = await DuckDBInstance.create(':memory:', { allow_unsigned_extensions: 'true' });
     const conn = await inst.connect();
 
-    console.log(`[DB:${label}] Initializing DuckLake connection to ${pgHost}:${pgPort} (data path: ${dataPath})...`);
+    console.log(`[DB:${label}] Initializing DuckLake connection to ${pgHost}:${pgPort} (data: ${describeStorage(storage)})...`);
 
-    try {
-        await fs.mkdir(dataPath, { recursive: true });
-    } catch (mkErr) {
-        console.warn(`[DB:${label}] Could not create data path ${dataPath}:`, mkErr.message || mkErr);
+    if (!remote) {
+        try {
+            await fs.mkdir(dataPath, { recursive: true });
+        } catch (mkErr) {
+            console.warn(`[DB:${label}] Could not create data path ${dataPath}:`, mkErr.message || mkErr);
+        }
     }
 
     await conn.run('INSTALL ducklake; LOAD ducklake;');
     await conn.run('INSTALL postgres; LOAD postgres;');
+    if (remote) {
+        // httpfs provides the s3:// file system; aws provides the credential
+        // chain provider (env vars, ~/.aws, instance/task roles).
+        await conn.run('INSTALL httpfs; LOAD httpfs;');
+        if (storage.provider === 'credential_chain') await conn.run('INSTALL aws; LOAD aws;');
+        // Temporary secret scoped to the data path. Its values are redacted in
+        // duckdb_secrets(), and once external access is disabled on the
+        // user-query instance (below) DuckDB refuses to display them at all.
+        await conn.run(buildS3SecretSql(storage));
+    }
 
     if (process.env.DISABLE_DUCKPGQ === '1') {
         console.warn(`[DB:${label}] DuckPGQ disabled via DISABLE_DUCKPGQ=1 (graph queries unavailable).`);
@@ -160,17 +176,21 @@ async function _attachDuckLake(label) {
     `);
 
     const escapedDataPath = dataPath.replace(/'/g, "''");
-    // DATA_INLINING_ROW_LIMIT 0 forces every write straight to Parquet instead
-    // of DuckLake's inline (Postgres-resident) row storage. Inline data has a
-    // read bug in our pinned DuckLake build: rows written to columns that were
-    // added via ALTER TABLE ADD COLUMN (i.e. any schema-evolved column, such as
-    // the arbitrary blob metadata columns) read back as NULL even though the
-    // values are physically stored. Writing directly to Parquet reconstructs
-    // evolved columns correctly on read. (This inline-read bug is distinct from
-    // the CHECKPOINT/compaction crashes discussed in compactDuckLake() below and
-    // package.json's "_comments" entry; it has not been re-verified against the
-    // currently pinned DuckDB/DuckLake version.)
-    await conn.run(`ATTACH 'ducklake:' AS ducklake (DATA_PATH '${escapedDataPath}', AUTOMATIC_MIGRATION true, DATA_INLINING_ROW_LIMIT 0);`);
+    // Small writes are inlined: an INSERT of fewer than DATA_INLINING_ROW_LIMIT
+    // rows is stored in the metadata catalog (Postgres) instead of creating a
+    // Parquet file, and scheduled maintenance (src/console/maintenance.js)
+    // flushes the inlined rows to Parquet in bulk. This is what keeps one-row-
+    // per-request ingestion from producing one tiny file per request.
+    //
+    // History: this used to be forced to 0 because, on an older DuckLake build,
+    // inlined rows in columns added by ALTER TABLE ADD COLUMN (the blob
+    // metadata columns) read back as NULL. Re-verified fixed on DuckDB 2.0.0 /
+    // DuckLake 1.1 (inline reads, reads on fresh connections, the user-query
+    // instance and after ducklake_flush_inlined_data all return the values; the
+    // blob metadata tests in test/test-blob.js and test/api.test.js pass with
+    // inlining on). Set DATA_INLINING_ROW_LIMIT=0 to restore the old behaviour.
+    const inliningLimit = dataInliningRowLimit();
+    await conn.run(`ATTACH 'ducklake:' AS ducklake (DATA_PATH '${escapedDataPath}', AUTOMATIC_MIGRATION true, DATA_INLINING_ROW_LIMIT ${inliningLimit});`);
     await conn.run("USE ducklake;");
 
     // Workaround for a DuckDB optimizer bug that corrupts inline DuckLake VARCHAR
@@ -194,14 +214,19 @@ async function _attachDuckLake(label) {
         const extResult = await conn.run(`SELECT current_setting('extension_directory')`);
         const extSetting = String((await extResult.getRows())[0]?.[0] || '');
         const extensionDir = path.resolve(extSetting || path.join(os.homedir(), '.duckdb', 'extensions')) + path.sep;
-        const allowed = [path.resolve(dataPath) + path.sep, extensionDir];
+        // Object storage: the S3 secret stays (reads need it; its values are
+        // never displayed, see above) and the bucket prefix is the only
+        // remote location the instance may read.
+        const allowed = [remote ? dataPath : path.resolve(dataPath) + path.sep, extensionDir];
         const list = allowed.map(d => `'${d.replace(/'/g, "''")}'`).join(', ');
         await conn.run(`SET GLOBAL allowed_directories = [${list}];`);
         await conn.run('SET GLOBAL enable_external_access = false;');
         console.log(`[DB:${label}] External access disabled (file access limited to ${allowed.join(', ')}).`);
     } else {
-        const consolePath = path.join(dataPath, '_console') + path.sep;
-        try { await fs.mkdir(consolePath, { recursive: true }); } catch (e) { /* attach reports problems */ }
+        const consolePath = joinDataPath(dataPath, '_console');
+        if (!remote) {
+            try { await fs.mkdir(consolePath, { recursive: true }); } catch (e) { /* attach reports problems */ }
+        }
         await conn.run(`ATTACH 'ducklake:' AS ${CONSOLE_CATALOG} (DATA_PATH '${consolePath.replace(/'/g, "''")}', METADATA_SCHEMA '${CONSOLE_CATALOG}', AUTOMATIC_MIGRATION true, DATA_INLINING_ROW_LIMIT 1000000);`);
     }
 
@@ -577,48 +602,60 @@ export async function executeUserSql(sql, { timeoutMs = userQueryTimeoutMs(), pr
 }
 
 /**
- * Run DuckLake maintenance (flush inlined data, snapshot expiry, file
- * compaction, orphaned-file cleanup) on the primary instance. Safe to call
- * repeatedly.
+ * Run DuckLake maintenance on the primary instance and report what it did:
+ *   flush    write inlined (Postgres-resident) rows out to Parquet
+ *   merge    merge adjacent small Parquet files (ducklake_merge_adjacent_files)
+ *   rewrite  rewrite files with many deleted rows (ducklake_rewrite_data_files)
+ *   expire   expire snapshots older than SNAPSHOT_RETENTION_DAYS (if set)
+ *   cleanup  delete files no snapshot references any more, and orphaned
+ *            files, older than the FILE_CLEANUP_GRACE_MINUTES grace period
+ * Steps can be switched off individually. Per-table failures are collected
+ * rather than thrown so one bad table does not stop the rest.
  *
- * Invoked at startup so that gateways that have been ingesting one row
- * per request for a long time don't accumulate millions of tiny Parquet
- * files. Logs and swallows errors so a maintenance failure does not
- * prevent the gateway from coming up.
+ * Called only by src/console/maintenance.js, which claims each run (scheduled,
+ * startup or manual) so exactly one gateway instance performs it.
  *
  * This deliberately does NOT run a single `CHECKPOINT ducklake`. CHECKPOINT
- * is sugar for the same six calls below run back-to-back on one connection,
- * which is exactly what triggers duckdb/ducklake#1108: a schema-cache key
- * collision after DuckLake's automatic v0.3->v0.4 ducklake_schema_versions
- * migration, provoked by per-table schema evolution (we do ALTER TABLE ADD
- * COLUMN for blob metadata — see the DATA_INLINING_ROW_LIMIT comment above).
- * Per the upstream-confirmed workaround, ducklake_merge_adjacent_files and
- * ducklake_rewrite_data_files run on a fresh, unpooled connection per table so
- * no single connection's schema cache ever holds more than one table's entry.
- * See package.json's "_comments"."@duckdb/node-api" entry for the full history
- * (including the now-fixed #525 crash this replaced) and what to re-check
- * before changing this again.
+ * is sugar for the same calls run back-to-back on one connection, which is
+ * exactly what triggers duckdb/ducklake#1108: a schema-cache key collision
+ * after DuckLake's automatic v0.3->v0.4 ducklake_schema_versions migration,
+ * provoked by per-table schema evolution (we do ALTER TABLE ADD COLUMN for
+ * blob metadata). Per the upstream-confirmed workaround,
+ * ducklake_merge_adjacent_files and ducklake_rewrite_data_files run on a
+ * fresh, unpooled connection per table so no single connection's schema cache
+ * ever holds more than one table's entry. See package.json's
+ * "_comments"."@duckdb/node-api" entry for the full history (including the
+ * now-fixed #525 crash this replaced) and what to re-check before changing
+ * this again.
  */
-export async function compactDuckLake() {
-    if (process.env.DISABLE_DUCKLAKE_COMPACTION === '1') {
-        console.warn('[Compact] Skipped: DISABLE_DUCKLAKE_COMPACTION=1.');
-        return;
-    }
+export async function runMaintenance({
+    flush = true, merge = true, rewrite = true, expire = true, cleanup = true, deleteThreshold = null,
+} = {}) {
     const start = Date.now();
-    console.log('[Compact] Running DuckLake maintenance...');
-    let tableCount = 0;
-    try {
-        await withConnection(async (conn) => {
-            await conn.run("CALL ducklake_flush_inlined_data('ducklake')");
-            await expireSnapshots(conn);
-        });
+    const stats = {
+        tables: 0, filesBefore: 0, filesAfter: 0, bytesBefore: 0, bytesAfter: 0,
+        deleteFilesBefore: 0, deleteFilesAfter: 0, rowsFlushed: 0,
+        filesMerged: 0, filesMergedInto: 0, filesRewritten: 0, filesRewrittenInto: 0,
+        snapshotsExpired: null, filesCleaned: 0, orphansDeleted: 0, failures: [], durationMs: 0,
+    };
+    const fail = (table, step, err) => stats.failures.push({ table, step, error: String(err?.message || err).split('\n')[0] });
 
-        const tables = await execute(
-            "SELECT table_name FROM duckdb_tables() WHERE database_name = 'ducklake'"
-        );
-        tableCount = tables.length;
+    const tables = (await execute(
+        "SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'ducklake' ORDER BY schema_name, table_name"
+    ));
+    stats.tables = tables.length;
+    const before = await lakeFileStats(tables);
+    Object.assign(stats, { filesBefore: before.files, bytesBefore: before.bytes, deleteFilesBefore: before.deleteFiles });
 
-        for (const { table_name } of tables) {
+    if (flush) {
+        try {
+            const rows = await execute("CALL ducklake_flush_inlined_data('ducklake')");
+            stats.rowsFlushed = rows.reduce((n, r) => n + Number(r.rows_flushed || 0), 0);
+        } catch (err) { fail(null, 'flush', err); }
+    }
+
+    if (merge || rewrite) {
+        for (const { schema_name: schema, table_name: table } of tables) {
             // Deliberately bypasses getConnection()/the pool: a genuinely fresh
             // DuckDBInstance connection is what keeps this table's schema-cache
             // entry isolated (see function doc above).
@@ -626,24 +663,92 @@ export async function compactDuckLake() {
             const conn = await inst.connect();
             try {
                 await conn.run('USE ducklake;');
-                await conn.run("CALL ducklake_merge_adjacent_files('ducklake', ?)", [table_name], [VARCHAR]);
-                await conn.run("CALL ducklake_rewrite_data_files('ducklake', ?)", [table_name], [VARCHAR]);
-            } catch (err) {
-                console.warn(`[Compact] Maintenance failed for table "${table_name}":`, err.message || err);
+                if (merge) {
+                    try {
+                        const r = await _readRows(await conn.run(
+                            "CALL ducklake_merge_adjacent_files('ducklake', ?, schema => ?)", [table, schema], [VARCHAR, VARCHAR]));
+                        for (const row of r) { stats.filesMerged += Number(row.files_processed || 0); stats.filesMergedInto += Number(row.files_created || 0); }
+                    } catch (err) { fail(table, 'merge', err); }
+                }
+                if (rewrite) {
+                    try {
+                        const threshold = deleteThreshold === null || deleteThreshold === undefined ? '' : `, delete_threshold => ${Number(deleteThreshold)}`;
+                        const r = await _readRows(await conn.run(
+                            `CALL ducklake_rewrite_data_files('ducklake', ?, schema => ?${threshold})`, [table, schema], [VARCHAR, VARCHAR]));
+                        for (const row of r) { stats.filesRewritten += Number(row.files_processed || 0); stats.filesRewrittenInto += Number(row.files_created || 0); }
+                    } catch (err) { fail(table, 'rewrite', err); }
+                }
             } finally {
                 try { await conn.close(); } catch (e) { }
             }
         }
-
-        await withConnection(async (conn) => {
-            await cleanupOldFiles(conn);
-            await conn.run("CALL ducklake_delete_orphaned_files('ducklake')");
-        });
-
-        console.log(`[Compact] DuckLake maintenance done in ${Date.now() - start}ms (${tableCount} tables)`);
-    } catch (err) {
-        console.warn('[Compact] DuckLake maintenance failed:', err.message || err);
     }
+
+    if (expire) {
+        try {
+            await withConnection(async (conn) => {
+                const days = snapshotRetentionDays();
+                if (days === null) return;
+                const r = await _readRows(await conn.run(`CALL ducklake_expire_snapshots('ducklake', older_than => now() - INTERVAL ${days} DAY)`));
+                stats.snapshotsExpired = r.length;
+            });
+        } catch (err) { fail(null, 'expire', err); }
+    }
+
+    if (cleanup) {
+        try {
+            await withConnection(async (conn) => {
+                stats.filesCleaned = (await _readRows(await conn.run(cleanupOldFilesSql()))).length;
+                // Orphans get the same grace period: another gateway instance
+                // may be writing a file that is not committed yet.
+                stats.orphansDeleted = (await _readRows(await conn.run(
+                    `CALL ducklake_delete_orphaned_files('ducklake', older_than => now() - INTERVAL ${FILE_CLEANUP_GRACE_MINUTES} MINUTE)`))).length;
+            });
+        } catch (err) { fail(null, 'cleanup', err); }
+    }
+
+    const after = await lakeFileStats(tables);
+    Object.assign(stats, { filesAfter: after.files, bytesAfter: after.bytes, deleteFilesAfter: after.deleteFiles });
+    stats.durationMs = Date.now() - start;
+    return stats;
+}
+
+/** Active data/delete file counts and bytes across `tables` (current snapshot). */
+async function lakeFileStats(tables) {
+    const out = { files: 0, bytes: 0, deleteFiles: 0 };
+    if (!tables.length) return out;
+    await withConnection(async (conn) => {
+        for (const { schema_name: schema, table_name: table } of tables) {
+            try {
+                const [row] = await _readRows(await conn.run(
+                    `SELECT count(*) AS files, coalesce(sum(data_file_size_bytes), 0) AS bytes, count(delete_file) AS deletes
+                     FROM ducklake_list_files('ducklake', ?, schema => ?)`, [table, schema], [VARCHAR, VARCHAR]));
+                out.files += Number(row?.files || 0);
+                out.bytes += Number(row?.bytes || 0);
+                out.deleteFiles += Number(row?.deletes || 0);
+            } catch (e) { /* table dropped meanwhile */ }
+        }
+    });
+    return out;
+}
+
+/** Current file counts for the console (no changes). */
+export async function getLakeFileStats() {
+    const tables = await execute("SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'ducklake'");
+    return { tables: tables.length, ...(await lakeFileStats(tables)) };
+}
+
+/** One-line summary of runMaintenance() stats for logs, the run log and the audit log. */
+export function describeMaintenance(s) {
+    const mb = (b) => `${(b / 1048576).toFixed(1)} MB`;
+    const parts = [`${s.tables} table(s); data files ${s.filesBefore} -> ${s.filesAfter} (${mb(s.bytesBefore)} -> ${mb(s.bytesAfter)})`];
+    if (s.rowsFlushed) parts.push(`flushed ${s.rowsFlushed} inlined row(s)`);
+    if (s.filesMerged) parts.push(`merged ${s.filesMerged} file(s) into ${s.filesMergedInto}`);
+    if (s.filesRewritten) parts.push(`rewrote ${s.filesRewritten} file(s) with deletes into ${s.filesRewrittenInto}`);
+    if (s.snapshotsExpired) parts.push(`expired ${s.snapshotsExpired} snapshot(s)`);
+    if (s.filesCleaned || s.orphansDeleted) parts.push(`deleted ${s.filesCleaned} old and ${s.orphansDeleted} orphaned file(s)`);
+    if (s.failures.length) parts.push(`${s.failures.length} failure(s): ${s.failures.slice(0, 3).map(f => `${f.table ? `${f.table} ` : ''}${f.step}: ${f.error}`).join('; ')}`);
+    return parts.join('; ');
 }
 
 /**
@@ -664,10 +769,12 @@ export function snapshotRetentionDays() {
 // query that started before a rewrite/expiry can finish reading them.
 const FILE_CLEANUP_GRACE_MINUTES = 5;
 
+// With no arguments ducklake_cleanup_old_files() keeps recently scheduled
+// files much longer, so replaced files would linger on disk.
+const cleanupOldFilesSql = () => `CALL ducklake_cleanup_old_files('ducklake', older_than => now() - INTERVAL ${FILE_CLEANUP_GRACE_MINUTES} MINUTE)`;
+
 async function cleanupOldFiles(conn) {
-    // With no arguments ducklake_cleanup_old_files() keeps recently scheduled
-    // files much longer, so replaced files would linger on disk.
-    await conn.run(`CALL ducklake_cleanup_old_files('ducklake', older_than => now() - INTERVAL ${FILE_CLEANUP_GRACE_MINUTES} MINUTE)`);
+    await conn.run(cleanupOldFilesSql());
 }
 
 async function expireSnapshots(conn) {
@@ -681,7 +788,7 @@ async function expireSnapshots(conn) {
  * Reclaim storage after rows were deleted from `tables`: rewrite their data
  * files without the deleted rows, expire snapshots past the retention window
  * (if one is set) and remove files no snapshot references any more. Each
- * rewrite uses a fresh connection, as in compactDuckLake() (ducklake#1108).
+ * rewrite uses a fresh connection, as in runMaintenance() (ducklake#1108).
  * Returns a short human-readable summary.
  */
 export async function reclaimTableStorage(tables) {
@@ -703,7 +810,7 @@ export async function reclaimTableStorage(tables) {
         await cleanupOldFiles(conn);
     });
     // Files replaced just now are still inside the grace period; delete them
-    // once it has passed (startup maintenance also catches any left over).
+    // once it has passed (scheduled maintenance also catches any left over).
     const deferred = setTimeout(() => {
         withConnection(cleanupOldFiles).catch(err => console.warn('[Prune] Deferred file cleanup failed:', err.message || err));
     }, (FILE_CLEANUP_GRACE_MINUTES + 1) * 60 * 1000);
