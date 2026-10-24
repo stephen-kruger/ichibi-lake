@@ -9,7 +9,7 @@ import {
     storageConfig, buildS3SecretSql, isObjectStorePath, joinDataPath, withTrailingSlash, describeStorage, dataInliningRowLimit, S3_SECRET_NAME,
 } from '../src/storage.js';
 import { normaliseMaintenance, describeSteps, MAINTENANCE_DEFAULTS, MAINTENANCE_STEPS } from '../src/console/maintenance.js';
-import { isTransactionConflict } from '../src/console/store.js';
+import { isTransactionConflict } from '../src/conflict.js';
 
 let passed = 0, failed = 0;
 async function test(name, fn) {

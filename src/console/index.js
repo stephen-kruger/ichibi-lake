@@ -105,6 +105,8 @@ function ensureSetupCode() {
  * Initialise console tables, load setting overrides and start background
  * jobs. Called from the gateway's startup sequence once DuckLake is attached.
  */
+let refreshTimer = null;
+
 export async function initConsole() {
     await store.initConsoleTables();
     await store.refreshOverrides();
@@ -112,10 +114,14 @@ export async function initConsole() {
 
     if (await store.countUsers() === 0) ensureSetupCode();
 
-    const refresh = setInterval(() => {
-        store.refreshOverrides().catch(err => console.warn('[Console] Settings refresh failed:', err.message || err));
-    }, SETTINGS_REFRESH_MS);
-    refresh.unref?.();
+    // initConsole() is re-run when a later startup step fails (src/index.js),
+    // so start the refresh interval only once.
+    if (!refreshTimer) {
+        refreshTimer = setInterval(() => {
+            store.refreshOverrides().catch(err => console.warn('[Console] Settings refresh failed:', err.message || err));
+        }, SETTINGS_REFRESH_MS);
+        refreshTimer.unref?.();
+    }
 
     await startPruneScheduler();
     // Lake maintenance (flush/merge/rewrite/expire/cleanup); also performs the

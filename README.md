@@ -138,6 +138,7 @@ The gateway runs two DuckDB instances: a **primary** instance (connection pool) 
 | `DATA_INLINING_ROW_LIMIT` | `1000` | A write of fewer rows than this is stored in the Postgres catalog instead of creating a Parquet file; [lake maintenance](#47-lake-maintenance-small-files) flushes these rows to Parquet in bulk. `0` = every write creates a Parquet file (the behaviour before this setting existed) |
 | `DISABLE_DUCKPGQ` | *(unset)* | Set to `1` to disable the DuckPGQ graph extension |
 | `DISABLE_DUCKLAKE_COMPACTION` | *(unset)* | Set to `1` to stop all [lake maintenance](#47-lake-maintenance-small-files) runs (scheduled, startup and manual). Emergency switch only: without maintenance, inlined rows are never flushed and small files are never merged |
+| `STARTUP_ATTEMPTS` | `5` | How often the startup sequence (RBAC/ACL bootstrap, migrations, admin console) is attempted before the process exits so its supervisor can restart it. Each step is also retried on DuckLake transaction conflicts, which occur when several instances start against one catalog at the same moment |
 
 The DuckDB extensions the gateway needs (`ducklake`, `postgres`, `duckpgq`, and `httpfs`/`aws` for object storage) are pre-installed in the Docker image. When running natively they are downloaded on first start (or run `node scripts/install-extensions.js` once).
 
