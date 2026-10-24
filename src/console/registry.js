@@ -58,6 +58,11 @@ export const SETTINGS = [
         help: 'How long a console login stays valid. Applies to new logins.',
     },
     {
+        key: 'METRICS_TOKEN', section: 'security', type: 'secret', default: '',
+        editable: false, label: 'Metrics bearer token',
+        help: 'Bearer token for GET /metrics. When unset, /metrics requires a superuser API key.',
+    },
+    {
         // Edited on the API Keys page (which also reconciles RBAC rows), never
         // through the generic settings form.
         key: 'API_KEYS', section: 'security', type: 'list', editable: true, live: true, hidden: true,
@@ -95,6 +100,40 @@ export const SETTINGS = [
         key: 'USER_QUERY_CONCURRENCY', section: 'query', type: 'number', default: '4',
         min: 1, max: 256, editable: true, live: true, label: 'User query concurrency',
         help: 'Maximum user SQL queries executing at once; the rest queue.',
+    },
+    {
+        key: 'USER_QUERY_STREAM_TIMEOUT_MS', section: 'query', type: 'number', default: '300000',
+        min: 1000, max: 86400000, editable: true, live: true, label: 'Streaming query timeout (ms)',
+        help: 'Wall-clock limit for a whole NDJSON POST /query response, including the transfer.',
+    },
+    {
+        key: 'QUERY_MAX_ROWS', section: 'query', type: 'number', default: '100000',
+        min: 1, max: 100000000, editable: true, live: true, label: 'Max rows per JSON query',
+        help: 'Row cap for POST /query JSON responses; larger results are truncated and flagged.',
+    },
+    {
+        key: 'QUERY_STREAM_MAX_ROWS', section: 'query', type: 'number', default: '10000000',
+        min: 1, max: 10000000000, editable: true, live: true, label: 'Max rows per streamed query',
+        help: 'Row cap for POST /query NDJSON responses.',
+    },
+    {
+        key: 'EXPORT_MAX_ROWS', section: 'query', type: 'number', default: '5000000',
+        min: 1, max: 10000000000, editable: true, live: true, label: 'Max rows per table export',
+        help: 'Row cap for GET /tables/:tableName/export; larger exports are truncated and flagged in headers.',
+    },
+    {
+        key: 'EXPORT_CONCURRENCY', section: 'query', type: 'number', default: '2',
+        min: 1, max: 64, editable: true, live: true, label: 'Concurrent table exports',
+        help: 'Exports running at once; further requests get 429.',
+    },
+    {
+        key: 'EXPORT_TIMEOUT_MS', section: 'query', type: 'number', default: '600000',
+        min: 1000, max: 86400000, editable: true, live: true, label: 'Table export timeout (ms)',
+        help: 'Wall-clock limit for one export, including the download.',
+    },
+    {
+        key: 'EXPORT_TMP_DIR', section: 'query', type: 'string', default: '',
+        editable: false, label: 'Export temp directory', help: 'Where Parquet exports are staged (default: the OS temp dir).',
     },
     {
         key: 'PRIMARY_POOL_SIZE', section: 'query', type: 'number', default: '4',

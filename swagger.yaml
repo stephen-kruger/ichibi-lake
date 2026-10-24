@@ -793,6 +793,184 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /tables/{tableName}/export:
+    get:
+      summary: Export a table as Parquet, CSV or NDJSON
+      description: |
+        Streams the table (optionally filtered and sorted, with the same parameters as
+        `GET /tables/{tableName}`) as a file download. Requires read access to the table;
+        system tables (`_`-prefixed) return 404.
+
+        CSV and NDJSON are streamed from DuckDB chunk by chunk without temp files (BLOBs
+        base64-encoded). Parquet is written by DuckDB to a temp file in EXPORT_TMP_DIR, streamed
+        with a Content-Length, then deleted. Every export is capped at EXPORT_MAX_ROWS rows;
+        the `X-Total-Rows`, `X-Row-Count` and `X-Export-Truncated` headers say up front whether
+        the file is complete. At most EXPORT_CONCURRENCY exports run at once (429 otherwise),
+        each within EXPORT_TIMEOUT_MS.
+      parameters:
+        - in: path
+          name: tableName
+          schema:
+            type: string
+          required: true
+          description: The table to export.
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [parquet, csv, ndjson]
+            default: parquet
+          description: File format.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 0
+          description: Lower the row cap for this export (cannot raise EXPORT_MAX_ROWS).
+        - in: query
+          name: sort
+          schema:
+            type: string
+          description: Column to sort by; prefix with '-' for descending.
+        - in: query
+          name: after
+          schema:
+            type: string
+          description: Keyset cursor; only rows after this value of the sort column (requires sort).
+        - in: query
+          name: "[columnName]"
+          schema:
+            type: string
+          description: Any other query parameter is an equality filter on that column.
+      responses:
+        '200':
+          description: The exported file
+          headers:
+            Content-Disposition:
+              description: attachment; filename="<table>.<ext>"
+              schema:
+                type: string
+            X-Total-Rows:
+              description: Rows matching the filters.
+              schema:
+                type: integer
+            X-Row-Count:
+              description: Rows in this file.
+              schema:
+                type: integer
+            X-Export-Truncated:
+              description: "`true` when the row cap cut the export short."
+              schema:
+                type: string
+            X-Row-Cap:
+              description: The row cap that applied.
+              schema:
+                type: integer
+          content:
+            application/vnd.apache.parquet:
+              schema:
+                type: string
+                format: binary
+            text/csv:
+              schema:
+                type: string
+            application/x-ndjson:
+              schema:
+                type: string
+        '400':
+          description: Unknown format, invalid limit, or `after` without a valid `sort`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid API key
+        '403':
+          description: No read access to the table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Table not found (or a system table)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Too many concurrent exports; retry after the Retry-After seconds
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      summary: Liveness check
+      description: Returns 200 while the gateway process is responsive. No authentication and no database access.
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  uptimeSeconds:
+                    type: integer
+                    example: 3600
+
+  /health/ready:
+    get:
+      summary: Readiness check
+      description: >-
+        Returns 200 when startup has finished, the DuckLake catalog is attached and the metadata
+        Postgres answers a query; otherwise 503 with the failing check. No authentication.
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      description: >-
+        Prometheus text exposition (version 0.0.4): request counts and latency by route template,
+        user-query gate (active, queued, timeouts), exports, pruning job outcomes, Kafka consumer
+        lag, DuckLake table/file counts and process memory. When METRICS_TOKEN is set it requires
+        `Authorization: Bearer <METRICS_TOKEN>`; otherwise a superuser API key (x-api-key header or
+        bearer token).
+      security:
+        - MetricsBearer: []
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  # HELP ichibi_user_query_active User SQL queries executing on the isolated instance.
+                  # TYPE ichibi_user_query_active gauge
+                  ichibi_user_query_active 0
+        '401':
+          description: Missing or wrong credentials
+
   /kafka-sink:
     post:
       summary: Kafka HTTP Sink Endpoint
@@ -1013,7 +1191,7 @@ paths:
 
   /query:
     post:
-      summary: Execute a SQL query
+      summary: Execute a SQL query (JSON or streamed NDJSON)
       description: >-
         Executes a read-only SQL query against the DuckLake catalog. Superuser API keys only
         (RBAC `superuser` role, or any key from API_KEYS when RBAC is not configured); other keys
@@ -1021,24 +1199,53 @@ paths:
         schema or data, and DuckDB introspection functions that reveal connection details
         (duckdb_databases, duckdb_settings, current_setting, pragma_*), are rejected with 403.
         Server files outside the lake are not readable, and system tables are not exposed.
+
+
+        Results are read in chunks and capped. The default JSON response holds at most
+        QUERY_MAX_ROWS rows (USER_QUERY_TIMEOUT_MS). For large results request NDJSON with
+        `?format=ndjson` or `Accept: application/x-ndjson`: rows are streamed one JSON object per
+        line as DuckDB produces them (at most QUERY_STREAM_MAX_ROWS, USER_QUERY_STREAM_TIMEOUT_MS for
+        the whole transfer), followed by a trailer line
+        `{"_ichibi":{"rowCount":n,"truncated":bool,"maxRows":n}}`, or
+        `{"_ichibi":{"error":"...","status":504}}` if the query failed after streaming began.
+        Errors before the first row are returned as a normal JSON error. Values serialise the same
+        way in both formats (BIGINT as string, BLOB as base64).
+      parameters:
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [json, ndjson]
+          description: Response format. Defaults to `json`, or `ndjson` when the Accept header asks for application/x-ndjson.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
+              required: [sql]
               properties:
                 sql:
                   type: string
-                  description: The SQL query to execute. Optional if tableName is provided or defaults.
+                  description: The read-only SQL query to execute.
                   example: "SELECT * FROM ichibi_table LIMIT 10"
-                tableName:
-                  type: string
-                  description: The target table name for the default query if sql is omitted.
-                  example: "ichibi_table"
+                maxRows:
+                  type: integer
+                  minimum: 1
+                  description: Lower the row cap for this request (cannot raise QUERY_MAX_ROWS / QUERY_STREAM_MAX_ROWS).
+                  example: 1000
       responses:
         '200':
           description: Query executed successfully
+          headers:
+            X-Result-Truncated:
+              description: "`true` when a JSON result was cut at the row cap (absent otherwise)."
+              schema:
+                type: string
+            X-Row-Cap:
+              description: Row cap that applies to an NDJSON stream.
+              schema:
+                type: integer
           content:
             application/json:
               schema:
@@ -1049,20 +1256,48 @@ paths:
                     example: true
                   rows:
                     type: array
-                    description: An array of rows containing the query results.
+                    description: Result rows as objects keyed by column name.
                     items:
-                      type: array
-                      items:
-                        type: string
-                    example: [["1", "duck"], ["2", "lake"]]
+                      type: object
+                    example: [{"id": "1", "name": "duck"}, {"id": "2", "name": "lake"}]
+                  rowCount:
+                    type: integer
+                    example: 2
+                  truncated:
+                    type: boolean
+                    description: true when the result had more rows than maxRows.
+                    example: false
+                  maxRows:
+                    type: integer
+                    description: The row cap that applied.
+                    example: 100000
+            application/x-ndjson:
+              schema:
+                type: string
+                example: |
+                  {"id":"1","name":"duck"}
+                  {"id":"2","name":"lake"}
+                  {"_ichibi":{"rowCount":2,"truncated":false,"maxRows":10000000}}
         '400':
-          description: Bad request (e.g. missing SQL query)
+          description: Bad request (missing SQL, invalid maxRows, unknown format)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Not a superuser key, or the SQL is not read-only
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error (e.g. syntax error in SQL)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '504':
+          description: The JSON query exceeded USER_QUERY_TIMEOUT_MS
           content:
             application/json:
               schema:
@@ -1451,7 +1686,30 @@ components:
       type: apiKey
       in: header
       name: x-api-key
+    MetricsBearer:
+      type: http
+      scheme: bearer
+      description: METRICS_TOKEN (GET /metrics only).
   schemas:
+    Readiness:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ready, not ready]
+        checks:
+          type: object
+          properties:
+            startup:
+              type: string
+              description: starting, ready or failed
+              example: ready
+            ducklake:
+              type: string
+              example: ok
+            postgres:
+              type: string
+              example: ok
     Error:
       type: object
       properties:

@@ -10,6 +10,8 @@ import {
     execute,
     executeWithParams,
     executeUserSql,
+    streamUserSql,
+    userQueryStats,
     getTableColumns,
     invalidateColumnCache,
     compactDuckLake,
@@ -33,6 +35,8 @@ import { initRbacTables, bootstrapRbac, isValidApiKey, checkAccess, isRbacConfig
 import { assertReadOnlySql } from './sql-guard.js';
 import adminRouter from './rbac-api.js';
 import { createConsoleRouter, initConsole, loadSettingOverrides, publicBaseUrl } from './console/index.js';
+import { EXPORT_FORMATS, runExport, exportStats } from './export.js';
+import { httpMetricsMiddleware, renderMetrics } from './metrics.js';
 import swaggerUi from 'swagger-ui-express';
 import YAML from 'yamljs';
 import { createHandler } from 'graphql-http/lib/use/express';
@@ -59,6 +63,7 @@ process.emitWarning = (warning, ...args) => {
 const app = express();
 const port = process.env.PORT || 3000;
 
+app.use(httpMetricsMiddleware);
 app.use(compression());
 // Admin console (password-protected web UI). Mounted before CORS so console
 // responses never carry permissive cross-origin headers.
@@ -220,6 +225,99 @@ async function applyDefaultPartitioning(tableName) {
 app.get('/swagger.yaml', (req, res) => {
     res.setHeader('Content-Type', 'text/yaml');
     res.sendFile(path.join(process.cwd(), 'swagger.yaml'));
+});
+
+// --- Operations: health checks and metrics ---
+
+// Set once the startup sequence in app.listen() below has finished (RBAC/ACL
+// bootstrap, console, compaction). Until then the gateway is live but not ready.
+let startupState = 'starting';
+
+function withTimeout(promise, ms, what) {
+    let timer;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms); }),
+    ]).finally(() => clearTimeout(timer));
+}
+
+const HEALTH_CHECK_TIMEOUT_MS = 5000;
+
+// GET /health - liveness. No auth, no database access: answers as long as the
+// Node event loop is responsive. Used by the compose healthcheck.
+app.get('/health', (req, res) => {
+    res.set('Cache-Control', 'no-store').json({ status: 'ok', uptimeSeconds: Math.round(process.uptime()) });
+});
+
+// GET /health/ready - readiness. No auth. 200 only when startup finished, the
+// DuckLake catalog is attached on the primary instance and its Postgres
+// metadata database answers a query; otherwise 503 with the failing check.
+app.get('/health/ready', async (req, res) => {
+    const checks = { startup: startupState, ducklake: 'unknown', postgres: 'unknown' };
+    try {
+        const rows = await withTimeout(
+            execute("SELECT count(*) AS n FROM duckdb_databases() WHERE database_name = 'ducklake' AND type = 'ducklake'"),
+            HEALTH_CHECK_TIMEOUT_MS, 'DuckLake check');
+        checks.ducklake = Number(rows[0]?.n) === 1 ? 'ok' : 'not attached';
+    } catch (err) {
+        checks.ducklake = `error: ${String(err.message || err).split('\n')[0]}`;
+    }
+    try {
+        // A real round trip to the metadata Postgres through DuckLake's own
+        // attachment (DuckLake caches nothing for this).
+        await withTimeout(
+            execute("SELECT * FROM postgres_query('__ducklake_metadata_ducklake', 'SELECT 1')"),
+            HEALTH_CHECK_TIMEOUT_MS, 'Postgres check');
+        checks.postgres = 'ok';
+    } catch (err) {
+        checks.postgres = `error: ${String(err.message || err).split('\n')[0]}`;
+    }
+    const ready = checks.startup === 'ready' && checks.ducklake === 'ok' && checks.postgres === 'ok';
+    res.set('Cache-Control', 'no-store').status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not ready', checks });
+});
+
+// DuckLake catalog size for /metrics, cached so frequent scrapes do not query
+// the metadata database every time.
+const LAKE_STATS_TTL_MS = 30000;
+let lakeStatsCache = { at: 0, value: null };
+async function lakeStats() {
+    if (Date.now() - lakeStatsCache.at < LAKE_STATS_TTL_MS) return lakeStatsCache.value;
+    let value = null;
+    try {
+        const rows = await withTimeout(execute(`
+            SELECT count(*) FILTER (WHERE NOT starts_with(table_name, '_')) AS tables,
+                   coalesce(sum(file_count), 0) AS files,
+                   coalesce(sum(file_size_bytes), 0) AS bytes
+            FROM ducklake_table_info('ducklake')`), HEALTH_CHECK_TIMEOUT_MS, 'DuckLake stats');
+        value = { tables: Number(rows[0].tables), files: Number(rows[0].files), bytes: Number(rows[0].bytes) };
+    } catch (err) {
+        console.warn('[Metrics] DuckLake stats query failed:', String(err.message || err).split('\n')[0]);
+    }
+    lakeStatsCache = { at: Date.now(), value };
+    return value;
+}
+
+// GET /metrics - Prometheus text format. With METRICS_TOKEN set, scrapers send
+// "Authorization: Bearer <METRICS_TOKEN>". Without it, a superuser API key is
+// required (x-api-key header or Bearer token), so metrics are never public by
+// default.
+app.get('/metrics', async (req, res) => {
+    const bearer = (req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+    const token = process.env.METRICS_TOKEN;
+    let allowed = false;
+    if (token) {
+        allowed = bearer === token;
+    } else {
+        const key = req.headers['x-api-key'] || bearer;
+        try { allowed = !!key && await isSuperuserKey(key); } catch (_) { allowed = false; }
+    }
+    if (!allowed) {
+        return res.status(401).set('WWW-Authenticate', 'Bearer').json({
+            error: token ? 'Unauthorized: missing or wrong METRICS_TOKEN bearer token' : 'Unauthorized: /metrics requires a superuser API key (or set METRICS_TOKEN)',
+        });
+    }
+    const body = renderMetrics({ userQuery: userQueryStats(), exports: exportStats(), lake: await lakeStats(), ready: startupState === 'ready' });
+    res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8').set('Cache-Control', 'no-store').send(body);
 });
 
 // --- 3. Authenticated API Routes ---
@@ -840,11 +938,56 @@ app.patch('/tables/:tableName/acl', async (req, res) => {
 //                    >= (DESC) the supplied value. Avoids the O(offset)
 //                    scan cost of deep LIMIT/OFFSET paging.
 //   <column>=<val>   simple column-equality filters (parameter-bound)
+// Build the filtered/sorted SELECT shared by GET /tables/:tableName and its
+// /export variant. Throws 400 for ?after without a valid ?sort. Returns the
+// WHERE / ORDER BY clauses with their bound parameters.
+function buildTableFilter(columns, query) {
+    const { sort, after, ...rest } = query;
+    const columnSet = new Set(columns);
+    const whereClauses = [];
+    const params = [];
+    const types = [];
+
+    // Simple column equality filters (unknown parameters are ignored)
+    for (const [key, value] of Object.entries(rest)) {
+        if (columnSet.has(key)) {
+            whereClauses.push(`"${key}" = ?`);
+            params.push(String(value));
+            types.push(VARCHAR);
+        }
+    }
+
+    // Sorting + optional keyset cursor
+    let sortColName = null;
+    let isDesc = false;
+    if (sort) {
+        isDesc = sort.startsWith('-');
+        const colName = isDesc ? sort.substring(1) : sort;
+        if (columnSet.has(colName)) sortColName = colName;
+    }
+
+    if (after !== undefined) {
+        if (!sortColName) {
+            const err = new Error('Keyset pagination ?after=... requires a valid ?sort=<column>');
+            err.statusCode = 400;
+            throw err;
+        }
+        // ASC: row > cursor; DESC: row < cursor.
+        whereClauses.push(`"${sortColName}" ${isDesc ? '<' : '>'} ?`);
+        params.push(String(after));
+        types.push(VARCHAR);
+    }
+
+    const where = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
+    const orderBy = sortColName ? ` ORDER BY "${sortColName}" ${isDesc ? 'DESC' : 'ASC'}` : '';
+    return { where, orderBy, params, types, sortColName };
+}
+
 app.get('/tables/:tableName', async (req, res) => {
     try {
         const { tableName } = req.params;
         assertSafeIdentifier(tableName, 'tableName');
-        const { limit = 50, offset = 0, sort, after, ...filters } = req.query;
+        const { limit = 50, offset = 0, ...query } = req.query;
 
         // 1. Resolve column list from the cache instead of issuing a per-request
         // `SELECT * LIMIT 0` probe against the Parquet table.
@@ -852,54 +995,18 @@ app.get('/tables/:tableName', async (req, res) => {
         if (!columns || columns.length === 0) {
             return res.status(404).json({ success: false, error: 'Table not found' });
         }
-        const columnSet = new Set(columns);
         await requireReadAccess(tableName, req);
 
-        const whereClauses = [];
-        const params = [];
-        const types = [];
+        // 2. Filters, sorting and keyset cursor
+        const { where, orderBy, params, types, sortColName } = buildTableFilter(columns, query);
+        let sql = `SELECT * FROM "${tableName}"${where}${orderBy}`;
 
-        // 2. Simple column equality filters
-        for (const [key, value] of Object.entries(filters)) {
-            if (columnSet.has(key)) {
-                whereClauses.push(`"${key}" = ?`);
-                params.push(String(value));
-                types.push(VARCHAR);
-            }
-        }
-
-        // 4. Sorting + optional keyset cursor
-        let sortColName = null;
-        let isDesc = false;
-        if (sort) {
-            isDesc = sort.startsWith('-');
-            const colName = isDesc ? sort.substring(1) : sort;
-            if (columnSet.has(colName)) sortColName = colName;
-        }
-
-        if (after !== undefined) {
-            if (!sortColName) {
-                return res.status(400).json({
-                    success: false,
-                    error: 'Keyset pagination ?after=... requires a valid ?sort=<column>',
-                });
-            }
-            // ASC: row > cursor; DESC: row < cursor.
-            whereClauses.push(`"${sortColName}" ${isDesc ? '<' : '>'} ?`);
-            params.push(String(after));
-            types.push(VARCHAR);
-        }
-
-        let sql = `SELECT * FROM "${tableName}"`;
-        if (whereClauses.length > 0) sql += ` WHERE ${whereClauses.join(' AND ')}`;
-        if (sortColName) sql += ` ORDER BY "${sortColName}" ${isDesc ? 'DESC' : 'ASC'}`;
-
-        // 5. Pagination. With keyset (`after`) we drop OFFSET entirely so
+        // 3. Pagination. With keyset (`after`) we drop OFFSET entirely so
         // deep pages stay O(limit) instead of O(offset+limit).
         const safeLimit = Math.max(0, parseInt(limit) || 0);
         const safeOffset = Math.max(0, parseInt(offset) || 0);
         sql += ` LIMIT ${safeLimit}`;
-        if (after === undefined && safeOffset > 0) sql += ` OFFSET ${safeOffset}`;
+        if (query.after === undefined && safeOffset > 0) sql += ` OFFSET ${safeOffset}`;
 
         const rows = await executeWithParams(sql, params, types);
 
@@ -917,16 +1024,155 @@ app.get('/tables/:tableName', async (req, res) => {
     }
 });
 
-// POST /query - Raw SQL query (read-only, isolated DuckDB instance with timeout)
-app.post('/query', async (req, res) => {
+// GET /tables/:tableName/export?format=parquet|csv|ndjson - Download a whole
+// (optionally filtered/sorted) table as a file. Same read-access check and the
+// same filter/sort/after parameters as GET /tables/:tableName; ?limit= lowers
+// the EXPORT_MAX_ROWS cap. See src/export.js for how each format is produced.
+app.get('/tables/:tableName/export', async (req, res) => {
     try {
-        const { sql } = req.body;
+        const { tableName } = req.params;
+        assertSafeIdentifier(tableName, 'tableName');
+        const { format = 'parquet', limit, offset, ...query } = req.query;
+        if (!Object.hasOwn(EXPORT_FORMATS, format)) {
+            return res.status(400).json({ success: false, error: `Unsupported export format "${format}". Use one of: ${Object.keys(EXPORT_FORMATS).join(', ')}` });
+        }
+        let safeLimit = null;
+        if (limit !== undefined) {
+            safeLimit = parseInt(limit, 10);
+            if (!Number.isInteger(safeLimit) || safeLimit < 0) {
+                return res.status(400).json({ success: false, error: 'limit must be a non-negative integer' });
+            }
+        }
+
+        const schema = await executeWithParams(
+            `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position`,
+            [tableName], [VARCHAR]
+        );
+        if (schema.length === 0) {
+            return res.status(404).json({ success: false, error: 'Table not found' });
+        }
+        await requireReadAccess(tableName, req);
+
+        const { where, orderBy, params, types } = buildTableFilter(schema.map(c => c.column_name), query);
+        // BLOBs travel base64-encoded in the text formats, like the JSON API.
+        const selectList = schema.map(({ column_name: c, data_type: t }) =>
+            format !== 'parquet' && /^BLOB/i.test(t) ? `base64("${c}") AS "${c}"` : `"${c}"`).join(', ');
+        await runExport({
+            format,
+            selectSql: `SELECT ${selectList} FROM "${tableName}"${where}${orderBy}`,
+            countSql: `SELECT count(*) FROM "${tableName}"${where}`,
+            params, types,
+            limit: safeLimit,
+            filename: tableName,
+            res,
+        });
+    } catch (error) {
+        if (!res.headersSent) res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    }
+});
+
+// POST /query - Raw SQL query (read-only, isolated DuckDB instance with timeout)
+//
+// Results are read from DuckDB in chunks and capped, so memory stays bounded:
+//   JSON (default)  {success, rows, rowCount, truncated, maxRows}; at most
+//                   QUERY_MAX_ROWS rows, within USER_QUERY_TIMEOUT_MS.
+//   NDJSON          ?format=ndjson or Accept: application/x-ndjson. One row
+//                   object per line, written as DuckDB produces them, then a
+//                   final trailer line {"_ichibi":{rowCount,truncated,maxRows}}
+//                   (plus "error" if the query failed mid-stream). At most
+//                   QUERY_STREAM_MAX_ROWS rows, within USER_QUERY_STREAM_TIMEOUT_MS
+//                   for the whole transfer.
+// A positive integer `maxRows` in the body lowers (never raises) the cap.
+const queryMaxRows = () => Math.max(1, parseInt(process.env.QUERY_MAX_ROWS || '100000', 10) || 100000);
+const queryStreamMaxRows = () => Math.max(1, parseInt(process.env.QUERY_STREAM_MAX_ROWS || '10000000', 10) || 10000000);
+const queryStreamTimeoutMs = () => Math.max(1000, parseInt(process.env.USER_QUERY_STREAM_TIMEOUT_MS || '300000', 10) || 300000);
+const NDJSON_TYPE = 'application/x-ndjson';
+
+function queryResponseFormat(req) {
+    const requested = req.query.format;
+    if (requested !== undefined) {
+        if (requested === 'json' || requested === 'ndjson') return requested;
+        const err = new Error(`Unsupported format "${requested}". Use json or ndjson.`);
+        err.statusCode = 400;
+        throw err;
+    }
+    return (req.headers.accept || '').includes(NDJSON_TYPE) ? 'ndjson' : 'json';
+}
+
+app.post('/query', async (req, res) => {
+    let streaming = false;
+    try {
+        const { sql, maxRows } = req.body || {};
         if (!sql) return res.status(400).json({ error: 'Missing sql in body' });
+        const format = queryResponseFormat(req);
+        let requestedCap = Infinity;
+        if (maxRows !== undefined) {
+            requestedCap = Number(maxRows);
+            if (!Number.isInteger(requestedCap) || requestedCap < 1) {
+                return res.status(400).json({ success: false, error: 'maxRows must be a positive integer' });
+            }
+        }
         await requireSuperuser(req);
         assertReadOnlySql(sql);
-        const rows = await executeUserSql(sql);
-        res.json({ success: true, rows });
+
+        // Interrupt the query if the client goes away before we finish.
+        const abort = new AbortController();
+        res.on('close', () => { if (!res.writableFinished) abort.abort(); });
+
+        if (format === 'json') {
+            const cap = Math.min(queryMaxRows(), requestedCap);
+            const rows = [];
+            const { truncated } = await streamUserSql(sql, {
+                maxRows: cap, signal: abort.signal,
+                onRows: (batch) => { for (const r of batch) rows.push(r); },
+            });
+            if (truncated) res.setHeader('X-Result-Truncated', 'true');
+            return res.json({ success: true, rows, rowCount: rows.length, truncated, maxRows: cap });
+        }
+
+        const cap = Math.min(queryStreamMaxRows(), requestedCap);
+        const writeChunk = async (text) => {
+            // The deadline or a disconnect can end the response while a chunk
+            // is being converted; never write after that.
+            if (res.writableEnded || res.destroyed) return;
+            if (!res.write(text)) {
+                await new Promise(resolve => {
+                    const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+                    res.on('drain', done);
+                    res.on('close', done);
+                });
+            }
+        };
+        let summary;
+        try {
+            summary = await streamUserSql(sql, {
+                maxRows: cap,
+                timeoutMs: queryStreamTimeoutMs(),
+                signal: abort.signal,
+                // Headers go out only once the query has started producing a
+                // result, so planning/binding errors still get a JSON error status.
+                onColumns: () => {
+                    streaming = true;
+                    res.status(200);
+                    res.setHeader('Content-Type', `${NDJSON_TYPE}; charset=utf-8`);
+                    res.setHeader('X-Row-Cap', String(cap));
+                },
+                onRows: (batch) => writeChunk(batch.map(r => JSON.stringify(r)).join('\n') + '\n'),
+            });
+        } catch (err) {
+            // Nothing sent yet (e.g. an execution error on the first chunk):
+            // answer with a normal JSON error status instead of a 200 stream.
+            if (!streaming || !res.headersSent) {
+                res.removeHeader('Content-Type');
+                res.removeHeader('X-Row-Cap');
+                throw err;
+            }
+            if (!res.destroyed) res.end(JSON.stringify({ _ichibi: { error: err.message, status: err.statusCode || 500 } }) + '\n');
+            return;
+        }
+        res.end(JSON.stringify({ _ichibi: { rowCount: summary.rowCount, truncated: summary.truncated, maxRows: cap } }) + '\n');
     } catch (error) {
+        if (res.headersSent || res.destroyed) return;
         res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
 });
@@ -1729,8 +1975,10 @@ app.listen(port, '0.0.0.0', async () => {
         // Compact tiny Parquet files left over from high-frequency one-row
         // ingestion. This is often the single biggest win for scan speed.
         await compactDuckLake();
+        startupState = 'ready';
         startKafkaConsumer().catch(err => console.error('Kafka Consumer Error:', err));
     } catch (err) {
+        startupState = 'failed';
         console.error('Startup Error:', err);
     }
 });

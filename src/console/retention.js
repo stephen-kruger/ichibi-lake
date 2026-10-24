@@ -23,6 +23,7 @@ import path from 'path';
 import { randomBytes } from 'crypto';
 import { execute, withConnection, VARCHAR, reclaimTableStorage, snapshotRetentionDays } from '../db.js';
 import * as store from './store.js';
+import { recordPruneJob } from '../metrics.js';
 import { parseCron, nextRun, validateCron } from './cron.js';
 
 const SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
@@ -516,6 +517,7 @@ async function runJob(jobId, rule, { trigger, username }) {
     const summary = `${processed} table(s) pruned, ${skipped} skipped, ${failures} failed; ${deletedTotal.toLocaleString()} row(s) deleted.` + (message ? ` ${message}` : '');
     await store.finishRun(jobId, { status, rowsDeleted: deletedTotal, message: summary });
     await store.recordRuleResult(rule.id, status, deletedTotal);
+    recordPruneJob(status, deletedTotal);
     if (deletedTotal > 0 || trigger === 'manual' || failures) {
         await store.audit(username || 'scheduler', 'prune.job', `${rule.name}: ${summary} (${trigger})`);
         console.log(`[Prune] ${rule.name}: ${summary} (${trigger})`);

@@ -1,5 +1,6 @@
 import { Kafka } from 'kafkajs';
 import { withConnection } from './db.js';
+import { recordKafkaLag } from './metrics.js';
 import { resolveTypeConflict, formatSchemaDefinition } from './schema-evolution.js';
 import { ensureTableAcl } from './acl.js';
 import { randomUUID } from 'crypto';
@@ -183,6 +184,12 @@ export async function startKafkaConsumer() {
     console.log(`[Kafka] Consumer connected to ${brokers.join(', ')}`);
 
     await consumer.subscribe({ topic: topicRegex, fromBeginning: false });
+
+    // Per-partition lag for GET /metrics; kafkajs reports it after every batch,
+    // so this costs no extra broker round trips.
+    consumer.on(consumer.events.END_BATCH_PROCESS, ({ payload }) => {
+        recordKafkaLag(payload.topic, payload.partition, payload.offsetLag);
+    });
 
     await consumer.run({
         eachMessage: async ({ topic, partition, message }) => {
