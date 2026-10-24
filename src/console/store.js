@@ -6,6 +6,7 @@
 import { randomBytes } from 'crypto';
 import { execute, executeWithParams, VARCHAR, BIGINT, BOOLEAN, CONSOLE_CATALOG } from '../db.js';
 import { SETTINGS, getSettingDef } from './registry.js';
+import { isTransactionConflict, retryOnConflict } from '../conflict.js';
 
 // Console tables live in their own catalog (see CONSOLE_CATALOG in src/db.js),
 // which the user-query instance never attaches.
@@ -436,25 +437,6 @@ export async function dueRuleIds(nowMs) {
         `SELECT id FROM ${PRUNE_RULES} WHERE enabled = 'true' AND (next_run_ms IS NULL OR next_run_ms <= ?)`,
         [BigInt(nowMs)], [BIGINT]);
     return rows.map(r => r.id);
-}
-
-/**
- * A commit that lost a race with another instance's write to the same rows
- * (DuckLake: "Transaction conflict ..."). For a claim this means another
- * instance got there first.
- */
-export function isTransactionConflict(err) {
-    return /Transaction conflict|Failed to commit DuckLake transaction/i.test(String(err?.message || err));
-}
-
-/** Run a write, retrying a few times when it loses a commit race (see isTransactionConflict). */
-async function retryOnConflict(fn, attempts = 5) {
-    for (let i = 1; ; i++) {
-        try { return await fn(); } catch (err) {
-            if (i >= attempts || !isTransactionConflict(err)) throw err;
-            await new Promise(r => setTimeout(r, 100 * i + Math.floor(Math.random() * 100)));
-        }
-    }
 }
 
 /**

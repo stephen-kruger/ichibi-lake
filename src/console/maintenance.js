@@ -158,6 +158,9 @@ async function runJob(runId, token, cfg, { trigger, username }) {
 // --- Scheduler -----------------------------------------------------------------------
 
 let timer = null;
+// Pending first tick; tracked so a repeated start (startup retry) does not
+// leave a second interval running.
+let startTimer = null;
 let ticking = false;
 
 async function tick() {
@@ -197,12 +200,16 @@ export async function startMaintenanceScheduler() {
     await store.releaseMaintenanceLeaseOfHost(`${os.hostname()}:`).catch(() => {});
     const cfg = await getMaintenanceConfig();
     if (timer) clearInterval(timer);
+    if (startTimer) clearTimeout(startTimer);
+    timer = null;
     const offset = Math.floor(Math.random() * 5000);
-    setTimeout(() => {
+    startTimer = setTimeout(() => {
+        startTimer = null;
         tick();
         timer = setInterval(tick, TICK_MS);
         timer.unref?.();
-    }, offset).unref?.();
+    }, offset);
+    startTimer.unref?.();
     if (cfg.enabled && cfg.runAtStartup && !(cfg.lastRunMs && Date.now() - cfg.lastRunMs < STARTUP_SKIP_MS)) {
         await startMaintenance({ trigger: 'startup' }).catch(err => console.warn('[Maintenance] Startup run not started:', err.message));
     }

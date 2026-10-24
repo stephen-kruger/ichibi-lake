@@ -525,6 +525,9 @@ async function runJob(jobId, rule, { trigger, username }) {
 // --- Scheduler -------------------------------------------------------------------------
 
 let timer = null;
+// Pending first tick; tracked so a repeated start (startup retry) does not
+// leave a second interval running.
+let startTimer = null;
 let ticking = false;
 
 async function tick() {
@@ -562,12 +565,16 @@ export async function startPruneScheduler() {
     // Runs left 'running' by an earlier process on this host (crash/restart).
     await store.abandonRunsOfHost(`${os.hostname()}:`).catch(() => {});
     if (timer) clearInterval(timer);
+    if (startTimer) clearTimeout(startTimer);
+    timer = null;
     const offset = Math.floor(Math.random() * 5000);
-    setTimeout(() => {
+    startTimer = setTimeout(() => {
+        startTimer = null;
         tick();
         timer = setInterval(tick, TICK_MS);
         timer.unref?.();
-    }, offset).unref?.();
+    }, offset);
+    startTimer.unref?.();
 }
 
 export function storageInfo() {
