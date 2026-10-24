@@ -23,7 +23,7 @@ import { invalidateAclCache } from '../acl.js';
 import { invalidateRbacCache } from '../rbac.js';
 import { listGraphDefinitions } from '../db.js';
 import * as consoleStore from './store.js';
-import { matchTables } from './retention.js';
+import { matchTables, isDateType, isEpochType } from './retention.js';
 
 export const SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 export const PAGE_SIZES = [25, 50, 100, 250, 500];
@@ -470,8 +470,6 @@ export async function addColumn(tableName, { name, type: rawType, nullable, defa
     });
 }
 
-const DATE_TYPE_RE = /^(DATE|TIMESTAMP)/i;
-
 /**
  * Count non-NULL values of `column` that cannot be converted to `type`, with a
  * few distinct examples, without changing anything.
@@ -516,10 +514,10 @@ export async function previewTypeChange(tableName, column, rawType) {
 async function convertColumnType(conn, tableName, col, type, { onInvalid } = {}) {
     const column = col.column_name;
     await assertNoGraphs(tableName, 'convert a column');
-    if (!DATE_TYPE_RE.test(type)) {
+    if (!isDateType(type) && !isEpochType(type)) {
         const rules = (await consoleStore.listPruneRules().catch(() => []))
             .filter(r => r.maxAgeValue && r.dateColumn === column && matchTables([tableName], r.tablePattern, r.excludePattern).length);
-        if (rules.length) throw httpError(409, `Pruning rule(s) ${rules.map(r => `"${r.name}"`).join(', ')} prune "${tableName}" by the age of "${column}"; change them before converting it to a non-date type.`);
+        if (rules.length) throw httpError(409, `Pruning rule(s) ${rules.map(r => `"${r.name}"`).join(', ')} prune "${tableName}" by the age of "${column}"; change them before converting it to a type that is not a date, timestamp or epoch number.`);
     }
     const lenient = onInvalid === 'null';
     if (!lenient) {

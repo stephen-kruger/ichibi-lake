@@ -11,7 +11,7 @@ import {
     generateSetupCode, generateApiKey,
 } from '../src/console/auth.js';
 import { SECTIONS, SETTINGS, getSettingDef, normaliseSettingValue, maskSecret } from '../src/console/registry.js';
-import { containedBlobPath, isSystemTable, matchTables, normaliseRule, buildPredicates, PROTECTED_TABLES } from '../src/console/retention.js';
+import { containedBlobPath, isSystemTable, matchTables, normaliseRule, buildPredicates, PROTECTED_TABLES, isLegacyMultiTable, detectEpochUnit, isEpochType, isDateType, normaliseConditions, buildConditionPredicate } from '../src/console/retention.js';
 import { parseCron, nextRun, nextRuns, validateCron } from '../src/console/cron.js';
 import { intervalToCron } from '../src/console/store.js';
 import { normaliseType, quoteIdent, quoteLiteral, buildWhere, wideningTargets, isEditableType, cleanDuckDbError } from '../src/console/data.js';
@@ -170,12 +170,24 @@ async function run() {
             assert.ok(PROTECTED_TABLES.has(t), `${t} in PROTECTED_TABLES`);
         }
     });
-    await test('rules cannot target system tables or use unsafe patterns', () => {
+    await test('a rule prunes exactly one table: no wildcards, lists or system tables', () => {
         const base = { name: 'r', maxAgeValue: 1, dateColumn: 'created', schedule: '@daily' };
-        assert.throws(() => normaliseRule({ ...base, tablePattern: '_rbac_users' }), /reserved for system tables/);
-        assert.throws(() => normaliseRule({ ...base, tablePattern: '_*' }), /reserved for system tables/);
-        assert.throws(() => normaliseRule({ ...base, tablePattern: 'events; DROP TABLE x' }), /Invalid table pattern/);
-        assert.throws(() => normaliseRule({ ...base, tablePattern: 'events', excludePattern: 'a"b' }), /Invalid table pattern/);
+        assert.throws(() => normaliseRule({ ...base, table: '_rbac_users' }), /system table/);
+        assert.throws(() => normaliseRule({ ...base, table: '_console_users' }), /system table/);
+        assert.throws(() => normaliseRule({ ...base, table: 'sensor_*' }), /exactly one table/);
+        assert.throws(() => normaliseRule({ ...base, table: 'a, b' }), /exactly one table/);
+        assert.throws(() => normaliseRule({ ...base, table: 'events; DROP TABLE x' }), /exactly one table/);
+        assert.throws(() => normaliseRule({ ...base }), /Choose the table/);
+        const ok = normaliseRule({ ...base, table: 'events', excludePattern: '*_archive' });
+        assert.equal(ok.tablePattern, 'events');
+        assert.equal(ok.excludePattern, '', 'exclusions do not apply to single-table rules');
+        assert.equal(normaliseRule({ ...base, tablePattern: 'events' }).tablePattern, 'events', 'tablePattern is accepted as an alias');
+    });
+    await test('rules saved with patterns are recognised as legacy multi-table rules', () => {
+        assert.equal(isLegacyMultiTable({ tablePattern: 'events', excludePattern: '' }), false);
+        assert.equal(isLegacyMultiTable({ tablePattern: 'sensor_*', excludePattern: '' }), true);
+        assert.equal(isLegacyMultiTable({ tablePattern: 'a, b', excludePattern: '' }), true);
+        assert.equal(isLegacyMultiTable({ tablePattern: 'events', excludePattern: 'x' }), true);
     });
 
     console.log('\n▸ console: pruning — rule validation and SQL');
@@ -184,8 +196,8 @@ async function run() {
         assert.throws(() => normaliseRule({ name: 'r', tablePattern: 'events', maxAgeValue: 5, schedule: '@daily' }), /date\/timestamp column/);
         assert.throws(() => normaliseRule({ name: 'r', tablePattern: 'events', maxRows: 0, schedule: '@daily' }), /Rows to keep/);
         assert.throws(() => normaliseRule({ name: 'r', tablePattern: 'events', maxRows: 10, schedule: 'every day' }), /Invalid schedule/);
-        const ok = normaliseRule({ name: ' r ', tablePattern: 'a, b ,c', maxAgeValue: 12, maxAgeUnit: 'hours', dateColumn: 'ts', maxRows: 100, schedule: '0 2 * * *' });
-        assert.equal(ok.tablePattern, 'a, b, c');
+        const ok = normaliseRule({ name: ' r ', table: ' events ', maxAgeValue: 12, maxAgeUnit: 'hours', dateColumn: 'ts', maxRows: 100, schedule: '0 2 * * *' });
+        assert.equal(ok.tablePattern, 'events');
         assert.equal(ok.name, 'r');
         assert.equal(ok.maxAgeUnit, 'hours');
     });
@@ -203,6 +215,66 @@ async function run() {
         assert.equal(byCol.count, `rowid IN (SELECT rowid FROM "events" ORDER BY "seq" DESC NULLS LAST, rowid DESC OFFSET 1000)`);
         const byInsert = buildPredicates({ maxRows: 5 }, 'events', types);
         assert.equal(byInsert.count, `rowid IN (SELECT rowid FROM "events" ORDER BY rowid DESC OFFSET 5)`);
+    });
+    await test('epoch units are detected from the magnitude of the values', () => {
+        const now = Date.UTC(2026, 9, 24);
+        assert.equal(detectEpochUnit(now / 1000), 's');
+        assert.equal(detectEpochUnit(now), 'ms');
+        assert.equal(detectEpochUnit(now * 1000), 'us');
+        assert.equal(detectEpochUnit(BigInt(now) * 1000000n), 'ns');
+        assert.equal(detectEpochUnit(Date.UTC(1975, 0, 1) / 1000), 's');
+        assert.equal(detectEpochUnit(Date.UTC(1975, 0, 1)), 'ms', '1975 in ms is still above the seconds band');
+        assert.equal(detectEpochUnit('not a number'), null);
+    });
+    await test('numeric epoch columns compare against the cutoff in their unit', () => {
+        const epochTypes = new Map([['ts', 'BIGINT'], ['secs', 'INTEGER'], ['f', 'DOUBLE'], ['d', 'DECIMAL(18,3)']]);
+        const rule = { maxAgeValue: 30, maxAgeUnit: 'days', dateColumn: 'ts' };
+        assert.equal(buildPredicates(rule, 't', epochTypes, 'ms').age, `"ts" < epoch_ms(CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL 30 DAY)`);
+        assert.equal(buildPredicates({ ...rule, dateColumn: 'secs' }, 't', epochTypes, 's').age, `"secs" < epoch(CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL 30 DAY)`);
+        assert.match(buildPredicates(rule, 't', epochTypes, 'us').age, /epoch_us\(/);
+        assert.match(buildPredicates(rule, 't', epochTypes, 'ns').age, /epoch_ns\(/);
+        assert.match(buildPredicates({ ...rule, dateColumn: 'f' }, 't', epochTypes, 's').age, /^"f" < epoch\(/);
+        assert.match(buildPredicates(rule, 't', epochTypes, null).skip, /epoch unit is unknown/);
+        for (const t of ['BIGINT', 'INTEGER', 'UBIGINT', 'DOUBLE', 'DECIMAL(18,3)']) assert.ok(isEpochType(t), t);
+        for (const t of ['VARCHAR', 'BOOLEAN', 'TIMESTAMP']) assert.ok(!isEpochType(t), t);
+        assert.ok(isDateType('TIMESTAMP WITH TIME ZONE') && isDateType('DATE') && !isDateType('BIGINT'));
+    });
+    await test('the epoch unit is validated and defaults to auto', () => {
+        const base = { name: 'r', tablePattern: 'events', maxAgeValue: 1, dateColumn: 'ts', schedule: '@daily' };
+        assert.equal(normaliseRule(base).epochUnit, 'auto');
+        assert.equal(normaliseRule({ ...base, epochUnit: 'ms' }).epochUnit, 'ms');
+        assert.throws(() => normaliseRule({ ...base, epochUnit: 'minutes' }), /Epoch unit/);
+    });
+    const ctypes = new Map([['level', 'VARCHAR'], ['n', 'BIGINT'], ['ts', 'TIMESTAMP'], ['meta', 'STRUCT(a INTEGER)']]);
+    await test('match conditions become typed, escaped SQL — values can never inject', () => {
+        const c = normaliseConditions({ match: 'all', items: [{ column: 'level', op: 'equals', value: "x'); DROP TABLE t; --" }] });
+        const sql = buildConditionPredicate(c, ctypes).sql;
+        assert.equal(sql, `COALESCE((CAST("level" AS VARCHAR) = 'x''); DROP TABLE t; --'), false)`);
+        assert.equal(buildConditionPredicate(normaliseConditions({ items: [{ column: 'n', op: 'gte', value: '10' }] }), ctypes).sql,
+            `COALESCE(("n" >= TRY_CAST('10' AS BIGINT)), false)`);
+        assert.equal(buildConditionPredicate(normaliseConditions({ items: [{ column: 'level', op: 'contains', value: '50%_off' }] }), ctypes).sql,
+            `COALESCE((CAST("level" AS VARCHAR) ILIKE '%50\\%\\_off%' ESCAPE '\\'), false)`);
+        assert.match(buildConditionPredicate(normaliseConditions({ match: 'any', items: [{ column: 'n', op: 'in', value: '1, 2,3' }, { column: 'level', op: 'is_null' }] }), ctypes).sql,
+            /\("n" IN \(TRY_CAST\('1' AS BIGINT\), TRY_CAST\('2' AS BIGINT\), TRY_CAST\('3' AS BIGINT\)\)\) OR \("level" IS NULL\)/);
+        assert.match(buildConditionPredicate(normaliseConditions({ items: [{ column: 'meta', op: 'equals', value: 'x' }] }), ctypes).sql,
+            /CAST\("meta" AS VARCHAR\) = 'x'/, 'complex types compare as text');
+        assert.match(buildConditionPredicate(normaliseConditions({ items: [{ column: 'a"b', op: 'equals', value: 'x' }] }), new Map([['a"b', 'VARCHAR']])).sql,
+            /CAST\("a""b" AS VARCHAR\)/, 'column names are quoted with escaping');
+    });
+    await test('conditions reject unknown operators, missing columns and oversized input', () => {
+        assert.throws(() => normaliseConditions({ items: [{ column: 'level', op: 'raw_sql', value: '1=1' }] }), /unknown operator/);
+        assert.throws(() => normaliseConditions({ items: [{ column: '', op: 'equals', value: 'x' }] }), /needs a column/);
+        assert.throws(() => normaliseConditions({ items: Array.from({ length: 11 }, () => ({ column: 'level', op: 'is_null' })) }), /At most 10/);
+        assert.throws(() => normaliseConditions({ items: [{ column: 'level', op: 'equals', value: 'x'.repeat(501) }] }), /invalid value/);
+        assert.equal(normaliseConditions({ items: [] }), null);
+        assert.match(buildConditionPredicate(normaliseConditions({ items: [{ column: 'nope', op: 'is_null' }] }), ctypes).skip, /no "nope" column/);
+        const base = { name: 'r', tablePattern: 'events', schedule: '@daily' };
+        assert.equal(normaliseRule({ ...base, conditions: { items: [{ column: 'level', op: 'equals', value: 'debug' }] } }).conditions.match, 'all',
+            'conditions alone are a valid criterion');
+    });
+    await test('match conditions combine with the other criteria using OR', () => {
+        const p = buildPredicates({ maxAgeValue: 7, dateColumn: 'ts', conditions: normaliseConditions({ items: [{ column: 'level', op: 'equals', value: 'debug' }] }) }, 't', ctypes);
+        assert.ok(p.age && p.match && !p.skip, JSON.stringify(p));
     });
     await test('tables without the needed columns are skipped with a reason', () => {
         assert.match(buildPredicates({ maxAgeValue: 1, dateColumn: 'missing' }, 't', types).skip, /no "missing" column/);

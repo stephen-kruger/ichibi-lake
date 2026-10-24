@@ -17,7 +17,7 @@ import {
     getDummyHash, passwordFingerprint, createSessionToken, verifySessionToken, parseCookies,
     sessionCookie, LoginThrottle, safeEqual, generateSetupCode, generateApiKey,
 } from './auth.js';
-import { isSystemTable, normaliseRule, computeNextRun, matchTables, previewRule, startJob, startPruneScheduler, storageInfo } from './retention.js';
+import { isSystemTable, normaliseRule, computeNextRun, matchTables, previewRule, startJob, startPruneScheduler, storageInfo, isDateType, isEpochType, describeConditions, CONDITION_OPS, isLegacyMultiTable } from './retention.js';
 import { nextRuns, validateCron, SCHEDULE_PRESETS } from './cron.js';
 import * as data from './data.js';
 import {
@@ -47,8 +47,9 @@ function keyId(apiKey) {
 /** One-line summary of a rule's criteria and schedule for the audit log. */
 function describeRule(rule) {
     const parts = [`tables ${rule.tablePattern}${rule.excludePattern ? ` except ${rule.excludePattern}` : ''}`];
-    if (rule.maxAgeValue) parts.push(`older than ${rule.maxAgeValue} ${rule.maxAgeUnit} by ${rule.dateColumn}`);
+    if (rule.maxAgeValue) parts.push(`older than ${rule.maxAgeValue} ${rule.maxAgeUnit} by ${rule.dateColumn}${rule.epochUnit && rule.epochUnit !== 'auto' ? ` (epoch ${rule.epochUnit})` : ''}`);
     if (rule.maxRows) parts.push(`keep newest ${rule.maxRows} by ${rule.orderColumn || 'insertion order'}`);
+    if (rule.conditions) parts.push(`matching ${describeConditions(rule.conditions)}`);
     parts.push(`schedule "${rule.schedule}"`, rule.enabled ? 'enabled' : 'disabled');
     if (rule.safetyLimit) parts.push(`safety limit ${rule.safetyLimit}`);
     if (rule.reclaimStorage) parts.push('reclaim storage');
@@ -548,16 +549,22 @@ export function createConsoleRouter() {
         const tables = new Map();
         for (const r of rows) {
             if (isSystemTable(r.table_name)) continue;
-            if (!tables.has(r.table_name)) tables.set(r.table_name, { name: r.table_name, columns: [], dateColumns: [] });
+            if (!tables.has(r.table_name)) tables.set(r.table_name, { name: r.table_name, columns: [], types: {}, dateColumns: [], epochColumns: [], numericColumns: [] });
             const t = tables.get(r.table_name);
             t.columns.push(r.column_name);
-            if (/^(DATE|TIMESTAMP)/i.test(String(r.data_type))) t.dateColumns.push(r.column_name);
+            t.types[r.column_name] = String(r.data_type);
+            if (isDateType(r.data_type)) t.dateColumns.push(r.column_name);
+            else if (isEpochType(r.data_type)) {
+                // Numbers usable as Unix epoch times; names that suggest a time are listed first.
+                if (/(time|date|_at$|^ts$|_ts$|^ts_|created|updated|epoch)/i.test(r.column_name)) t.epochColumns.push(r.column_name);
+                else t.numericColumns.push(r.column_name);
+            }
         }
         return [...tables.values()];
     }
 
     function ruleView(rule, tableNames) {
-        return { ...rule, matches: matchTables(tableNames, rule.tablePattern, rule.excludePattern) };
+        return { ...rule, matches: matchTables(tableNames, rule.tablePattern, rule.excludePattern), legacyMultiTable: isLegacyMultiTable(rule) };
     }
 
     api.get('/retention', wrap(async (req, res) => {
@@ -567,6 +574,7 @@ export function createConsoleRouter() {
             rules: (await store.listPruneRules()).map(r => ruleView(r, names)),
             tables,
             presets: SCHEDULE_PRESETS,
+            conditionOps: CONDITION_OPS,
             storage: { ...storageInfo(), setting: settingPayload(getSettingDef('SNAPSHOT_RETENTION_DAYS')) },
         });
     }));
@@ -588,6 +596,25 @@ export function createConsoleRouter() {
         await store.updatePruneRule(req.params.id, { ...rule, nextRunMs, user: req.consoleUser.username });
         await store.audit(req.consoleUser.username, 'prune.rule_update', `${rule.name}: ${describeRule(rule)}`, clientIp(req));
         res.json({ success: true });
+    }));
+
+    // Enable/disable only (used by the list toggle); works for every rule,
+    // including multi-table rules saved before the one-table change.
+    api.patch('/retention/rules/:id', requireAdmin, wrap(async (req, res) => {
+        const existing = await store.getPruneRule(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Rule not found' });
+        if (typeof req.body?.enabled !== 'boolean') return res.status(400).json({ error: 'Send { "enabled": true | false }' });
+        const enabled = req.body.enabled;
+        await store.setRuleEnabled(existing.id, enabled, enabled ? computeNextRun(existing.schedule) : null, req.consoleUser.username);
+        await store.audit(req.consoleUser.username, 'prune.rule_update', `${existing.name}: ${enabled ? 'enabled' : 'disabled'}`, clientIp(req));
+        res.json({ success: true });
+    }));
+
+    // Dry run of a saved rule exactly as stored.
+    api.post('/retention/rules/:id/preview', wrap(async (req, res) => {
+        const existing = await store.getPruneRule(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Rule not found' });
+        res.json(await previewRule(existing, { validated: true }));
     }));
 
     api.delete('/retention/rules/:id', requireAdmin, wrap(async (req, res) => {
