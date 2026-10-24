@@ -257,46 +257,61 @@ async function run() {
             assert((await seed(`${P}_keep`, [400, 400])).status === 200, 'keep');
             assert((await gateway('POST', `/upload/${P}_nodate`, [{ id: 'x' }])).status === 200, 'nodate');
         });
-        await test('rules cannot target system tables; "*" never reaches them', async () => {
-            for (const tablePattern of ['_rbac_users', '_*', '_console_users']) {
-                const r = await admin('POST', '/retention/rules', { name: 'bad', tablePattern, maxRows: 1, schedule: '@daily' });
-                assert(r.status === 400, `${tablePattern} -> ${r.status}`);
+        await test('a rule prunes one table: system tables, wildcards and lists are rejected', async () => {
+            for (const table of ['_rbac_users', '_console_users', '_*', '*', `${P}_*`, `${P}_a, ${P}_b`]) {
+                const r = await admin('POST', '/retention/rules', { name: 'bad', table, maxRows: 1, schedule: '@daily' });
+                assert(r.status === 400, `${table} -> ${r.status}`);
+                assert((await admin('POST', '/retention/preview', { table, maxRows: 1 })).status === 400, `preview ${table}`);
             }
-            const all = await admin('POST', '/retention/preview', { tablePattern: '*', maxRows: 1 });
-            assert(all.status === 200 && all.data.tables.length > 0, JSON.stringify(all.data).slice(0, 200));
-            assert(!all.data.tables.some(t => t.table.startsWith('_')), 'a system table matched "*"');
         });
         await test('invalid rules and schedules are rejected', async () => {
-            assert((await admin('POST', '/retention/rules', { name: 'x', tablePattern: `${P}_a`, schedule: '@daily' })).status === 400, 'no criterion');
-            assert((await admin('POST', '/retention/rules', { name: 'x', tablePattern: `${P}_a`, maxRows: 1, schedule: '61 * * * *' })).status === 400, 'bad cron');
+            assert((await admin('POST', '/retention/rules', { name: 'x', table: `${P}_a`, schedule: '@daily' })).status === 400, 'no criterion');
+            assert((await admin('POST', '/retention/rules', { name: 'x', table: `${P}_a`, maxRows: 1, schedule: '61 * * * *' })).status === 400, 'bad cron');
             const sched = await admin('POST', '/retention/schedule', { schedule: '*/15 * * * *' });
             assert(sched.data.valid && sched.data.next.length === 3, JSON.stringify(sched.data));
             assert((await admin('POST', '/retention/schedule', { schedule: 'nope' })).data.valid === false, 'invalid cron preview');
         });
-        await test('preview: wildcard + exclusion, per-table counts, skipped tables explained', async () => {
-            const r = await admin('POST', '/retention/preview', { tablePattern: `${P}_*`, excludePattern: '*_keep', maxAgeValue: 30, dateColumn: 'event_time' });
-            const by = Object.fromEntries(r.data.tables.map(t => [t.table, t]));
-            assert(!by[`${P}_keep`], 'excluded table matched');
-            assert(by[`${P}_a`].total === 2 && by[`${P}_b`].total === 2, JSON.stringify(r.data.tables));
-            assert(by[`${P}_nodate`].status === 'skipped' && /event_time/.test(by[`${P}_nodate`].reason), JSON.stringify(by[`${P}_nodate`]));
+        await test('preview: per-table counts; a table without the column is explained', async () => {
+            const r = await admin('POST', '/retention/preview', { table: `${P}_a`, maxAgeValue: 30, dateColumn: 'event_time' });
+            assert(r.data.tables.length === 1 && r.data.tables[0].total === 2, JSON.stringify(r.data.tables));
+            const nd = await admin('POST', '/retention/preview', { table: `${P}_nodate`, maxAgeValue: 30, dateColumn: 'event_time' });
+            assert(nd.data.tables[0].status === 'skipped' && /event_time/.test(nd.data.tables[0].reason), JSON.stringify(nd.data.tables[0]));
             assert((await ids(`${P}_a`)).length === 3, 'preview must not delete');
         });
-        await test('age rule: run now deletes only old rows in matching tables', async () => {
-            const id = await createRule({ name: `age ${TS}`, tablePattern: `${P}_*`, excludePattern: '*_keep', maxAgeValue: 30, dateColumn: 'event_time' });
+        await test('age rule: run now deletes only the old rows of its table', async () => {
+            const id = await createRule({ name: `age ${TS}`, table: `${P}_a`, maxAgeValue: 30, dateColumn: 'event_time' });
             createdRules.push(id);
             const job = await runRule(id);
-            assert(job.status === 'succeeded' && job.rowsDeleted === 4, JSON.stringify({ status: job.status, deleted: job.rowsDeleted, msg: job.message }));
-            const t = Object.fromEntries(job.tables.map(x => [x.table, x]));
-            assert(t[`${P}_nodate`].status === 'skipped', 'nodate should be skipped');
-            assert(t[`${P}_a`].rowsByAge === 2 && t[`${P}_a`].rowsDeleted === 2, JSON.stringify(t[`${P}_a`]));
+            assert(job.status === 'succeeded' && job.rowsDeleted === 2 && job.tables.length === 1, JSON.stringify({ status: job.status, deleted: job.rowsDeleted, msg: job.message }));
+            assert(job.tables[0].rowsByAge === 2, JSON.stringify(job.tables[0]));
             assert((await ids(`${P}_a`)).join() === `${P}_a_2`, `a: ${await ids(`${P}_a`)}`);
-            assert((await ids(`${P}_keep`)).length === 2, 'excluded table was pruned');
+            assert((await ids(`${P}_b`)).length === 5 && (await ids(`${P}_keep`)).length === 2, 'other tables must be untouched');
             const rule = (await admin('GET', '/retention')).data.rules.find(r => r.id === id);
-            assert(rule.lastStatus === 'succeeded' && rule.lastDeleted === 4 && rule.matches.length === 3, JSON.stringify(rule));
+            assert(rule.lastStatus === 'succeeded' && rule.lastDeleted === 2 && rule.matches.length === 1 && !rule.legacyMultiTable, JSON.stringify(rule));
+        });
+        await test('cloning: the same settings saved for another table give an independent rule', async () => {
+            const source = (await admin('GET', '/retention')).data.rules.find(r => r.id === createdRules[0]);
+            const { id: _id, ...settings } = source;
+            const cloneId = await createRule({ ...settings, name: `${source.name} (copy)`, table: `${P}_b` });
+            createdRules.push(cloneId);
+            const prev = await admin('POST', `/retention/rules/${cloneId}/preview`);
+            assert(prev.data.tables.length === 1 && prev.data.tables[0].table === `${P}_b` && prev.data.tables[0].total === 2, JSON.stringify(prev.data));
+            const rules = (await admin('GET', '/retention')).data.rules;
+            assert(rules.find(r => r.id === createdRules[0]).tablePattern === `${P}_a`, 'source rule unchanged');
+        });
+        await test('the enable toggle works on its own and reschedules', async () => {
+            const id = createdRules[1];
+            assert((await admin('PATCH', `/retention/rules/${id}`, { enabled: false })).status === 200, 'disable');
+            let r = (await admin('GET', '/retention')).data.rules.find(x => x.id === id);
+            assert(!r.enabled && r.nextRunMs === null, JSON.stringify(r));
+            assert((await admin('PATCH', `/retention/rules/${id}`, { enabled: true })).status === 200, 'enable');
+            r = (await admin('GET', '/retention')).data.rules.find(x => x.id === id);
+            assert(r.enabled && r.nextRunMs > Date.now(), JSON.stringify(r));
+            assert((await admin('PATCH', `/retention/rules/${id}`, { enabled: 'yes' })).status === 400, 'non-boolean');
         });
         await test('count rule keeps the newest N rows by a column', async () => {
             assert((await seed(`${P}_c`, [5, 4, 3, 2, 1])).status === 200, 'seed c');
-            const id = await createRule({ name: `count ${TS}`, tablePattern: `${P}_c`, maxRows: 2, orderColumn: 'event_time' });
+            const id = await createRule({ name: `count ${TS}`, table: `${P}_c`, maxRows: 2, orderColumn: 'event_time' });
             createdRules.push(id);
             const job = await runRule(id);
             assert(job.rowsDeleted === 3, JSON.stringify(job));
@@ -304,17 +319,82 @@ async function run() {
         });
         await test('age and count combined: a row is deleted if it fails either', async () => {
             assert((await seed(`${P}_d`, [100, 10, 3, 2, 1])).status === 200, 'seed d');
-            const prev = await admin('POST', '/retention/preview', { tablePattern: `${P}_d`, maxAgeValue: 30, dateColumn: 'event_time', maxRows: 3, orderColumn: 'event_time' });
+            const prev = await admin('POST', '/retention/preview', { table: `${P}_d`, maxAgeValue: 30, dateColumn: 'event_time', maxRows: 3, orderColumn: 'event_time' });
             const t = prev.data.tables[0];
             assert(t.byAge === 1 && t.byCount === 2 && t.total === 2, JSON.stringify(t));
         });
         await test('safety limit refuses a run that would delete too much, deleting nothing', async () => {
             assert((await seed(`${P}_e`, [90, 80, 70])).status === 200, 'seed e');
-            const id = await createRule({ name: `safety ${TS}`, tablePattern: `${P}_e`, maxAgeValue: 30, dateColumn: 'event_time', safetyLimit: 1 });
+            const id = await createRule({ name: `safety ${TS}`, table: `${P}_e`, maxAgeValue: 30, dateColumn: 'event_time', safetyLimit: 1 });
             createdRules.push(id);
             const job = await runRule(id);
             assert(job.status === 'failed' && job.tables[0].status === 'failed' && /safety limit/.test(job.tables[0].message), JSON.stringify(job));
             assert((await ids(`${P}_e`)).length === 3, 'rows were deleted despite the safety limit');
+        });
+        const epochAgo = (d, unit) => { const ms = now.getTime() - d * 86400000; return unit === 's' ? Math.floor(ms / 1000) : ms; };
+        await test('epoch date columns: BIGINT milliseconds and seconds, unit auto-detected', async () => {
+            const msRows = [90, 60, 1].map((d, i) => ({ id: `ms_${i}`, ts: epochAgo(d, 'ms') }));
+            const sRows = [90, 60, 1].map((d, i) => ({ id: `s_${i}`, ts: epochAgo(d, 's') }));
+            assert((await gateway('POST', `/upload/${P}_epoch_ms`, msRows)).status === 200, 'seed ms');
+            assert((await gateway('POST', `/upload/${P}_epoch_s`, sRows)).status === 200, 'seed s');
+            const schema = await admin('GET', `/data/tables/${P}_epoch_ms/schema`);
+            const tsType = schema.data.columns.find(c => c.name === 'ts').type;
+            assert(/INT/.test(tsType), `expected an integer epoch column, got ${tsType}`);
+            const by = {};
+            for (const t of [`${P}_epoch_ms`, `${P}_epoch_s`]) {
+                by[t] = (await admin('POST', '/retention/preview', { table: t, maxAgeValue: 30, dateColumn: 'ts' })).data.tables[0];
+            }
+            assert(by[`${P}_epoch_ms`].total === 2 && /milliseconds \(detected\)/.test(by[`${P}_epoch_ms`].dateInfo), JSON.stringify(by[`${P}_epoch_ms`]));
+            assert(by[`${P}_epoch_s`].total === 2 && /seconds \(detected\)/.test(by[`${P}_epoch_s`].dateInfo), JSON.stringify(by[`${P}_epoch_s`]));
+        });
+        await test('an explicit epoch unit overrides detection', async () => {
+            const wrong = await admin('POST', '/retention/preview', { table: `${P}_epoch_ms`, maxAgeValue: 30, dateColumn: 'ts', epochUnit: 's' });
+            assert(wrong.data.tables[0].total === 0 && /epoch seconds$/.test(wrong.data.tables[0].dateInfo), `ms values read as seconds should match nothing: ${JSON.stringify(wrong.data.tables[0])}`);
+            const right = await admin('POST', '/retention/preview', { table: `${P}_epoch_ms`, maxAgeValue: 30, dateColumn: 'ts', epochUnit: 'ms' });
+            assert(right.data.tables[0].total === 2, JSON.stringify(right.data.tables[0]));
+        });
+        await test('running an epoch rule deletes only the old rows and logs the unit used', async () => {
+            let deleted = 0;
+            for (const t of [`${P}_epoch_ms`, `${P}_epoch_s`]) {
+                const id = await createRule({ name: `epoch ${t}`, table: t, maxAgeValue: 30, dateColumn: 'ts' });
+                createdRules.push(id);
+                const job = await runRule(id);
+                assert(job.status === 'succeeded', JSON.stringify(job));
+                assert(/Age by ts as epoch (milliseconds|seconds) \(detected\)/.test(job.tables[0].message), job.tables[0].message);
+                deleted += job.rowsDeleted;
+            }
+            assert(deleted === 4, `deleted ${deleted}`);
+            assert((await ids(`${P}_epoch_ms`)).join() === 'ms_2' && (await ids(`${P}_epoch_s`)).join() === 's_2', 'wrong rows remain');
+        });
+        await test('non-date, non-numeric columns are skipped with a reason', async () => {
+            const r = await admin('POST', '/retention/preview', { table: `${P}_epoch_ms`, maxAgeValue: 30, dateColumn: 'id' });
+            assert(r.data.tables[0].status === 'skipped' && /not a date, timestamp or epoch number/.test(r.data.tables[0].reason), JSON.stringify(r.data.tables[0]));
+        });
+        await test('match conditions: delete rows matching simple conditions', async () => {
+            const rows = [
+                { id: 'm1', level: 'debug', n: 5 }, { id: 'm2', level: 'info', n: 50 }, { id: 'm3', level: 'DEBUG', n: 500 },
+                { id: 'm4', level: "x'); DROP TABLE t; --", n: 1 },
+            ];
+            assert((await gateway('POST', `/upload/${P}_match`, rows)).status === 200, 'seed');
+            const cond = (items, match = 'all') => ({ table: `${P}_match`, conditions: { match, items } });
+            const p1 = await admin('POST', '/retention/preview', cond([{ column: 'level', op: 'equals', value: 'debug' }]));
+            assert(p1.data.tables[0].byMatch === 1 && p1.data.tables[0].total === 1, `equals is exact: ${JSON.stringify(p1.data.tables[0])}`);
+            const p2 = await admin('POST', '/retention/preview', cond([{ column: 'level', op: 'contains', value: 'debug' }]));
+            assert(p2.data.tables[0].total === 2, `contains is case-insensitive: ${JSON.stringify(p2.data.tables[0])}`);
+            const p3 = await admin('POST', '/retention/preview', cond([{ column: 'level', op: 'contains', value: 'debug' }, { column: 'n', op: 'gt', value: '100' }]));
+            assert(p3.data.tables[0].total === 1, `all: ${JSON.stringify(p3.data.tables[0])}`);
+            const p4 = await admin('POST', '/retention/preview', cond([{ column: 'n', op: 'in', value: '5, 50' }, { column: 'level', op: 'equals', value: 'DEBUG' }], 'any'));
+            assert(p4.data.tables[0].total === 3, `any: ${JSON.stringify(p4.data.tables[0])}`);
+            const inj = await admin('POST', '/retention/preview', cond([{ column: 'level', op: 'equals', value: "x'); DROP TABLE t; --" }]));
+            assert(inj.data.tables[0].total === 1, `an SQL-looking value is matched literally: ${JSON.stringify(inj.data.tables[0])}`);
+            assert((await admin('POST', '/retention/preview', cond([{ column: 'level', op: 'raw', value: '1=1' }]))).status === 400, 'unknown operator rejected');
+            assert((await admin('POST', '/retention/preview', cond([{ column: 'level; DROP TABLE x', op: 'equals', value: '1' }]))).data.tables[0].status === 'skipped',
+                'unknown column skips the table');
+            const id = await createRule({ name: `match ${TS}`, ...cond([{ column: 'level', op: 'contains', value: 'debug' }]) });
+            createdRules.push(id);
+            const job = await runRule(id);
+            assert(job.rowsDeleted === 2 && job.tables[0].rowsByMatch === 2, JSON.stringify(job));
+            assert((await ids(`${P}_match`)).join() === 'm2,m4', `remaining: ${await ids(`${P}_match`)}`);
         });
         await test('disabling a rule clears its next run; edits are validated', async () => {
             const id = createdRules[0];
@@ -322,11 +402,12 @@ async function run() {
             assert((await admin('PUT', `/retention/rules/${id}`, { ...rule, enabled: false })).status === 200, 'disable');
             const after = (await admin('GET', '/retention')).data.rules.find(r => r.id === id);
             assert(!after.enabled && after.nextRunMs === null, JSON.stringify(after));
-            assert((await admin('PUT', `/retention/rules/${id}`, { ...rule, tablePattern: '_rbac_users' })).status === 400, 'system table on edit');
+            assert((await admin('PUT', `/retention/rules/${id}`, { ...rule, table: '_rbac_users' })).status === 400, 'system table on edit');
+            assert((await admin('PUT', `/retention/rules/${id}`, { ...rule, table: `${P}_*` })).status === 400, 'wildcard on edit');
         });
         await test('scheduled rules run automatically (every-minute schedule)', async () => {
             assert((await seed(`${P}_f`, [60, 1])).status === 200, 'seed f');
-            const id = await createRule({ name: `sched ${TS}`, tablePattern: `${P}_f`, maxAgeValue: 30, dateColumn: 'event_time', schedule: '* * * * *' });
+            const id = await createRule({ name: `sched ${TS}`, table: `${P}_f`, maxAgeValue: 30, dateColumn: 'event_time', schedule: '* * * * *' });
             createdRules.push(id);
             const until = Date.now() + 120000;
             let job = null;
@@ -338,6 +419,22 @@ async function run() {
             assert(job.status === 'succeeded' && job.rowsDeleted === 1, JSON.stringify(job));
             const rule = (await admin('GET', '/retention')).data.rules.find(r => r.id === id);
             assert(rule.nextRunMs > Date.now() - 1000, 'next run should be scheduled in the future');
+        });
+        await test('legacy multi-table rules keep working and are flagged', async () => {
+            // Simulate a rule saved before rules were limited to one table.
+            const legacyId = `legacy${TS}`;
+            const script = `import('./src/console/store.js').then(async (s) => { await s.createPruneRule({ id: '${legacyId}', name: 'legacy ${TS}', tablePattern: '${P}_g*', excludePattern: '', dateColumn: 'event_time', maxAgeValue: 30, maxAgeUnit: 'days', schedule: '@daily', enabled: true, user: 'test' }); process.exit(0); })`;
+            execFileSync('docker', ['exec', CONTAINER, 'node', '-e', script]);
+            createdRules.push(legacyId);
+            assert((await seed(`${P}_g1`, [90, 1])).status === 200 && (await seed(`${P}_g2`, [90, 1])).status === 200, 'seed');
+            const rule = (await admin('GET', '/retention')).data.rules.find(r => r.id === legacyId);
+            assert(rule && rule.legacyMultiTable && rule.matches.length === 2, JSON.stringify(rule));
+            assert((await admin('PATCH', `/retention/rules/${legacyId}`, { enabled: false })).status === 200, 'toggle works for legacy rules');
+            const prev = await admin('POST', `/retention/rules/${legacyId}/preview`);
+            assert(prev.status === 200 && prev.data.tables.length === 2 && prev.data.totalRows === 2, JSON.stringify(prev.data));
+            const job = await runRule(legacyId);
+            assert(job.status === 'succeeded' && job.rowsDeleted === 2, `legacy rule still runs on every matching table: ${JSON.stringify(job)}`);
+            assert((await admin('PUT', `/retention/rules/${legacyId}`, rule)).status === 400, 'saving it unchanged requires choosing one table');
         });
         await test('rules can be deleted', async () => {
             for (const id of createdRules) assert((await admin('DELETE', `/retention/rules/${id}`)).status === 200, `delete ${id}`);

@@ -27,7 +27,110 @@ import { parseCron, nextRun, validateCron } from './cron.js';
 
 const SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 const DATE_TYPES_RE = /^(DATE|TIMESTAMP(\s*WITH TIME ZONE)?|TIMESTAMP_(S|MS|NS)|TIMESTAMPTZ|DATETIME)$/i;
-const PATTERN_ITEM_RE = /^[A-Za-z0-9_*?]{1,63}$/;
+// Numeric columns holding Unix epoch times (e.g. BIGINT milliseconds).
+const EPOCH_TYPES_RE = /^(TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|USMALLINT|UINTEGER|UBIGINT|UHUGEINT|FLOAT|DOUBLE|REAL|DECIMAL\(\d+,\s*\d+\))$/i;
+export const EPOCH_UNITS = ['auto', 's', 'ms', 'us', 'ns'];
+const EPOCH_UNIT_LABELS = { s: 'seconds', ms: 'milliseconds', us: 'microseconds', ns: 'nanoseconds' };
+
+export function isDateType(type) { return DATE_TYPES_RE.test(String(type).trim()); }
+export function isEpochType(type) { return EPOCH_TYPES_RE.test(String(type).trim()); }
+
+/**
+ * Infer the unit of a Unix epoch value from its magnitude. Any date from
+ * 1973 to 5138 falls in exactly one band (e.g. now is ~1.7e9 s, 1.7e12 ms).
+ */
+export function detectEpochUnit(maxAbs) {
+    const v = Math.abs(Number(maxAbs));
+    if (!Number.isFinite(v)) return null;
+    if (v < 1e11) return 's';
+    if (v < 1e14) return 'ms';
+    if (v < 1e17) return 'us';
+    return 'ns';
+}
+
+export function epochUnitLabel(unit) { return EPOCH_UNIT_LABELS[unit] || unit; }
+
+// --- Match conditions ---------------------------------------------------------------
+// A rule may delete rows matching simple conditions. These are structured
+// (column + operator + value), never SQL text: the server builds the SQL,
+// columns are checked against each table and quoted, and values are always
+// escaped string literals cast to the column's type.
+export const CONDITION_OPS = {
+    equals: 'equals', not_equals: 'does not equal', contains: 'contains', not_contains: 'does not contain',
+    starts_with: 'starts with', ends_with: 'ends with', gt: '>', gte: '≥', lt: '<', lte: '≤',
+    in: 'is one of', is_null: 'is NULL', not_null: 'is not NULL',
+};
+const NO_VALUE_CONDITION_OPS = new Set(['is_null', 'not_null']);
+const MAX_CONDITIONS = 10;
+const MAX_IN_VALUES = 50;
+// Scalar types a literal can be cast to for typed comparisons.
+const CASTABLE_TYPE_RE = /^(BOOLEAN|TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|USMALLINT|UTINYINT|UINTEGER|UBIGINT|UHUGEINT|FLOAT|REAL|DOUBLE|DECIMAL\(\d+,\s*\d+\)|DATE|TIME|TIMESTAMP|TIMESTAMP WITH TIME ZONE|TIMESTAMPTZ|TIMESTAMP_S|TIMESTAMP_MS|TIMESTAMP_NS|UUID|INTERVAL)$/i;
+
+const sqlLiteral = (value) => `'${String(value).replace(/'/g, "''")}'`;
+const likeEscape = (value) => String(value).replace(/[\\%_]/g, (m) => `\\${m}`);
+
+/** Validate conditions from API input. Returns null when there are none. */
+export function normaliseConditions(input) {
+    if (input === null || input === undefined) return null;
+    const items = Array.isArray(input.items) ? input.items : [];
+    if (!items.length) return null;
+    if (items.length > MAX_CONDITIONS) throw httpError(400, `At most ${MAX_CONDITIONS} conditions per rule`);
+    const out = items.map((c, i) => {
+        const column = optionalColumn(c?.column, `column in condition ${i + 1}`);
+        if (!column) throw httpError(400, `Condition ${i + 1} needs a column`);
+        if (!Object.hasOwn(CONDITION_OPS, c.op)) throw httpError(400, `Condition ${i + 1} has an unknown operator`);
+        let value = NO_VALUE_CONDITION_OPS.has(c.op) ? '' : String(c.value ?? '');
+        if (value.length > 500 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value)) throw httpError(400, `Condition ${i + 1} has an invalid value`);
+        if (c.op === 'in') {
+            const list = value.split(',').map(v => v.trim()).filter(Boolean);
+            if (!list.length || list.length > MAX_IN_VALUES) throw httpError(400, `Condition ${i + 1}: list 1 to ${MAX_IN_VALUES} comma-separated values`);
+            value = list.join(', ');
+        }
+        return { column, op: c.op, value };
+    });
+    return { match: input.match === 'any' ? 'any' : 'all', items: out };
+}
+
+/**
+ * SQL predicate for a rule's conditions on one table, or { skip } when a
+ * column is missing. `types` maps column name -> DuckDB type.
+ */
+export function buildConditionPredicate(conditions, types) {
+    const parts = [];
+    for (const c of conditions.items) {
+        const type = String(types.get(c.column) ?? '').trim();
+        if (!type) return { skip: `no "${c.column}" column (used in a match condition)` };
+        const col = quoteIdent(c.column);
+        const text = `CAST(${col} AS VARCHAR)`;
+        const typed = CASTABLE_TYPE_RE.test(type);
+        const lit = (v) => (typed ? `TRY_CAST(${sqlLiteral(v)} AS ${type})` : sqlLiteral(v));
+        const target = typed ? col : text;
+        switch (c.op) {
+            case 'is_null': parts.push(`${col} IS NULL`); break;
+            case 'not_null': parts.push(`${col} IS NOT NULL`); break;
+            case 'equals': parts.push(`${target} = ${lit(c.value)}`); break;
+            case 'not_equals': parts.push(`${target} IS DISTINCT FROM ${lit(c.value)}`); break;
+            case 'gt': parts.push(`${target} > ${lit(c.value)}`); break;
+            case 'gte': parts.push(`${target} >= ${lit(c.value)}`); break;
+            case 'lt': parts.push(`${target} < ${lit(c.value)}`); break;
+            case 'lte': parts.push(`${target} <= ${lit(c.value)}`); break;
+            case 'in': parts.push(`${target} IN (${c.value.split(',').map(v => lit(v.trim())).join(', ')})`); break;
+            case 'contains': parts.push(`${text} ILIKE ${sqlLiteral(`%${likeEscape(c.value)}%`)} ESCAPE '\\'`); break;
+            case 'not_contains': parts.push(`(${text} IS NULL OR ${text} NOT ILIKE ${sqlLiteral(`%${likeEscape(c.value)}%`)} ESCAPE '\\')`); break;
+            case 'starts_with': parts.push(`${text} ILIKE ${sqlLiteral(`${likeEscape(c.value)}%`)} ESCAPE '\\'`); break;
+            case 'ends_with': parts.push(`${text} ILIKE ${sqlLiteral(`%${likeEscape(c.value)}`)} ESCAPE '\\'`); break;
+            default: throw new Error(`Unknown operator ${c.op}`);
+        }
+    }
+    // COALESCE: a comparison that cannot be evaluated (NULL) never deletes.
+    return { sql: `COALESCE(${parts.map(p => `(${p})`).join(conditions.match === 'any' ? ' OR ' : ' AND ')}, false)` };
+}
+
+export function describeConditions(conditions) {
+    if (!conditions) return '';
+    return conditions.items.map(c => `${c.column} ${CONDITION_OPS[c.op]}${NO_VALUE_CONDITION_OPS.has(c.op) ? '' : ` "${c.value}"`}`)
+        .join(conditions.match === 'any' ? ' or ' : ' and ');
+}
 export const MAX_AGE = { hours: 24 * 36500, days: 36500 };
 const TICK_MS = 20 * 1000;
 const STALE_RUN_MS = 6 * 3600 * 1000;
@@ -112,20 +215,25 @@ export function normaliseRule(input = {}) {
     const name = String(input.name || '').trim();
     if (!name || name.length > 100) throw httpError(400, 'A rule name (up to 100 characters) is required');
 
-    const include = splitPatterns(input.tablePattern);
-    if (!include.length) throw httpError(400, 'Enter at least one table name or pattern');
-    const exclude = splitPatterns(input.excludePattern);
-    for (const p of [...include, ...exclude]) {
-        if (!PATTERN_ITEM_RE.test(p)) throw httpError(400, `Invalid table pattern "${p}": use letters, digits, _ and the wildcards * and ?`);
-        if (isSystemTable(p)) throw httpError(400, `Patterns cannot start with "_" (reserved for system tables): "${p}"`);
+    // One table per rule, so the rule's columns always fit that table's
+    // schema (tables can name/type their date columns differently). Use
+    // "Clone" in the console to apply similar rules to other tables.
+    const table = String(input.table ?? input.tablePattern ?? '').trim();
+    if (!table) throw httpError(400, 'Choose the table this rule prunes');
+    if (!SAFE_IDENTIFIER_RE.test(table)) {
+        throw httpError(400, `Invalid table "${table}": a rule prunes exactly one table (letters, digits and _; no wildcards or lists). Clone the rule for other tables.`);
     }
+    if (isSystemTable(table)) throw httpError(400, `"${table}" is a system table and cannot be pruned`);
 
     const maxAgeUnit = input.maxAgeUnit === 'hours' ? 'hours' : 'days';
+    const epochUnit = input.epochUnit === undefined || input.epochUnit === null || input.epochUnit === '' ? 'auto' : String(input.epochUnit);
+    if (!EPOCH_UNITS.includes(epochUnit)) throw httpError(400, `Epoch unit must be one of: ${EPOCH_UNITS.join(', ')}`);
     const maxAgeValue = optionalPositiveInt(input.maxAgeValue, `Maximum age (${maxAgeUnit})`, MAX_AGE[maxAgeUnit]);
     const maxRows = optionalPositiveInt(input.maxRows, 'Rows to keep', 1e12);
     const dateColumn = optionalColumn(input.dateColumn, 'date column');
     const orderColumn = optionalColumn(input.orderColumn, 'order column');
-    if (maxAgeValue === null && maxRows === null) throw httpError(400, 'Choose at least one criterion: a maximum age, a number of rows to keep, or both');
+    const conditions = normaliseConditions(input.conditions);
+    if (maxAgeValue === null && maxRows === null && !conditions) throw httpError(400, 'Choose at least one criterion: a maximum age, a number of rows to keep, or match conditions');
     if (maxAgeValue !== null && !dateColumn) throw httpError(400, 'Age-based pruning needs the date/timestamp column to compare');
 
     const schedule = String(input.schedule || '').trim();
@@ -134,12 +242,14 @@ export function normaliseRule(input = {}) {
 
     return {
         name,
-        tablePattern: include.join(', '),
-        excludePattern: exclude.join(', '),
+        tablePattern: table,
+        excludePattern: '',
         dateColumn: maxAgeValue !== null ? dateColumn : null,
         maxAgeValue, maxAgeUnit,
+        epochUnit: maxAgeValue !== null ? epochUnit : 'auto',
         maxRows,
         orderColumn: maxRows !== null ? orderColumn : null,
+        conditions,
         schedule,
         enabled: input.enabled !== false,
         safetyLimit: optionalPositiveInt(input.safetyLimit, 'Safety limit', 1e12),
@@ -154,23 +264,39 @@ export function computeNextRun(schedule, from = new Date()) {
 
 // --- SQL for one table -------------------------------------------------------------
 
+/** SQL for the cutoff instant expressed as a Unix epoch number in `unit`. */
+export function epochCutoff(unit, cutoffTimestampSql) {
+    switch (unit) {
+        case 's': return `epoch(${cutoffTimestampSql})`;
+        case 'ms': return `epoch_ms(${cutoffTimestampSql})`;
+        case 'us': return `epoch_us(${cutoffTimestampSql})`;
+        case 'ns': return `epoch_ns(${cutoffTimestampSql})`;
+        default: throw new Error(`Unknown epoch unit "${unit}"`);
+    }
+}
+
 /**
  * Predicates selecting rows to delete from one table. `types` maps column
- * name -> DuckDB type for the table. Returns { age, count, skip } where skip
- * explains why the rule cannot apply to this table.
+ * name -> DuckDB type for the table. For a numeric (epoch) date column,
+ * `epochUnit` is the resolved unit ('s', 'ms', 'us' or 'ns'). Returns
+ * { age, count, skip } where skip explains why the rule cannot apply.
  */
-export function buildPredicates(rule, tableName, types) {
+export function buildPredicates(rule, tableName, types, epochUnit = null) {
     let age = null;
     let count = null;
     if (rule.maxAgeValue) {
-        const type = types.get(rule.dateColumn);
+        const type = String(types.get(rule.dateColumn) ?? '').trim();
         if (!type) return { skip: `no "${rule.dateColumn}" column` };
-        if (!DATE_TYPES_RE.test(String(type).trim())) return { skip: `"${rule.dateColumn}" is ${type}, not a date/timestamp` };
         const n = Number(rule.maxAgeValue);
         const unit = rule.maxAgeUnit === 'hours' ? 'HOUR' : 'DAY';
-        age = /^DATE$/i.test(String(type).trim())
-            ? `${quoteIdent(rule.dateColumn)} < CAST(CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL ${n} ${unit} AS DATE)`
-            : `${quoteIdent(rule.dateColumn)} < CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL ${n} ${unit}`;
+        const cutoff = `CAST(CURRENT_TIMESTAMP AS TIMESTAMP) - INTERVAL ${n} ${unit}`;
+        const col = quoteIdent(rule.dateColumn);
+        if (/^DATE$/i.test(type)) age = `${col} < CAST(${cutoff} AS DATE)`;
+        else if (isDateType(type)) age = `${col} < ${cutoff}`;
+        else if (isEpochType(type)) {
+            if (!epochUnit || epochUnit === 'auto') return { skip: `"${rule.dateColumn}" is ${type}; its epoch unit is unknown` };
+            age = `${col} < ${epochCutoff(epochUnit, cutoff)}`;
+        } else return { skip: `"${rule.dateColumn}" is ${type}, not a date, timestamp or epoch number` };
     }
     if (rule.maxRows) {
         let order = 'rowid DESC';
@@ -180,11 +306,17 @@ export function buildPredicates(rule, tableName, types) {
         }
         count = `rowid IN (SELECT rowid FROM ${quoteIdent(tableName)} ORDER BY ${order} OFFSET ${Number(rule.maxRows)})`;
     }
-    return { age, count, skip: null };
+    let match = null;
+    if (rule.conditions && rule.conditions.items?.length) {
+        const m = buildConditionPredicate(rule.conditions, types);
+        if (m.skip) return { skip: m.skip };
+        match = m.sql;
+    }
+    return { age, count, match, skip: null };
 }
 
-function wherePredicate({ age, count }) {
-    return [age, count].filter(Boolean).map(p => `(${p})`).join(' OR ');
+function wherePredicate({ age, count, match }) {
+    return [age, count, match].filter(Boolean).map(p => `(${p})`).join(' OR ');
 }
 
 async function columnTypes(conn, tableName) {
@@ -208,20 +340,50 @@ async function userTableNames() {
 }
 
 /** Count what a rule would delete from one table (no changes). */
+/**
+ * For a numeric date column, the epoch unit to use: the rule's explicit
+ * unit, or one detected from the largest absolute value. Returns
+ * { unit, detected } or { unit: null } when the column has no values.
+ */
+async function resolveEpochUnit(conn, rule, tableName, types) {
+    if (!rule.maxAgeValue || !isEpochType(types.get(rule.dateColumn) ?? '')) return { unit: null };
+    if (rule.epochUnit && rule.epochUnit !== 'auto') return { unit: rule.epochUnit, detected: false };
+    const [maxAbs] = await firstRow(conn, `SELECT max(abs(${quoteIdent(rule.dateColumn)})) FROM ${quoteIdent(tableName)}`);
+    if (maxAbs === null || maxAbs === undefined) return { unit: null, empty: true };
+    return { unit: detectEpochUnit(maxAbs), detected: true };
+}
+
+function describeDateColumn(rule, types, epoch) {
+    if (!rule.maxAgeValue) return null;
+    const type = String(types.get(rule.dateColumn) ?? '');
+    if (!epoch.unit) return epoch.empty ? `${rule.dateColumn} (${type}) has no values` : `${rule.dateColumn} (${type})`;
+    return `${rule.dateColumn} as epoch ${epochUnitLabel(epoch.unit)}${epoch.detected ? ' (detected)' : ''}`;
+}
+
 async function evaluateTable(conn, rule, tableName) {
     assertPrunable(tableName);
     const types = await columnTypes(conn, tableName);
     if (!types.size) return { table: tableName, status: 'skipped', reason: 'table no longer exists' };
-    const preds = buildPredicates(rule, tableName, types);
+    const epoch = await resolveEpochUnit(conn, rule, tableName, types);
+    // An epoch column with no values: nothing can be old enough to delete,
+    // but a row-count criterion may still apply.
+    const effective = epoch.empty ? { ...rule, maxAgeValue: null } : rule;
+    if (epoch.empty && !rule.maxRows && !rule.conditions) {
+        const [rows] = await firstRow(conn, `SELECT count(*) FROM ${quoteIdent(tableName)}`);
+        return { table: tableName, status: 'ok', rows: Number(rows), byAge: 0, byCount: 0, byMatch: 0, total: 0, types, dateInfo: describeDateColumn(rule, types, epoch), preds: null };
+    }
+    const preds = buildPredicates(effective, tableName, types, epoch.unit);
     if (preds.skip) return { table: tableName, status: 'skipped', reason: preds.skip };
     const t = quoteIdent(tableName);
-    const [rows, byAge, byCount, total] = await firstRow(conn,
+    const [rows, byAge, byCount, byMatch, total] = await firstRow(conn,
         `SELECT count(*),
                 ${preds.age ? `count(*) FILTER (WHERE ${preds.age})` : '0'},
                 ${preds.count ? `count(*) FILTER (WHERE ${preds.count})` : '0'},
+                ${preds.match ? `count(*) FILTER (WHERE ${preds.match})` : '0'},
                 count(*) FILTER (WHERE ${wherePredicate(preds)})
          FROM ${t}`);
-    return { table: tableName, status: 'ok', preds, rows: Number(rows), byAge: Number(byAge), byCount: Number(byCount), total: Number(total), types };
+    return { table: tableName, status: 'ok', preds, rows: Number(rows), byAge: Number(byAge), byCount: Number(byCount), byMatch: Number(byMatch), total: Number(total), types,
+        dateInfo: describeDateColumn(rule, types, epoch) };
 }
 
 /** Resolve a stored blob path and return it only if it lies inside blobsRoot. */
@@ -260,9 +422,14 @@ async function deleteRows(conn, tableName, evaluation) {
 
 // --- Preview -----------------------------------------------------------------------
 
+/** True for rules saved before the one-table-per-rule change (patterns or lists). */
+export function isLegacyMultiTable(rule) {
+    return !!rule.excludePattern || !SAFE_IDENTIFIER_RE.test(String(rule.tablePattern || ''));
+}
+
 /** Dry run: which tables match and how many rows each would lose. */
-export async function previewRule(input) {
-    const rule = normaliseRule({ ...input, name: input.name || 'preview', schedule: input.schedule || '@daily' });
+export async function previewRule(input, { validated = false } = {}) {
+    const rule = validated ? input : normaliseRule({ ...input, name: input.name || 'preview', schedule: input.schedule || '@daily' });
     const tables = matchTables(await userTableNames(), rule.tablePattern, rule.excludePattern);
     return withConnection(async (conn) => {
         const results = [];
@@ -270,7 +437,7 @@ export async function previewRule(input) {
             const e = await evaluateTable(conn, rule, table);
             results.push({
                 table, status: e.status, reason: e.reason || null, rows: e.rows ?? null,
-                byAge: e.byAge ?? 0, byCount: e.byCount ?? 0, total: e.total ?? 0,
+                byAge: e.byAge ?? 0, byCount: e.byCount ?? 0, byMatch: e.byMatch ?? 0, total: e.total ?? 0, dateInfo: e.dateInfo || null,
                 overLimit: !!(rule.safetyLimit && e.total > rule.safetyLimit),
             });
         }
@@ -319,13 +486,14 @@ async function runJob(jobId, rule, { trigger, username }) {
                     const e = await evaluateTable(conn, rule, table);
                     if (e.status === 'skipped') return { status: 'skipped', message: e.reason };
                     if (rule.safetyLimit && e.total > rule.safetyLimit) {
-                        return { status: 'failed', rowsByAge: e.byAge, rowsByCount: e.byCount,
+                        return { status: 'failed', rowsByAge: e.byAge, rowsByCount: e.byCount, rowsByMatch: e.byMatch,
                             message: `Would delete ${e.total.toLocaleString()} rows, above the safety limit of ${rule.safetyLimit.toLocaleString()}; nothing was deleted.` };
                     }
-                    if (e.total === 0) return { status: 'succeeded', rowsByAge: 0, rowsByCount: 0, rowsDeleted: 0, message: 'Nothing to delete.' };
+                    const via = e.dateInfo ? ` Age by ${e.dateInfo}.` : '';
+                    if (e.total === 0) return { status: 'succeeded', rowsByAge: 0, rowsByCount: 0, rowsByMatch: 0, rowsDeleted: 0, message: `Nothing to delete.${via}` };
                     const d = await deleteRows(conn, table, e);
-                    return { status: 'succeeded', rowsByAge: e.byAge, rowsByCount: e.byCount, rowsDeleted: d.deleted, blobFiles: d.blobFiles,
-                        message: `Deleted ${d.deleted.toLocaleString()} of ${e.rows.toLocaleString()} rows.` };
+                    return { status: 'succeeded', rowsByAge: e.byAge, rowsByCount: e.byCount, rowsByMatch: e.byMatch, rowsDeleted: d.deleted, blobFiles: d.blobFiles,
+                        message: `Deleted ${d.deleted.toLocaleString()} of ${e.rows.toLocaleString()} rows.${via}` };
                 });
                 await store.finishRun(runId, result);
                 if (result.status === 'skipped') skipped++;

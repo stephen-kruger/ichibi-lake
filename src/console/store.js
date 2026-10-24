@@ -61,8 +61,10 @@ export async function initConsoleTables() {
         date_column VARCHAR,
         max_age_value BIGINT,
         max_age_unit VARCHAR,
+        epoch_unit VARCHAR,
         max_rows BIGINT,
         order_column VARCHAR,
+        conditions VARCHAR,
         schedule VARCHAR,
         enabled VARCHAR,
         safety_limit BIGINT,
@@ -77,6 +79,9 @@ export async function initConsoleTables() {
         updated_ms BIGINT,
         updated_by VARCHAR
     )`);
+    // Added after the first prune-rules release (numeric epoch date columns).
+    await execute(`ALTER TABLE ${PRUNE_RULES} ADD COLUMN IF NOT EXISTS epoch_unit VARCHAR`);
+    await execute(`ALTER TABLE ${PRUNE_RULES} ADD COLUMN IF NOT EXISTS conditions VARCHAR`);
     await execute(`CREATE TABLE IF NOT EXISTS ${PRUNE_RUNS} (
         run_id VARCHAR,
         job_id VARCHAR,
@@ -90,6 +95,7 @@ export async function initConsoleTables() {
         finished_ms BIGINT,
         rows_by_age BIGINT,
         rows_by_count BIGINT,
+        rows_by_match BIGINT,
         rows_deleted BIGINT,
         blob_files BIGINT,
         message VARCHAR,
@@ -103,6 +109,7 @@ export async function initConsoleTables() {
         detail VARCHAR,
         ip VARCHAR
     )`);
+    await execute(`ALTER TABLE ${PRUNE_RUNS} ADD COLUMN IF NOT EXISTS rows_by_match BIGINT`);
     await migrateFromMainCatalog();
     await migrateLegacyRetention();
 }
@@ -335,11 +342,17 @@ export function describeSetting(def) {
 const num = (v) => (v === null || v === undefined ? null : Number(v));
 const big = (v) => (v === null || v === undefined || v === '' ? null : BigInt(Math.trunc(Number(v))));
 
+function parseConditions(text) {
+    if (!text) return null;
+    try { const c = JSON.parse(text); return c && Array.isArray(c.items) && c.items.length ? c : null; } catch { return null; }
+}
+
 function ruleFromRow(r) {
     return {
         id: r.id, name: r.name, tablePattern: r.table_pattern, excludePattern: r.exclude_pattern || '',
         dateColumn: r.date_column || null, maxAgeValue: num(r.max_age_value), maxAgeUnit: r.max_age_unit || 'days',
-        maxRows: num(r.max_rows), orderColumn: r.order_column || null, schedule: r.schedule,
+        epochUnit: r.epoch_unit || 'auto',
+        maxRows: num(r.max_rows), orderColumn: r.order_column || null, conditions: parseConditions(r.conditions), schedule: r.schedule,
         enabled: r.enabled === 'true', safetyLimit: num(r.safety_limit), reclaimStorage: r.reclaim_storage === 'true',
         nextRunMs: num(r.next_run_ms), lastRunMs: num(r.last_run_ms), lastStatus: r.last_status || null,
         lastDeleted: num(r.last_deleted), createdMs: num(r.created_ms), createdBy: r.created_by,
@@ -347,8 +360,8 @@ function ruleFromRow(r) {
     };
 }
 
-const RULE_COLUMNS = `id, name, table_pattern, exclude_pattern, date_column, max_age_value, max_age_unit, max_rows,
-    order_column, schedule, enabled, safety_limit, reclaim_storage, next_run_ms, last_run_ms, last_status, last_deleted,
+const RULE_COLUMNS = `id, name, table_pattern, exclude_pattern, date_column, max_age_value, max_age_unit, epoch_unit, max_rows,
+    order_column, conditions, schedule, enabled, safety_limit, reclaim_storage, next_run_ms, last_run_ms, last_status, last_deleted,
     created_ms, created_by, updated_ms, updated_by`;
 
 export async function listPruneRules() {
@@ -363,26 +376,34 @@ export async function getPruneRule(id) {
 export async function createPruneRule(rule) {
     const now = Date.now();
     await executeWithParams(
-        `INSERT INTO ${PRUNE_RULES} (id, name, table_pattern, exclude_pattern, date_column, max_age_value, max_age_unit, max_rows,
-            order_column, schedule, enabled, safety_limit, reclaim_storage, next_run_ms, created_ms, created_by, updated_ms, updated_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO ${PRUNE_RULES} (id, name, table_pattern, exclude_pattern, date_column, max_age_value, max_age_unit, epoch_unit, max_rows,
+            order_column, conditions, schedule, enabled, safety_limit, reclaim_storage, next_run_ms, created_ms, created_by, updated_ms, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [rule.id, rule.name, rule.tablePattern, rule.excludePattern || '', rule.dateColumn || null, big(rule.maxAgeValue),
-            rule.maxAgeUnit || 'days', big(rule.maxRows), rule.orderColumn || null, rule.schedule, rule.enabled ? 'true' : 'false',
+            rule.maxAgeUnit || 'days', rule.epochUnit || 'auto', big(rule.maxRows), rule.orderColumn || null,
+            rule.conditions ? JSON.stringify(rule.conditions) : null, rule.schedule, rule.enabled ? 'true' : 'false',
             big(rule.safetyLimit), rule.reclaimStorage ? 'true' : 'false', big(rule.nextRunMs), BigInt(now), rule.user, BigInt(now), rule.user],
-        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT,
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT,
             BIGINT, VARCHAR, BIGINT, VARCHAR]);
 }
 
 export async function updatePruneRule(id, rule) {
     await executeWithParams(
         `UPDATE ${PRUNE_RULES} SET name = ?, table_pattern = ?, exclude_pattern = ?, date_column = ?, max_age_value = ?,
-            max_age_unit = ?, max_rows = ?, order_column = ?, schedule = ?, enabled = ?, safety_limit = ?, reclaim_storage = ?,
+            max_age_unit = ?, epoch_unit = ?, max_rows = ?, order_column = ?, conditions = ?, schedule = ?, enabled = ?, safety_limit = ?, reclaim_storage = ?,
             next_run_ms = ?, updated_ms = ?, updated_by = ?
          WHERE id = ?`,
         [rule.name, rule.tablePattern, rule.excludePattern || '', rule.dateColumn || null, big(rule.maxAgeValue),
-            rule.maxAgeUnit || 'days', big(rule.maxRows), rule.orderColumn || null, rule.schedule, rule.enabled ? 'true' : 'false',
+            rule.maxAgeUnit || 'days', rule.epochUnit || 'auto', big(rule.maxRows), rule.orderColumn || null,
+            rule.conditions ? JSON.stringify(rule.conditions) : null, rule.schedule, rule.enabled ? 'true' : 'false',
             big(rule.safetyLimit), rule.reclaimStorage ? 'true' : 'false', big(rule.nextRunMs), BigInt(Date.now()), rule.user, id],
-        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, BIGINT, VARCHAR, VARCHAR]);
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, BIGINT, VARCHAR, VARCHAR]);
+}
+
+export async function setRuleEnabled(id, enabled, nextRunMs, user) {
+    await executeWithParams(
+        `UPDATE ${PRUNE_RULES} SET enabled = ?, next_run_ms = ?, updated_ms = ?, updated_by = ? WHERE id = ?`,
+        [enabled ? 'true' : 'false', big(nextRunMs), BigInt(Date.now()), user, id], [VARCHAR, BIGINT, BIGINT, VARCHAR, VARCHAR]);
 }
 
 export async function deletePruneRule(id) {
@@ -441,11 +462,11 @@ export async function insertRun(run) {
 
 export async function finishRun(runId, r) {
     await executeWithParams(
-        `UPDATE ${PRUNE_RUNS} SET status = ?, finished_ms = ?, rows_by_age = ?, rows_by_count = ?, rows_deleted = ?,
+        `UPDATE ${PRUNE_RUNS} SET status = ?, finished_ms = ?, rows_by_age = ?, rows_by_count = ?, rows_by_match = ?, rows_deleted = ?,
             blob_files = ?, message = ? WHERE run_id = ?`,
-        [r.status, BigInt(Date.now()), big(r.rowsByAge), big(r.rowsByCount), big(r.rowsDeleted), big(r.blobFiles),
+        [r.status, BigInt(Date.now()), big(r.rowsByAge), big(r.rowsByCount), big(r.rowsByMatch), big(r.rowsDeleted), big(r.blobFiles),
             String(r.message || '').slice(0, 2000), runId],
-        [VARCHAR, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, VARCHAR, VARCHAR]);
+        [VARCHAR, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, BIGINT, VARCHAR, VARCHAR]);
 }
 
 /** Recent jobs (newest first) with their per-table runs. */
@@ -462,7 +483,7 @@ export async function listRuns({ ruleId = null, limit = 50 } = {}) {
     const shape = (r) => ({
         runId: r.run_id, jobId: r.job_id, ruleId: r.rule_id, ruleName: r.rule_name, table: r.table_name, trigger: r.trigger,
         status: r.status, startedMs: num(r.started_ms), finishedMs: num(r.finished_ms), rowsByAge: num(r.rows_by_age),
-        rowsByCount: num(r.rows_by_count), rowsDeleted: num(r.rows_deleted), blobFiles: num(r.blob_files),
+        rowsByCount: num(r.rows_by_count), rowsByMatch: num(r.rows_by_match), rowsDeleted: num(r.rows_deleted), blobFiles: num(r.blob_files),
         message: r.message || '', instance: r.instance, username: r.username,
     });
     return jobs.map(j => ({ ...shape(j), tables: tables.filter(t => t.job_id === j.job_id).map(shape) }));

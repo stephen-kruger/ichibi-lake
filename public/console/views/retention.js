@@ -24,22 +24,68 @@
     }
     const n = (v) => Number(v || 0).toLocaleString();
 
-    // Same matching rules as the server (src/console/retention.js).
-    function globRegex(glob) {
-        return new RegExp(`^${glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`, 'i');
-    }
-    function splitPatterns(text) { return String(text || '').split(',').map(s => s.trim()).filter(Boolean); }
-    function matchTables(names, include, exclude) {
-        const inc = splitPatterns(include).map(globRegex);
-        const exc = splitPatterns(exclude).map(globRegex);
-        return names.filter(t => !t.startsWith('_') && inc.some(r => r.test(t)) && !exc.some(r => r.test(t))).sort();
-    }
-
     function describeCriteria(rule) {
         const parts = [];
-        if (rule.maxAgeValue) parts.push(`older than ${n(rule.maxAgeValue)} ${rule.maxAgeUnit} (by ${rule.dateColumn})`);
+        const EPOCH = { s: 'epoch seconds', ms: 'epoch ms', us: 'epoch µs', ns: 'epoch ns' };
+        if (rule.maxAgeValue) parts.push(`older than ${n(rule.maxAgeValue)} ${rule.maxAgeUnit} (by ${rule.dateColumn}${EPOCH[rule.epochUnit] ? `, ${EPOCH[rule.epochUnit]}` : ''})`);
         if (rule.maxRows) parts.push(`beyond the newest ${n(rule.maxRows)} rows (by ${rule.orderColumn || 'insertion order'})`);
+        if (rule.conditions?.items?.length) parts.push(`matching ${describeConditions(rule.conditions)}`);
         return `Delete rows ${parts.join(' or ')}`;
+    }
+
+    /**
+     * Column dropdown rebuilt from the selected tables. Groups list column
+     * names with how many of the selected tables have them; "Other…" reveals a
+     * text box for columns not present yet (e.g. wildcard rules for future
+     * tables). The current value is kept across rebuilds, flagged if missing.
+     */
+    function columnChooser({ value = '', emptyLabel = null, onChange = () => {} }) {
+        const select = h('select', { class: 'column-select' });
+        const other = h('input', { type: 'text', class: 'narrow', placeholder: 'column name', hidden: true });
+        let current = value || '';
+        // Until the user picks a column, follow the table selection: rebuild()
+        // re-chooses the most common supported column. A saved value counts as
+        // a choice and is kept.
+        let userChosen = !!value;
+        const sync = () => { other.hidden = select.value !== '__other__'; onChange(); };
+        select.addEventListener('change', () => { userChosen = true; if (select.value !== '__other__') current = select.value; else other.focus(); sync(); });
+        other.addEventListener('input', () => { userChosen = true; current = other.value.trim(); onChange(); });
+        return {
+            el: h('span', { class: 'column-chooser' }, select, other),
+            get value() { return select.value === '__other__' ? other.value.trim() : select.value; },
+            set disabled(d) { select.disabled = d; other.disabled = d; },
+            rebuild(groups, tableCount) {
+                const label = (c) => (c.detail ? `${c.name} — ${c.detail}` : tableCount > 1 ? `${c.name} — ${c.count} of ${tableCount} tables` : c.name);
+                const known = new Set(groups.flatMap(g => g.items.map(i => i.name)));
+                if (!userChosen) current = '';
+                const options = [];
+                if (emptyLabel !== null) options.push(h('option', { value: '' }, emptyLabel));
+                for (const g of groups) {
+                    if (g.items.length) options.push(h('optgroup', { label: g.label }, g.items.map(c => h('option', { value: c.name }, label(c)))));
+                }
+                if (current && !known.has(current)) {
+                    options.push(h('optgroup', { label: 'Not in the selected tables' }, h('option', { value: current }, `${current} (not found)`)));
+                }
+                options.push(h('option', { value: '__other__' }, 'Other…'));
+                select.replaceChildren(...options);
+                if (current) select.value = current;
+                else if (emptyLabel !== null) select.value = '';
+                else {
+                    // Default to the most common supported column.
+                    const first = groups.flatMap(g => g.items)[0];
+                    select.value = first ? first.name : '__other__';
+                    current = first ? first.name : '';
+                }
+                if (select.value === '__other__') other.value = current;
+                sync();
+            },
+        };
+    }
+
+    const NO_VALUE_OPS = new Set(['is_null', 'not_null']);
+    let CONDITION_OPS = {};
+    function describeConditions(c) {
+        return c.items.map(i => `${i.column} ${CONDITION_OPS[i.op] || i.op}${NO_VALUE_OPS.has(i.op) ? '' : ` "${i.value}"`}`).join(c.match === 'any' ? ' or ' : ' and ');
     }
 
     let pollTimer = null;
@@ -48,6 +94,7 @@
     registerView('retention', async (ctx) => {
         stopPolling();
         const data = await api('GET', '/retention');
+        CONDITION_OPS = data.conditionOps || {};
         const tableNames = data.tables.map(t => t.name);
         const presetLabel = (cron) => data.presets.find(p => p.cron === cron)?.label || null;
 
@@ -59,7 +106,7 @@
             const toggle = h('label', { class: 'switch', title: rule.enabled ? 'Enabled' : 'Disabled' },
                 h('input', { type: 'checkbox', checked: rule.enabled, disabled: !ctx.isAdmin }), h('span', {}));
             toggle.querySelector('input').addEventListener('change', (e) => withBusy(null, async () => {
-                await api('PUT', `/retention/rules/${rule.id}`, { ...rule, enabled: e.target.checked });
+                await api('PATCH', `/retention/rules/${rule.id}`, { enabled: e.target.checked });
                 toast(`Rule ${e.target.checked ? 'enabled' : 'disabled'}`, 'success');
                 ctx.reload();
             }));
@@ -73,7 +120,9 @@
                     ctx.reload();
                 });
             });
-            const preview = h('button', { class: 'btn small', type: 'button', onclick: () => previewDialog(rule) }, 'Preview');
+            const preview = h('button', { class: 'btn small', type: 'button', onclick: () => previewDialog(rule, `/retention/rules/${rule.id}/preview`) }, 'Preview');
+            const clone = h('button', { class: 'btn small', type: 'button', disabled: !ctx.isAdmin, title: 'Create a new rule with these settings',
+                onclick: () => editRule(ctx, data, rule, { clone: true }) }, 'Clone');
             const edit = h('button', { class: 'btn small', type: 'button', disabled: !ctx.isAdmin, onclick: () => editRule(ctx, data, rule) }, 'Edit');
             const del = h('button', { class: 'btn small danger', type: 'button', disabled: !ctx.isAdmin }, 'Delete');
             del.addEventListener('click', async () => {
@@ -84,8 +133,9 @@
                 h('td', {},
                     h('div', { class: 'rule-name' }, rule.name),
                     h('div', { class: 'mono muted' }, rule.tablePattern, rule.excludePattern ? ` (except ${rule.excludePattern})` : ''),
-                    h('div', { class: 'muted small', title: rule.matches.join(', ') || 'No tables match' },
-                        rule.matches.length ? `${rule.matches.length} table(s): ${rule.matches.slice(0, 4).join(', ')}${rule.matches.length > 4 ? ', …' : ''}` : 'No tables match yet')),
+                    rule.legacyMultiTable
+                        ? h('div', { class: 'small' }, h('span', { class: 'badge console', title: 'Saved before rules were limited to one table. It still runs; editing it requires choosing one table (use Clone for the others).' }, `multiple tables (${rule.matches.length})`))
+                        : (rule.matches.length ? null : h('div', { class: 'muted small' }, 'Table does not exist yet'))),
                 h('td', { class: 'small' }, describeCriteria(rule),
                     rule.safetyLimit ? h('div', { class: 'muted' }, `Safety limit: ${n(rule.safetyLimit)} rows per table`) : null,
                     rule.reclaimStorage ? h('div', { class: 'muted' }, 'Reclaims storage after pruning') : null),
@@ -94,13 +144,13 @@
                 h('td', { class: 'small' }, badge(rule.lastStatus),
                     rule.lastRunMs ? h('div', { class: 'muted' }, `${fmtMs(rule.lastRunMs)} · ${n(rule.lastDeleted)} deleted`) : null),
                 h('td', {}, toggle),
-                h('td', { class: 'actions' }, run, preview, edit, del));
+                h('td', { class: 'actions' }, run, preview, clone, edit, del));
         });
 
         const rulesCard = h('div', { class: 'card' },
-            h('div', { class: 'card-header' }, h('h2', {}, 'Rules'), h('span', { class: 'hint' }, 'Rows matching either criterion are deleted. Schedules are in UTC.')),
+            h('div', { class: 'card-header' }, h('h2', {}, 'Rules'), h('span', { class: 'hint' }, 'Rows meeting any ticked criterion are deleted. Schedules are in UTC.')),
             h('div', { class: 'card-body flush table-wrap' }, rows.length
-                ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Rule & tables'), h('th', {}, 'Criteria'), h('th', {}, 'Schedule'), h('th', {}, 'Last run'), h('th', {}, 'On'), h('th', {}, ''))), h('tbody', {}, rows))
+                ? h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Rule & table'), h('th', {}, 'Criteria'), h('th', {}, 'Schedule'), h('th', {}, 'Last run'), h('th', {}, 'On'), h('th', {}, ''))), h('tbody', {}, rows))
                 : h('div', { class: 'empty' }, 'No pruning rules yet. Create one to delete old or excess rows automatically.')));
 
         // -------------------------------------------------------------- storage
@@ -154,10 +204,10 @@
                 if (open) {
                     body.push(h('tr', { class: 'job-detail' }, h('td', { colspan: 8 },
                         job.tables.length ? h('table', { class: 'inner' },
-                            h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', {}, 'Status'), h('th', { class: 'num' }, 'By age'), h('th', { class: 'num' }, 'By count'), h('th', { class: 'num' }, 'Deleted'), h('th', {}, 'Details'))),
+                            h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', {}, 'Status'), h('th', { class: 'num' }, 'By age'), h('th', { class: 'num' }, 'By count'), h('th', { class: 'num' }, 'By match'), h('th', { class: 'num' }, 'Deleted'), h('th', {}, 'Details'))),
                             h('tbody', {}, job.tables.map(t => h('tr', {},
                                 h('td', { class: 'mono' }, t.table), h('td', {}, badge(t.status)),
-                                h('td', { class: 'num' }, n(t.rowsByAge)), h('td', { class: 'num' }, n(t.rowsByCount)), h('td', { class: 'num' }, n(t.rowsDeleted)),
+                                h('td', { class: 'num' }, n(t.rowsByAge)), h('td', { class: 'num' }, n(t.rowsByCount)), h('td', { class: 'num' }, n(t.rowsByMatch)), h('td', { class: 'num' }, n(t.rowsDeleted)),
                                 h('td', { class: 'small muted' }, t.message, t.blobFiles ? ` ${n(t.blobFiles)} blob file(s) removed.` : '')))))
                             : h('div', { class: 'muted' }, 'No tables were processed.'))));
                 }
@@ -174,7 +224,7 @@
         await loadRuns();
 
         return [
-            pageHeader('Retention & Pruning', 'Delete old or excess rows automatically. Each rule selects tables by name or wildcard (new tables are picked up automatically) and runs on its own schedule. System tables are never pruned.', newRule),
+            pageHeader('Retention & Pruning', 'Delete old, excess or matching rows automatically. Each rule prunes one table on its own schedule; use Clone to reuse a rule for another table. System tables are never pruned.', newRule),
             rulesCard, activityCard, storageCard,
         ];
     });
@@ -186,19 +236,20 @@
     function previewTable(result) {
         if (!result.tables.length) return h('div', { class: 'empty' }, 'No tables match.');
         return h('div', { class: 'table-wrap form-scroll' }, h('table', {},
-            h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', { class: 'num' }, 'Rows'), h('th', { class: 'num' }, 'By age'), h('th', { class: 'num' }, 'By count'), h('th', { class: 'num' }, 'Would delete'), h('th', {}, ''))),
+            h('thead', {}, h('tr', {}, h('th', {}, 'Table'), h('th', { class: 'num' }, 'Rows'), h('th', { class: 'num' }, 'By age'), h('th', { class: 'num' }, 'By count'), h('th', { class: 'num' }, 'By match'), h('th', { class: 'num' }, 'Would delete'), h('th', {}, ''))),
             h('tbody', {}, result.tables.map(t => h('tr', {},
                 h('td', { class: 'mono' }, t.table),
                 h('td', { class: 'num' }, t.rows === null ? '—' : n(t.rows)),
-                h('td', { class: 'num' }, n(t.byAge)), h('td', { class: 'num' }, n(t.byCount)),
+                h('td', { class: 'num' }, n(t.byAge)), h('td', { class: 'num' }, n(t.byCount)), h('td', { class: 'num' }, n(t.byMatch)),
                 h('td', { class: 'num' }, h('strong', {}, n(t.total))),
                 h('td', { class: 'small' }, t.status === 'skipped' ? h('span', { class: 'muted' }, `Skipped: ${t.reason}`)
-                    : t.overLimit ? h('span', { class: 'badge off' }, 'over safety limit') : null))))));
+                    : [t.overLimit ? h('span', { class: 'badge off' }, 'over safety limit') : null,
+                        t.dateInfo ? h('span', { class: 'muted' }, ` by ${t.dateInfo}`) : null]))))));
     }
 
-    async function previewDialog(spec) {
+    async function previewDialog(spec, endpoint = '/retention/preview') {
         let result;
-        try { result = await api('POST', '/retention/preview', spec); }
+        try { result = await api('POST', endpoint, endpoint === '/retention/preview' ? spec : undefined); }
         catch (err) { return toast(err.message, 'error'); }
         await modal({
             title: `Preview: ${spec.name || 'rule'}`,
@@ -213,17 +264,19 @@
     // Rule editor
     // =========================================================================
 
-    async function editRule(ctx, data, rule) {
+    async function editRule(ctx, data, rule, { clone = false } = {}) {
         let values = rule ? { ...rule } : {
-            name: '', tablePattern: '', excludePattern: '', maxAgeValue: 30, maxAgeUnit: 'days', dateColumn: 'created',
+            name: '', tablePattern: '', excludePattern: '', maxAgeValue: 30, maxAgeUnit: 'days', dateColumn: '',
             maxRows: null, orderColumn: '', schedule: '0 2 * * *', enabled: true, safetyLimit: null, reclaimStorage: false,
         };
+        if (clone) values.name = `${rule.name} (copy)`;
+        const isEdit = !!rule && !clone;
         // Reopen the editor with the entered values if saving fails.
         for (;;) {
-            values = await ruleForm(data, values, !!rule);
+            values = await ruleForm(data, values, isEdit, clone);
             if (!values) return;
             try {
-                if (rule) await api('PUT', `/retention/rules/${rule.id}`, values);
+                if (isEdit) await api('PUT', `/retention/rules/${rule.id}`, values);
                 else await api('POST', '/retention/rules', values);
                 toast(`Rule "${values.name}" saved`, 'success');
                 ctx.reload();
@@ -234,23 +287,59 @@
         }
     }
 
-    function ruleForm(data, v, isEdit) {
-        const tableNames = data.tables.map(t => t.name);
+    function ruleForm(data, v, isEdit, isClone = false) {
         const name = h('input', { type: 'text', value: v.name, placeholder: 'e.g. Sensor data – 90 days' });
-        const include = h('input', { type: 'text', value: v.tablePattern, placeholder: 'e.g. sensor_*, events' });
-        const exclude = h('input', { type: 'text', value: v.excludePattern || '', placeholder: 'optional, e.g. *_archive' });
-        const matchOut = h('div', { class: 'help' });
+        const singleTable = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(v.tablePattern || '') && !v.excludePattern;
+        let selectedTable = singleTable ? v.tablePattern : '';
+        const legacyNote = !singleTable && v.tablePattern
+            ? h('div', { class: 'callout' }, `This rule was saved with several tables (${v.tablePattern}${v.excludePattern ? ` except ${v.excludePattern}` : ''}). Rules now prune one table each: choose the table to keep here, and use Clone for the others.`)
+            : null;
+        const tableInfo = h('div', { class: 'help' });
 
         const useAge = h('input', { type: 'checkbox', checked: !!v.maxAgeValue });
         const ageValue = h('input', { type: 'number', min: 1, value: v.maxAgeValue || 30, class: 'narrow' });
         const ageUnit = h('select', { class: 'narrow' }, ['days', 'hours'].map(u => h('option', { value: u, selected: v.maxAgeUnit === u }, u)));
-        const dateColumn = h('input', { type: 'text', value: v.dateColumn || 'created', list: 'prune-date-columns', class: 'narrow' });
-        const dateList = h('datalist', { id: 'prune-date-columns' });
+        const epochNames = new Set(); // columns that are numbers in the selected tables
+        const epochRow = h('div', { class: 'criterion indent' });
+        const dateColumn = columnChooser({
+            value: v.dateColumn || '',
+            onChange: () => { epochRow.hidden = !(epochNames.has(dateColumn.value) || !dateColumnKnown(dateColumn.value)); },
+        });
+        const epochUnit = h('select', { class: 'narrow', title: 'Only used when the column is a number (Unix epoch time)' },
+            [['auto', 'auto-detect'], ['s', 'seconds'], ['ms', 'milliseconds'], ['us', 'microseconds'], ['ns', 'nanoseconds']]
+                .map(([val, label]) => h('option', { value: val, selected: (v.epochUnit || 'auto') === val }, label)));
 
         const useCount = h('input', { type: 'checkbox', checked: !!v.maxRows });
         const maxRows = h('input', { type: 'number', min: 1, value: v.maxRows || 1000000, class: 'narrow' });
-        const orderColumn = h('input', { type: 'text', value: v.orderColumn || '', list: 'prune-order-columns', placeholder: 'insertion order', class: 'narrow' });
-        const orderList = h('datalist', { id: 'prune-order-columns' });
+        epochRow.append(h('span', { class: 'muted small' }, 'Column is a number (Unix epoch); its unit is'), epochUnit);
+        const orderColumn = columnChooser({ value: v.orderColumn || '', emptyLabel: '(insertion order)' });
+        let dateColumnKnown = () => true;
+
+        // --- Match conditions: structured column / operator / value rows (no SQL text).
+        const useMatch = h('input', { type: 'checkbox', checked: !!v.conditions?.items?.length });
+        const matchMode = h('select', { class: 'narrow' }, h('option', { value: 'all', selected: v.conditions?.match !== 'any' }, 'all'),
+            h('option', { value: 'any', selected: v.conditions?.match === 'any' }, 'any'));
+        const condRows = h('div', { class: 'cond-rows' });
+        let condColumnGroups = [];
+        let condTableCount = 0;
+        const conditionRows = [];
+        const addCondition = (c = {}) => {
+            const col = columnChooser({ value: c.column || '' });
+            const op = h('select', { class: 'narrow' }, Object.entries(CONDITION_OPS).map(([k, label]) => h('option', { value: k, selected: (c.op || 'equals') === k }, label)));
+            const val = h('input', { type: 'text', class: 'narrow', value: c.value || '', placeholder: 'value' });
+            const syncOp = () => { val.hidden = NO_VALUE_OPS.has(op.value); val.placeholder = op.value === 'in' ? 'a, b, c' : 'value'; };
+            op.addEventListener('change', syncOp);
+            const row = { col, op, val, el: null };
+            const remove = h('button', { class: 'btn small danger', type: 'button', title: 'Remove condition', onclick: () => {
+                conditionRows.splice(conditionRows.indexOf(row), 1); row.el.remove();
+            } }, '×');
+            row.el = h('div', { class: 'criterion cond-row' }, col.el, op, val, remove);
+            conditionRows.push(row);
+            condRows.appendChild(row.el);
+            col.rebuild(condColumnGroups, condTableCount);
+            syncOp();
+        };
+        const addCondBtn = h('button', { class: 'btn small', type: 'button', onclick: () => addCondition() }, icon('plus'), 'Add condition');
 
         const preset = h('select', {}, data.presets.map(p => h('option', { value: p.cron, selected: p.cron === v.schedule }, p.label)),
             h('option', { value: '__custom__', selected: !data.presets.some(p => p.cron === v.schedule) }, 'Custom (cron)'));
@@ -262,20 +351,58 @@
         const enabled = h('input', { type: 'checkbox', checked: v.enabled !== false });
         const previewOut = h('div', {});
 
-        // Live table-match feedback and column suggestions.
-        const syncMatches = () => {
-            const m = matchTables(tableNames, include.value, exclude.value);
-            matchOut.textContent = !include.value.trim() ? 'Comma-separated names or wildcards (* and ?). Tables created later that match are included automatically.'
-                : m.length ? `Matches ${m.length} table(s) now: ${m.slice(0, 12).join(', ')}${m.length > 12 ? ', …' : ''}` : 'No tables match yet (the rule still applies to matching tables created later).';
-            const matched = data.tables.filter(t => m.includes(t.name));
-            const dates = [...new Set(matched.flatMap(t => t.dateColumns))];
-            const all = [...new Set(matched.flatMap(t => t.columns))];
-            dateList.replaceChildren(...dates.map(c => h('option', { value: c })));
-            orderList.replaceChildren(...all.map(c => h('option', { value: c })));
+        // --- Table: one per rule. Choosing it rebuilds every column dropdown
+        // from that table's actual columns and types.
+        const lower = (x) => x.toLowerCase();
+        const findTable = (nm) => data.tables.find(t => lower(t.name) === lower(nm || ''));
+        const syncColumns = () => {
+            const t = findTable(selectedTable);
+            const type = (c) => (t && t.types ? t.types[c] : '');
+            const items = (cols, suffix = '') => cols.map(c => ({ name: c, count: 1, detail: `${type(c)}${suffix}` }));
+            tableInfo.textContent = !selectedTable ? 'Choose the table to prune. To apply similar rules to other tables, save this one and use Clone.'
+                : t ? `${selectedTable}: ${t.columns.length} column(s)` : `${selectedTable} does not exist yet; the rule applies once it is created. Columns cannot be listed, so use Other… to type them.`;
+            const dateGroups = t ? [
+                { label: 'Dates & timestamps', items: items(t.dateColumns) },
+                { label: 'Epoch numbers (likely)', items: items(t.epochColumns || [], ', epoch') },
+                { label: 'Other numbers (epoch)', items: items(t.numericColumns || [], ', epoch?') },
+            ] : [];
+            epochNames.clear();
+            if (t) for (const c of [...(t.epochColumns || []), ...(t.numericColumns || [])]) epochNames.add(c);
+            const supported = new Set(dateGroups.flatMap(g => g.items.map(i => i.name)));
+            dateColumnKnown = (c) => supported.has(c);
+            dateColumn.rebuild(dateGroups, 1);
+            const allCols = t ? [{ label: 'Columns', items: items(t.columns) }] : [];
+            orderColumn.rebuild(allCols, 1);
+            condColumnGroups = allCols;
+            condTableCount = 1;
+            for (const r of conditionRows) r.col.rebuild(condColumnGroups, condTableCount);
+            drawTables();
         };
-        include.addEventListener('input', syncMatches);
-        exclude.addEventListener('input', syncMatches);
-        syncMatches();
+        const tableFilter = h('input', { type: 'text', placeholder: 'Filter tables…', class: 'picker-filter' });
+        const tableList = h('div', { class: 'picker-list', role: 'radiogroup', 'aria-label': 'Table' });
+        const otherTable = h('input', { type: 'text', class: 'narrow', placeholder: 'or type a table name' });
+        const drawTables = () => {
+            const q = lower(tableFilter.value.trim());
+            const missing = selectedTable && !findTable(selectedTable) ? [{ name: selectedTable, missing: true, dateColumns: [], epochColumns: [] }] : [];
+            const shown = [...missing, ...data.tables].filter(t => !q || lower(t.name).includes(q));
+            tableList.replaceChildren(...(shown.length ? shown.map(t => {
+                const on = lower(t.name) === lower(selectedTable);
+                const radio = h('input', { type: 'radio', name: 'prune-table', checked: on });
+                radio.addEventListener('change', () => { selectedTable = t.name; otherTable.value = ''; syncColumns(); });
+                return h('label', { class: `picker-row ${on ? 'on' : ''}` }, radio, h('span', { class: 'mono' }, t.name),
+                    t.missing ? h('span', { class: 'badge console' }, 'not found') : null,
+                    h('span', { class: 'muted small picker-cols' }, t.missing ? '' : [
+                        t.dateColumns.length ? `date: ${t.dateColumns.join(', ')}` : null,
+                        t.epochColumns?.length ? `epoch: ${t.epochColumns.join(', ')}` : null,
+                    ].filter(Boolean).join(' · ') || 'no date columns'));
+            }) : [h('div', { class: 'muted small' }, data.tables.length ? 'No tables match the filter.' : 'No user tables exist yet.')]));
+        };
+        tableFilter.addEventListener('input', drawTables);
+        otherTable.addEventListener('change', () => { if (otherTable.value.trim()) { selectedTable = otherTable.value.trim(); syncColumns(); } });
+        const tablePicker = h('div', { class: 'table-picker' },
+            h('div', { class: 'picker-head' }, tableFilter, h('span', { class: 'spacer' }), otherTable),
+            tableList);
+        syncColumns();
 
         let cronTimer = null;
         const syncCron = () => {
@@ -293,22 +420,30 @@
         syncCron();
 
         const toggleCriteria = () => {
-            for (const el of [ageValue, ageUnit, dateColumn]) el.disabled = !useAge.checked;
+            for (const el of [ageValue, ageUnit, dateColumn, epochUnit]) el.disabled = !useAge.checked;
             for (const el of [maxRows, orderColumn]) el.disabled = !useCount.checked;
+            condRows.classList.toggle('disabled', !useMatch.checked);
+            for (const r of conditionRows) { r.col.disabled = !useMatch.checked; r.op.disabled = !useMatch.checked; r.val.disabled = !useMatch.checked; }
+            matchMode.disabled = !useMatch.checked; addCondBtn.disabled = !useMatch.checked;
         };
         useAge.addEventListener('change', toggleCriteria);
         useCount.addEventListener('change', toggleCriteria);
+        useMatch.addEventListener('change', () => { if (useMatch.checked && !conditionRows.length) addCondition(); toggleCriteria(); });
+        for (const c of v.conditions?.items || []) addCondition(c);
         toggleCriteria();
 
         const read = () => ({
             name: name.value.trim(),
-            tablePattern: include.value,
-            excludePattern: exclude.value,
+            table: selectedTable,
             maxAgeValue: useAge.checked ? Number(ageValue.value) : null,
             maxAgeUnit: ageUnit.value,
-            dateColumn: useAge.checked ? dateColumn.value.trim() : null,
+            dateColumn: useAge.checked ? dateColumn.value : null,
+            epochUnit: epochUnit.value,
             maxRows: useCount.checked ? Number(maxRows.value) : null,
-            orderColumn: useCount.checked ? orderColumn.value.trim() || null : null,
+            orderColumn: useCount.checked ? orderColumn.value || null : null,
+            conditions: useMatch.checked && conditionRows.length
+                ? { match: matchMode.value, items: conditionRows.map(r => ({ column: r.col.value, op: r.op.value, value: r.val.value })) }
+                : null,
             schedule: cron.value.trim(),
             safetyLimit: safety.value ? Number(safety.value) : null,
             reclaimStorage: reclaim.checked,
@@ -324,22 +459,25 @@
 
         const body = h('div', { class: 'rule-form' },
             field('Name', name),
-            h('div', { class: 'form-grid' }, field('Tables', include), field('Except', exclude)),
-            matchOut,
+            legacyNote,
+            h('div', { class: 'field' }, h('label', { class: 'label' }, 'Table'), tablePicker, tableInfo),
             h('fieldset', {}, h('legend', {}, 'Delete rows that are…'),
-                h('div', { class: 'criterion' }, h('label', { class: 'checkbox' }, useAge, 'older than'), ageValue, ageUnit, h('span', {}, 'based on column'), dateColumn, dateList),
-                h('div', { class: 'criterion' }, h('label', { class: 'checkbox' }, useCount, 'beyond the newest'), maxRows, h('span', {}, 'rows, ordered by'), orderColumn, orderList),
-                h('div', { class: 'help' }, 'With both ticked, a row is deleted if it fails either one.')),
+                h('div', { class: 'criterion' }, h('label', { class: 'checkbox' }, useAge, 'older than'), ageValue, ageUnit, h('span', {}, 'based on column'), dateColumn.el),
+                epochRow,
+                h('div', { class: 'criterion' }, h('label', { class: 'checkbox' }, useCount, 'beyond the newest'), maxRows, h('span', {}, 'rows, ordered by'), orderColumn.el),
+                h('div', { class: 'criterion' }, h('label', { class: 'checkbox' }, useMatch, 'matching'), matchMode, h('span', {}, 'of these conditions:'), addCondBtn),
+                condRows,
+                h('div', { class: 'help' }, 'With more than one ticked, a row is deleted if it meets any of them. Conditions compare values only; SQL is never accepted.')),
             h('fieldset', {}, h('legend', {}, 'Schedule (UTC)'),
                 h('div', { class: 'criterion' }, preset, cron), cronOut),
             h('fieldset', {}, h('legend', {}, 'Safety and storage'),
-                h('div', { class: 'criterion' }, h('span', {}, 'Stop if a run would delete more than'), safety, h('span', {}, 'rows from one table')),
+                h('div', { class: 'criterion' }, h('span', {}, 'Stop if a run would delete more than'), safety, h('span', {}, 'rows')),
                 h('label', { class: 'checkbox' }, reclaim, 'Reclaim storage after pruning (rewrites the affected tables; see Storage reclaim)'),
                 h('label', { class: 'checkbox' }, enabled, 'Enabled')),
             previewBtn, previewOut);
 
         return modal({
-            title: isEdit ? `Edit rule: ${v.name}` : 'New pruning rule',
+            title: isEdit ? `Edit rule: ${v.name}` : isClone ? 'Clone pruning rule' : 'New pruning rule',
             body,
             actions: [{ label: 'Cancel', value: null }, { label: isEdit ? 'Save rule' : 'Create rule', value: 'save', primary: true }],
             wide: true,
