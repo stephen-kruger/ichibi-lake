@@ -4,9 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js && node test/order-by-corruption.test.js && node test/api.test.js && node test/test-rest.js && node test/test-blob.js && node test/test-graphs.js && node test/test.js && node test/test-kafka-sse.js && node test/test-kafka-retroactive.js",
+    "test": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js && node test/order-by-corruption.test.js && node test/pgq-grammar.test.js && node test/api.test.js && node test/test-rest.js && node test/test-blob.js && node test/test-graphs.js && node test/test.js && node test/test-kafka-sse.js && node test/test-kafka-retroactive.js",
     "test:rbac": "node test/test-rbac.js",
-    "test:unit": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js && node test/order-by-corruption.test.js",
+    "test:unit": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js && node test/order-by-corruption.test.js && node test/pgq-grammar.test.js",
     "test:graphs-unit": "node test/graphs.test.js",
     "test:kafka-topic-filter": "node test/kafka-topic-filter.test.js",
     "test:api": "node test/api.test.js",
@@ -17,6 +17,7 @@
     "test:kafka-retroactive": "node test/test-kafka-retroactive.js",
     "test:blob": "node test/test-blob.js",
     "test:orderby": "node test/order-by-corruption.test.js",
+    "test:pgq-grammar": "node test/pgq-grammar.test.js",
     "test:stress": "node test/stress-test.js",
     "superlake": "node scripts/superlake-wizard.js"
   },
@@ -25,15 +26,15 @@
   "license": "ISC",
   "type": "module",
   "_comments": {
-    "@duckdb/node-api": "Pinned to 1.5.4-r.1 (DuckDB 1.5.4). History: originally pinned to 1.5.0 solely for DuckPGQ community-extension availability. DuckLake's compaction/CHECKPOINT crash ('DuckLakeCompaction - expected a single output file', duckdb/ducklake#525) was fixed by duckdb/ducklake#1095 (merged 2026-04-30 into branch v1.5-variegata) and confirmed working against DuckDB 1.5.4. DuckPGQ's community-extension build was separately bumped to target DuckDB 1.5.4 on 2026-06-30 (duckdb/community-extensions@f2476d8), so 1.5.4 is the lowest version satisfying both constraints. CAVEAT (open as of 2026-07-21): duckdb/ducklake#1108 is a related but distinct crash — a schema-cache key collision after DuckLake's automatic v0.3->v0.4 ducklake_schema_versions migration, triggered by per-table schema evolution (this codebase does ALTER TABLE ADD COLUMN for blob metadata, see src/db.js). compactDuckLake() in src/db.js works around #1108 by running maintenance as six explicit calls with a fresh, unpooled connection per table for merge_adjacent_files/rewrite_data_files instead of a single CHECKPOINT. Before bumping past 1.5.4: re-check ducklake#1108 for a permanent fix, and confirm DuckPGQ has a matching build for the target DuckDB version."
+    "@duckdb/node-api": "Pinned to 2.0.0-r.1 (DuckDB 2.0.0). History: originally pinned to 1.5.0 solely for DuckPGQ community-extension availability, then 1.5.4 once DuckLake's compaction/CHECKPOINT crash (duckdb/ducklake#525) was fixed by duckdb/ducklake#1095 and DuckPGQ shipped a 1.5.4 build. As of 2026-10-24 DuckPGQ has community builds for both DuckDB 1.5.6 and 2.0.0 (DuckDB v2 refs promoted in duckdb/community-extensions on 2026-10-20). DuckDB 2.0 requires parser extensions to be opted in per session, so loadDuckPgq() in src/db.js runs SET active_grammar_extensions = ['duckpgq'] on every pooled/user connection (it cannot be SET GLOBAL). CAVEAT (still open as of 2026-10-24): duckdb/ducklake#1108, a schema-cache key collision after the per-table schema_versions migration triggered by per-table schema evolution (this codebase does ALTER TABLE ADD COLUMN for blob metadata, see src/db.js). compactDuckLake() in src/db.js works around #1108 by running maintenance as six explicit calls with a fresh, unpooled connection per table for merge_adjacent_files/rewrite_data_files instead of a single CHECKPOINT. Before bumping DuckDB again: re-check ducklake#1108, and confirm DuckPGQ has a matching build for the target DuckDB version (INSTALL duckpgq FROM community fails otherwise and graph endpoints report DuckPGQ as not loaded)."
   },
   "dependencies": {
-    "@duckdb/node-api": "1.5.4-r.1",
-    "compression": "^1.8.1",
+    "@duckdb/node-api": "2.0.0-r.1",
+    "compression": "^1.8.2",
     "cors": "^2.8.6",
-    "express": "^5.2.1",
-    "graphql": "^16.14.2",
-    "graphql-http": "^1.22.4",
+    "express": "^5.3.0",
+    "graphql": "^17.0.2",
+    "graphql-http": "^1.23.1",
     "kafkajs": "^2.2.4",
     "swagger-ui-express": "^5.0.1",
     "yamljs": "^0.3.0"
