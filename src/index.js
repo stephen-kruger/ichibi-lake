@@ -12,7 +12,6 @@ import {
     executeUserSql,
     getTableColumns,
     invalidateColumnCache,
-    compactDuckLake,
     initGraphRegistry,
     saveGraphDefinition,
     loadGraphDefinition,
@@ -1725,10 +1724,9 @@ app.listen(port, '0.0.0.0', async () => {
         // Admin console: loads setting overrides (applied to process.env) and
         // starts the retention scheduler. Runs after RBAC/ACL bootstrap so an
         // API_KEYS override can reconcile against the bootstrapped users.
+        // Also starts scheduled lake maintenance, which compacts small files
+        // at startup and on its schedule (src/console/maintenance.js).
         await initConsole();
-        // Compact tiny Parquet files left over from high-frequency one-row
-        // ingestion. This is often the single biggest win for scan speed.
-        await compactDuckLake();
         startKafkaConsumer().catch(err => console.error('Kafka Consumer Error:', err));
     } catch (err) {
         console.error('Startup Error:', err);

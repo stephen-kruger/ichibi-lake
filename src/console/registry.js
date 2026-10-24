@@ -110,10 +110,23 @@ export const SETTINGS = [
     },
 
     // --- Storage ------------------------------------------------------------
-    { key: 'DUCKLAKE_DATA_PATH', section: 'storage', type: 'string', default: 'data_files/', editable: false, label: 'DuckLake data path' },
-    { key: 'USE_FILESYSTEM_BLOBS', section: 'storage', type: 'boolean', default: '', editable: false, label: 'Filesystem BLOB storage' },
+    {
+        key: 'DUCKLAKE_DATA_PATH', section: 'storage', type: 'string', default: 'data_files/', editable: false, label: 'DuckLake data path',
+        help: 'Local directory or s3:// URL (S3, MinIO, R2...). Object storage uses the S3_* settings below.',
+    },
+    { key: 'S3_ENDPOINT', section: 'storage', type: 'string', default: '', editable: false, label: 'S3 endpoint', help: 'host:port of an S3-compatible server; empty for AWS S3.' },
+    { key: 'S3_REGION', section: 'storage', type: 'string', default: 'us-east-1', editable: false, label: 'S3 region' },
+    { key: 'S3_ACCESS_KEY', section: 'storage', type: 'secret', default: '', editable: false, label: 'S3 access key', help: 'Empty: the AWS credential chain (environment, ~/.aws, instance or task role).' },
+    { key: 'S3_SECRET_KEY', section: 'storage', type: 'secret', default: '', editable: false, label: 'S3 secret key' },
+    { key: 'S3_URL_STYLE', section: 'storage', type: 'string', default: '', editable: false, label: 'S3 URL style', help: 'Empty: path with an endpoint, vhost for AWS.' },
+    { key: 'S3_USE_SSL', section: 'storage', type: 'boolean', default: 'true', editable: false, label: 'S3 uses TLS' },
+    {
+        key: 'DATA_INLINING_ROW_LIMIT', section: 'storage', type: 'number', default: '1000', editable: false, label: 'Data inlining row limit',
+        help: 'Writes of fewer rows than this are kept in the metadata catalog until lake maintenance flushes them to Parquet, instead of creating one small file each. 0 disables inlining.',
+    },
+    { key: 'USE_FILESYSTEM_BLOBS', section: 'storage', type: 'boolean', default: '', editable: false, label: 'Filesystem BLOB storage', help: 'BLOB files always go to a local (or mounted) directory, also when the lake uses object storage.' },
     { key: 'BLOBS_PATH', section: 'storage', type: 'string', default: './data/blobs', editable: false, label: 'BLOB directory' },
-    { key: 'DISABLE_DUCKLAKE_COMPACTION', section: 'storage', type: 'boolean', default: '', editable: false, label: 'Startup compaction disabled' },
+    { key: 'DISABLE_DUCKLAKE_COMPACTION', section: 'storage', type: 'boolean', default: '', editable: false, label: 'Lake maintenance disabled', help: 'Emergency switch: no scheduled, startup or manual maintenance runs.' },
     { key: 'DUCKLAKE_PG_HOST', section: 'storage', type: 'string', default: '0.0.0.0', editable: false, label: 'Metadata Postgres host' },
     { key: 'DUCKLAKE_PG_PORT', section: 'storage', type: 'number', default: '5432', editable: false, label: 'Metadata Postgres port' },
     { key: 'DUCKLAKE_PG_DB', section: 'storage', type: 'string', default: 'ducklake', editable: false, label: 'Metadata database' },
@@ -132,7 +145,7 @@ export const SETTINGS = [
         key: 'SNAPSHOT_RETENTION_DAYS', section: 'storage', type: 'number', default: '',
         min: 0, max: 3650, editable: true, live: true, label: 'Snapshot retention (days)',
         help: 'DuckLake keeps every snapshot (time travel) until it is expired, so pruned rows keep using storage. ' +
-            'When set, startup maintenance and pruning rules with "reclaim storage" expire snapshots older than this ' +
+            'When set, lake maintenance and pruning rules with "reclaim storage" expire snapshots older than this ' +
             'and delete files no longer referenced. Empty: never expire (unlimited time travel, storage is not reclaimed).',
     },
 ];

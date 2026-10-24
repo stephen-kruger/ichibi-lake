@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Pre-install the DuckDB extensions the gateway loads at startup, using the
+ * Pre-install the DuckDB extensions the gateway loads at startup (httpfs and
+ * aws only when the lake is on object storage), using the
  * same @duckdb/node-api build as the gateway (so the extension version always
  * matches). Run at Docker image build time: see docker/Dockerfile for why
  * startup must never download extensions.
@@ -11,6 +12,10 @@ const EXTENSIONS = [
     'INSTALL ducklake;',
     'INSTALL postgres;',
     'INSTALL duckpgq FROM community;',
+    // Object storage (DUCKLAKE_DATA_PATH=s3://...): httpfs is the s3://
+    // file system, aws the credential-chain provider used without S3_ACCESS_KEY.
+    'INSTALL httpfs;',
+    'INSTALL aws;',
 ];
 
 const instance = await DuckDBInstance.create(':memory:');
@@ -20,7 +25,7 @@ for (const sql of EXTENSIONS) {
     console.log(`[install-extensions] ${sql}`);
 }
 const result = await conn.runAndReadAll(
-    `SELECT extension_name, extension_version, install_path FROM duckdb_extensions() WHERE installed AND extension_name IN ('ducklake', 'postgres_scanner', 'duckpgq')`
+    `SELECT extension_name, extension_version, install_path FROM duckdb_extensions() WHERE installed AND extension_name IN ('ducklake', 'postgres_scanner', 'duckpgq', 'httpfs', 'aws')`
 );
 for (const [name, version, path] of result.getRows()) console.log(`[install-extensions] ${name} ${version} -> ${path}`);
 if (result.getRows().length !== EXTENSIONS.length) {
