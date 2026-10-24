@@ -45,6 +45,12 @@ async function flushBatch(topic) {
     batches[topic] = [];
 
     const tableName = topic.replace(/[^a-zA-Z0-9_]/g, '_'); // Sanitize topic name
+    // "_"-prefixed names are reserved for system tables (RBAC users, ACLs,
+    // graph registry, ...); never ingest a topic into one of them.
+    if (tableName.startsWith('_')) {
+        console.warn(`[Kafka] Skipping ${dataToInsert.length} message(s) from topic "${topic}": table names starting with "_" are reserved.`);
+        return;
+    }
 
     const tempFileName = `kafka_temp_${randomUUID()}.json`;
     const tempFilePath = path.join(process.cwd(), tempFileName);

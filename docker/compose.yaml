@@ -50,10 +50,16 @@ services:
       - KAFKA_BROKERS=${KAFKA_BROKERS:-}
       # Port the Node gateway listens on.
       - PORT=${PORT:-3000}
-      # Read-only SQL enforcement for user-supplied SQL endpoints
-      # (/query, /graphql sql resolver, /graphs/:graphName/query). Set to
-      # "false" to disable and allow DDL/DML.
-      - SQL_READ_ONLY=${SQL_READ_ONLY:-true}
+      # Admin console (/console). On first start with no console logins, a
+      # one-time setup code is printed to the log; set CONSOLE_SETUP_TOKEN to
+      # choose it yourself. CONSOLE_SESSION_SECRET optionally pins the session
+      # signing key (otherwise one is generated and stored in DuckLake).
+      - CONSOLE_SETUP_TOKEN=${CONSOLE_SETUP_TOKEN:-}
+      - CONSOLE_SESSION_SECRET=${CONSOLE_SESSION_SECRET:-}
+      # Externally reachable base URL, used in log messages (e.g. the admin
+      # console link). Defaults to the host port published above; set it to
+      # your real address (e.g. https://lake.example.com) when deployed.
+      - PUBLIC_URL=${PUBLIC_URL:-http://localhost:${PORT:-3333}}
     volumes:
       # Persist DuckLake Parquet data files across container rebuilds.
       - ./data/ducklake:/app/data_files
@@ -223,54 +229,6 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
-    restart: unless-stopped
-
-  duckdb-ui:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    container_name: ichibi-lake-duckdb-ui
-    # Toggle the DuckDB UI on/off via DUCKDB_UI_ENABLED in .env. Enabled by
-    # default (1); set to 0 to skip starting this service entirely. Implemented
-    # with deploy.replicas because Compose treats replicas=0 as "do not run".
-    deploy:
-      replicas: ${DUCKDB_UI_ENABLED:-1}
-    ports:
-      # The DuckDB UI HTTP server only binds to loopback inside the container
-      # (it resolves "localhost" to the IPv6 [::1] address), so Docker cannot
-      # forward to it directly. We publish the host port to an in-container
-      # socat proxy (listening on 0.0.0.0:14213) which forwards to the UI
-      # server on [::1]:${ui_local_port}. The UI also validates Origin/Referer
-      # against http://localhost:${ui_local_port}, so the host port and
-      # ui_local_port below must stay identical.
-      - "${DUCKDB_UI_PORT:-4213}:14213"
-    stdin_open: true
-    tty: true
-    environment:
-      - ui_local_port=${DUCKDB_UI_PORT:-4213}
-      - DUCKLAKE_PG_HOST=db
-      - DUCKLAKE_PG_PORT=5432
-      - DUCKLAKE_PG_USER=postgres
-      - DUCKLAKE_PG_PASSWORD=postgres
-      - DUCKLAKE_PG_DB=ducklake
-      - DUCKLAKE_DATA_PATH=/app/data_files
-    volumes:
-      - ./data/ducklake:/app/data_files
-    networks:
-      - app-network
-    depends_on:
-      db:
-        condition: service_healthy
-    entrypoint:
-      - sh
-      - -c
-      - >
-        socat TCP-LISTEN:14213,fork,reuseaddr TCP6:[::1]:$${ui_local_port} &
-        exec duckdb -unsigned
-        -cmd "INSTALL ducklake; LOAD ducklake;"
-        -cmd "CREATE SECRET (TYPE ducklake, METADATA_PATH 'postgres:host=$${DUCKLAKE_PG_HOST} port=$${DUCKLAKE_PG_PORT} user=$${DUCKLAKE_PG_USER} password=$${DUCKLAKE_PG_PASSWORD} dbname=$${DUCKLAKE_PG_DB}');"
-        -cmd "ATTACH 'ducklake:' AS ducklake (DATA_PATH '$${DUCKLAKE_DATA_PATH}', AUTOMATIC_MIGRATION true); USE ducklake; SET GLOBAL disabled_optimizers = 'statistics_propagation,compressed_materialization'; SET search_path = 'ducklake.main,memory.main';"
-        -ui
     restart: unless-stopped
 
 networks:

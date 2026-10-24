@@ -13,6 +13,10 @@ info:
     The API key that creates a table automatically becomes an owner.
     ACLs can be retrieved and updated through dedicated management endpoints.
 
+    User-supplied SQL (POST /query, the GraphQL `sql` query) and graph management/queries
+    are superuser-only, because per-table permissions cannot be enforced on arbitrary SQL.
+    System tables (names starting with `_`) are never accessible through the table endpoints.
+
     Authentication is via the `x-api-key` header. Unauthenticated requests are rejected with HTTP 401.
 
     ### BLOB Management
@@ -970,6 +974,7 @@ paths:
       description: |
         A GraphQL API mapped directly over DuckDB.
         It supports running raw SQL using the `sql` query, which returns results as JSON.
+        The `sql` query is superuser-only and read-only, with the same rules as POST /query.
         It also allows fetching tables with the `tables` query.
       requestBody:
         required: true
@@ -1009,7 +1014,13 @@ paths:
   /query:
     post:
       summary: Execute a SQL query
-      description: Allows executing arbitrary SQL queries against the DuckLake instance. Only read queries are allowed, any statements which can modify schema, or data, will trigger a security exception, for obvious reasons.
+      description: >-
+        Executes a read-only SQL query against the DuckLake catalog. Superuser API keys only
+        (RBAC `superuser` role, or any key from API_KEYS when RBAC is not configured); other keys
+        get 403, because table permissions cannot be applied to arbitrary SQL. Statements that modify
+        schema or data, and DuckDB introspection functions that reveal connection details
+        (duckdb_databases, duckdb_settings, current_setting, pragma_*), are rejected with 403.
+        Server files outside the lake are not readable, and system tables are not exposed.
       requestBody:
         required: true
         content:
@@ -1337,7 +1348,9 @@ paths:
         Execute a Cypher-like pattern matching query against the named Property
         Graph. Either supply a structured request (`match` + `columns`) or pass a
         raw `graphTable` body containing everything that would appear *inside*
-        `FROM GRAPH_TABLE ( <graphName> ... )`.
+        `FROM GRAPH_TABLE ( <graphName> ... )`. Superuser API keys only: query
+        fragments can contain subqueries, so this is treated like POST /query.
+        Creating and deleting graphs is superuser-only as well.
 
         Examples from the DuckPGQ documentation:
 

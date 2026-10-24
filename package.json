@@ -4,9 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js && node test/order-by-corruption.test.js && node test/pgq-grammar.test.js && node test/api.test.js && node test/test-rest.js && node test/test-blob.js && node test/test-graphs.js && node test/test.js && node test/test-kafka-sse.js && node test/test-kafka-retroactive.js",
+    "test": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js && node test/order-by-corruption.test.js && node test/pgq-grammar.test.js && node test/console.test.js && node test/sql-guard.test.js && node test/api.test.js && node test/test-rest.js && node test/test-blob.js && node test/test-graphs.js && node test/test.js && node test/test-kafka-sse.js && node test/test-kafka-retroactive.js && node test/test-console.js && node test/test-rbac.js",
     "test:rbac": "node test/test-rbac.js",
-    "test:unit": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js && node test/order-by-corruption.test.js && node test/pgq-grammar.test.js",
+    "test:unit": "node test/schema-evolution.test.js && node test/graphs.test.js && node test/kafka-topic-filter.test.js && node test/order-by-corruption.test.js && node test/pgq-grammar.test.js && node test/console.test.js && node test/sql-guard.test.js",
     "test:graphs-unit": "node test/graphs.test.js",
     "test:kafka-topic-filter": "node test/kafka-topic-filter.test.js",
     "test:api": "node test/api.test.js",
@@ -18,6 +18,9 @@
     "test:blob": "node test/test-blob.js",
     "test:orderby": "node test/order-by-corruption.test.js",
     "test:pgq-grammar": "node test/pgq-grammar.test.js",
+    "test:console-unit": "node test/console.test.js",
+    "test:console": "node test/test-console.js",
+    "test:sql-guard": "node test/sql-guard.test.js",
     "test:stress": "node test/stress-test.js",
     "superlake": "node scripts/superlake-wizard.js"
   },

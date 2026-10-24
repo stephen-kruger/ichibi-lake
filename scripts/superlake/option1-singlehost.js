@@ -21,7 +21,6 @@ export default async function run() {
         ''
     );
     const apiKeys   = apiKeyInput.trim() || `ICHIBI_LAKE_${randomToken(16)}`;
-    const sqlRO     = await promptYN('Enforce SQL_READ_ONLY on user-supplied SQL endpoints?', true);
 
     const outDir = await ensureOutputDir('option1-singlehost');
 
@@ -86,7 +85,6 @@ x-app-base: &app-base
       - USE_FILESYSTEM_BLOBS=1
       - BLOBS_PATH=/app/blobs
       - API_KEYS=\${API_KEYS}
-      - SQL_READ_ONLY=\${SQL_READ_ONLY:-true}
       - PORT=3000${kafkaEnv}
   volumes:
       - ./data/ducklake:/app/data_files
@@ -130,10 +128,9 @@ networks:
 `;
 
     const envBody = renderEnv(
-        { API_KEYS: apiKeys, SQL_READ_ONLY: String(sqlRO) },
+        { API_KEYS: apiKeys },
         {
             API_KEYS:      'Comma-separated API keys accepted by every gateway',
-            SQL_READ_ONLY: 'Reject DDL/DML on /query, /graphql, /graphs/:n/query',
         },
         `SuperLake — Option 1 (single-host scale-out, ${n} gateways)`,
     );
@@ -149,7 +146,7 @@ data directory**. All ${n} gateways read and write the same DuckLake.
 | File | Purpose |
 |---|---|
 | \`compose.yaml\` | ${n} \`app-*\` services + \`db\`${includeKafka ? ' + `kafka`' : ''} |
-| \`.env\` | API keys and SQL_READ_ONLY toggle |
+| \`.env\` | API keys |
 
 ## Quick start
 

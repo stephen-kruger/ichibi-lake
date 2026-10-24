@@ -78,7 +78,6 @@ async function generateServer() {
     const finalSecret = secretKey || randomToken(20);
     const apiKeyInput = await prompt('API key(s) for the gateways (blank = generate)', '');
     const apiKeys   = apiKeyInput.trim() || `ICHIBI_LAKE_${randomToken(16)}`;
-    const sqlRO     = await promptYN('Enforce SQL_READ_ONLY on user-supplied SQL endpoints?', true);
 
     const outDir = await ensureOutputDir('option3-minio-server');
 
@@ -149,7 +148,6 @@ networks:
     const envBody = renderEnv(
         {
             API_KEYS:       apiKeys,
-            SQL_READ_ONLY:  String(sqlRO),
             S3_BUCKET:      bucket,
             S3_ACCESS_KEY:  accessKey,
             S3_SECRET_KEY:  finalSecret,
@@ -221,7 +219,6 @@ async function generateClient() {
     const secretKey    = await promptRequired('S3 secret key (must match server)', '');
     const hostPort     = await promptInt('Host port for the gateway', 3333, { min: 1024, max: 60000 });
     const apiKeys      = await promptRequired('API key(s) (must match catalog host\'s .env)', '');
-    const sqlRO        = await promptYN('Enforce SQL_READ_ONLY on user-supplied SQL endpoints?', true);
 
     const outDir = await ensureOutputDir('option3-minio-client');
 
@@ -250,7 +247,6 @@ services:
       # BLOBs cannot use the filesystem path with S3 — store inline in Parquet.
       - USE_FILESYSTEM_BLOBS=0
       - API_KEYS=\${API_KEYS}
-      - SQL_READ_ONLY=\${SQL_READ_ONLY:-true}
       - PORT=3000
       # Consumed by the db-s3-patch.md changes in src/db.js
       - S3_ENDPOINT=${serverIp}:9000
@@ -276,7 +272,6 @@ networks:
     const envBody = renderEnv(
         {
             API_KEYS:       apiKeys,
-            SQL_READ_ONLY:  String(sqlRO),
             S3_ACCESS_KEY:  accessKey,
             S3_SECRET_KEY:  secretKey,
         },

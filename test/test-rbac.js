@@ -18,6 +18,10 @@
  *   - Self-service /admin/check endpoint
  *   - Legacy backward-compat mode (API_KEYS → superuser)
  *   - Reader cannot write, writer can write (unless denied per-table)
+ *   - Raw SQL (/query, GraphQL sql) and property graphs are superuser-only;
+ *     writers and readers get 403, superusers get read-only SQL
+ *   - System tables ("_"-prefixed) are unreachable through the table
+ *     endpoints, /upload and /kafka-sink for every role
  */
 
 import { API_KEY, ALT_KEY, BASE_URL, KEYS } from './_env.js';
@@ -416,6 +420,79 @@ async function run() {
     });
 
     // ── 7. Superuser privileges ────────────────────────────────────────────
+    await describe('Superuser-only features (raw SQL, graphs) and system tables', async () => {
+        const ROLES = [['writer', WRITER_KEY], ['reader', READER_KEY]];
+        const GRAPH = `rbac_graph_${Date.now()}`;
+
+        for (const [role, key] of ROLES) {
+            await test(`${role} cannot run raw SQL via /query (403)`, async () => {
+                const r = await authPost(`${BASE_URL}/query`, { sql: 'SELECT 1 AS one' }, key);
+                if (r.status !== 403) throw new Error(`Expected 403, got ${r.status}: ${JSON.stringify(r.json)}`);
+            });
+            await test(`${role} cannot run raw SQL via the GraphQL sql query`, async () => {
+                const r = await authPost(`${BASE_URL}/graphql`, { query: '{ sql(query: "SELECT 1 AS one") }' }, key);
+                if (!r.json?.errors || !/superuser/i.test(r.json.errors[0]?.message || '')) {
+                    throw new Error(`Expected a superuser error, got ${r.status}: ${JSON.stringify(r.json)}`);
+                }
+            });
+            await test(`${role} cannot create, query or delete property graphs (403)`, async () => {
+                const create = await authPost(`${BASE_URL}/graphs`, { name: `${GRAPH}_${role}`, vertexTables: [T], edgeTables: [] }, key);
+                if (create.status !== 403) throw new Error(`create: expected 403, got ${create.status}`);
+                const query = await authPost(`${BASE_URL}/graphs/${GRAPH}/query`, { match: `(a:${T})`, columns: 'a.id' }, key);
+                if (query.status !== 403) throw new Error(`query: expected 403, got ${query.status}`);
+                const del = await authDelete(`${BASE_URL}/graphs/${GRAPH}`, key);
+                if (del.status !== 403) throw new Error(`delete: expected 403, got ${del.status}`);
+            });
+            await test(`${role} cannot read or write system tables (404 / 400)`, async () => {
+                for (const path of ['/tables/_rbac_users', '/tables/_rbac_users/schema', '/tables/_table_acls/acl']) {
+                    const r = await authGet(`${BASE_URL}${path}`, key);
+                    if (r.status !== 404) throw new Error(`GET ${path}: expected 404, got ${r.status}`);
+                }
+                const up = await uploadJSON(`${BASE_URL}/upload/_rbac_users`, [{ api_key: 'x', name: 'x' }], key);
+                if (up.status !== 404) throw new Error(`upload into _rbac_users: expected 404, got ${up.status}`);
+                const sink = await authPost(`${BASE_URL}/kafka-sink?topic=_rbac_users`, [{ value: { a: 1 } }], key);
+                if (sink.status !== 400) throw new Error(`kafka-sink into _rbac_users: expected 400, got ${sink.status}`);
+            });
+        }
+
+        await test('writer keeps RBAC-checked REST read and write on user tables', async () => {
+            const read = await getData(`${BASE_URL}/tables/${T}`, WRITER_KEY);
+            if (!read.ok) throw new Error(`read: ${read.status}`);
+            const write = await uploadJSON(`${BASE_URL}/upload/${T}`, [{ id: 'w-sec', value: 'still-allowed' }], WRITER_KEY);
+            if (!write.json?.success) throw new Error(`write: ${JSON.stringify(write.json)}`);
+        });
+
+        await test('superuser can run read-only raw SQL', async () => {
+            const r = await authPost(`${BASE_URL}/query`, { sql: `SELECT count(*) AS n FROM "${T}"` }, SUPER_KEY);
+            if (r.status !== 200 || !(Number(r.json?.rows?.[0]?.n) > 0)) throw new Error(`${r.status}: ${JSON.stringify(r.json)}`);
+            const gql = await authPost(`${BASE_URL}/graphql`, { query: '{ sql(query: "SELECT 1 AS one") }' }, SUPER_KEY);
+            if (gql.json?.errors) throw new Error(`graphql: ${JSON.stringify(gql.json)}`);
+        });
+
+        await test('superuser raw SQL is still read-only and cannot introspect connection details', async () => {
+            const write = await authPost(`${BASE_URL}/query`, { sql: `DELETE FROM "${T}"` }, SUPER_KEY);
+            if (write.status !== 403) throw new Error(`DELETE: expected 403, got ${write.status}`);
+            const intro = await authPost(`${BASE_URL}/query`, { sql: 'SELECT * FROM duckdb_databases()' }, SUPER_KEY);
+            if (intro.status !== 403) throw new Error(`duckdb_databases(): expected 403, got ${intro.status}`);
+        });
+
+        await test('superuser can create, query and delete a property graph', async () => {
+            const create = await authPost(`${BASE_URL}/graphs`, { name: GRAPH, vertexTables: [T], edgeTables: [] }, SUPER_KEY);
+            if (create.status !== 200) throw new Error(`create: ${create.status} ${JSON.stringify(create.json)}`);
+            const query = await authPost(`${BASE_URL}/graphs/${GRAPH}/query`, { match: `(a:${T})`, columns: 'a.id AS id' }, SUPER_KEY);
+            if (query.status !== 200 || !Array.isArray(query.json?.rows) || query.json.rows.length === 0) {
+                throw new Error(`query: ${query.status} ${JSON.stringify(query.json)}`);
+            }
+            const del = await authDelete(`${BASE_URL}/graphs/${GRAPH}`, SUPER_KEY);
+            if (del.status !== 200) throw new Error(`delete: ${del.status}`);
+        });
+
+        await test('superuser cannot reach system tables through the table endpoints either (404)', async () => {
+            const r = await authGet(`${BASE_URL}/tables/_rbac_users`, SUPER_KEY);
+            if (r.status !== 404) throw new Error(`Expected 404, got ${r.status}`);
+        });
+    });
+
     await describe('Superuser privileges', async () => {
         await test('Superuser can access denied table (superuser bypass)', async () => {
             const { json } = await getData(`${BASE_URL}/tables/${DENIED_TABLE}`, SUPER_KEY);
