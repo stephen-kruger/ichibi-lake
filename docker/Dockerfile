@@ -26,27 +26,44 @@ COPY swagger.yaml ./swagger.yaml
 # and for the duckdb-ui compose service that browses the DuckLake catalog.
 #
 # IMPORTANT: keep this CLI version in lockstep with the DuckDB version bundled by
-# `@duckdb/node-api` in package.json (currently 1.5.4-r.1 => DuckDB v1.5.4). The
+# `@duckdb/node-api` in package.json (currently 2.0.0-r.1 => DuckDB v2.0.0). The
 # Node gateway writes/migrates the DuckLake catalog with its bundled `ducklake`
 # extension; an older CLI ships an older `ducklake` that cannot read the newer
 # catalog format and fails ATTACH with "Not implemented Error: Only DuckLake
 # versions ... are supported", which leaves the DuckDB UI showing only the empty
 # in-memory `memory` database instead of the lake's tables.
+# Since v2.0.0 the CLI release assets are `duckdb-cli-<platform>.tar.gz`
+# (previously `duckdb_cli-<platform>.zip`).
 RUN arch=$(dpkg --print-architecture) && \
     case "$arch" in \
       amd64) cli_arch=linux-amd64 ;; \
       arm64) cli_arch=linux-arm64 ;; \
       *) echo "Unsupported arch: $arch"; exit 1 ;; \
     esac && \
-    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-${cli_arch}.zip" \
-      -o /tmp/duckdb_cli.zip && \
-    unzip -o /tmp/duckdb_cli.zip duckdb -d /usr/local/bin/ && \
-    rm /tmp/duckdb_cli.zip && \
+    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-${cli_arch}.tar.gz" \
+      | tar -xz -C /usr/local/bin/ duckdb && \
     chmod +x /usr/local/bin/duckdb
 
-# The Node gateway installs the DuckDB extensions it needs (ducklake,
-# postgres, duckpgq) at startup. DuckPGQ ships from the community repo, so
-# opt in to that here.
+# Pre-install the DuckDB extensions the gateway (ducklake, postgres, duckpgq)
+# and the duckdb-ui service (ui) need, so containers never download them at
+# startup. Runtime INSTALL is then a no-op. Without this, every fresh container
+# fetched them during _attachDuckLake(); DuckDB's built-in HTTP client has no
+# read timeout, so an occasional stalled connection (observed with the
+# community-extensions download for duckpgq) hung startup indefinitely and
+# every request queued behind it. Here a stall is bounded by `timeout` and
+# retried. The CLI and @duckdb/node-api must be the same DuckDB version (see
+# above) because extensions are stored per version under
+# ~/.duckdb/extensions/<version>/, and both run as root so they share that path.
+RUN for attempt in 1 2 3; do \
+      timeout 180 duckdb -c "INSTALL ducklake; INSTALL postgres; INSTALL ui; INSTALL duckpgq FROM community;" && break; \
+      echo "DuckDB extension install attempt $attempt failed; retrying..."; \
+      [ "$attempt" = 3 ] && exit 1; \
+    done && \
+    ls /root/.duckdb/extensions/*/*/
+
+# The Node gateway still runs INSTALL for its extensions at startup (a no-op
+# here, since they are pre-installed above). DuckPGQ ships from the community
+# repo, so opt in to that here.
 ENV DUCKDB_ALLOW_COMMUNITY_EXTENSIONS=1 \
     NODE_ENV=production
 
