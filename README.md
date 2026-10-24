@@ -38,6 +38,7 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [6.4 Deleting BLOBs](#64-deleting-blobs)
 - [7. Record Metadata Updates](#7-record-metadata-updates)
 - [8. Data Discovery & REST API](#8-data-discovery--rest-api)
+  - [8.1 Exporting Tables](#81-exporting-tables)
 - [9. Event Ingestion](#9-event-ingestion)
   - [9.1 JSON Upload](#91-json-upload)
   - [9.2 Raw SQL Query](#92-raw-sql-query)
@@ -57,7 +58,11 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [13.3 Security Model](#133-security-model)
   - [13.4 Recovery CLI](#134-recovery-cli)
   - [13.5 Extending the Console](#135-extending-the-console)
-- [14. Testing](#14-testing)
+- [14. Operations: Health, Metrics & Limits](#14-operations-health-metrics--limits)
+  - [14.1 Health Checks](#141-health-checks)
+  - [14.2 Prometheus Metrics](#142-prometheus-metrics)
+  - [14.3 Result Size Limits](#143-result-size-limits)
+- [15. Testing](#15-testing)
 
 ---
 
@@ -179,7 +184,14 @@ User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endp
 | :--- | :--- | :--- |
 | `PRIMARY_POOL_SIZE` | `4` | Number of warm DuckDB connections kept in the pool |
 | `USER_QUERY_CONCURRENCY` | `4` | Max concurrent user SQL / graph queries. Also editable live in the console. |
-| `USER_QUERY_TIMEOUT_MS` | `30000` | Timeout for user SQL / graph queries (ms). Also editable live in the console. |
+| `USER_QUERY_TIMEOUT_MS` | `30000` | Timeout for user SQL / graph queries (ms), including JSON `POST /query`. Also editable live in the console. |
+| `USER_QUERY_STREAM_TIMEOUT_MS` | `300000` | Timeout for a whole NDJSON `POST /query` response, transfer included (ms). Also editable live in the console. |
+| `QUERY_MAX_ROWS` | `100000` | Row cap for JSON `POST /query` responses; larger results are truncated and flagged. Also editable live in the console. |
+| `QUERY_STREAM_MAX_ROWS` | `10000000` | Row cap for NDJSON `POST /query` responses. Also editable live in the console. |
+| `EXPORT_MAX_ROWS` | `5000000` | Row cap for `GET /tables/:tableName/export`. Also editable live in the console. |
+| `EXPORT_CONCURRENCY` | `2` | Table exports allowed at once; further requests get HTTP 429. Also editable live in the console. |
+| `EXPORT_TIMEOUT_MS` | `600000` | Timeout for one export, download included (ms). Also editable live in the console. |
+| `EXPORT_TMP_DIR` | *OS temp dir*`/ichibi-export` | Where Parquet exports are staged before streaming (deleted after each response) |
 | `COLUMN_CACHE_TTL_MS` | `60000` | Per-table column schema cache TTL (ms) |
 | `ACL_CACHE_TTL_MS` | `60000` | ACL cache TTL (ms) |
 | `DEFAULT_PARTITION_KEY` | `created` | Column(s) to partition new tables by. Comma-separated for multi-column partitioning. Set to `none` to disable. Also editable live in the console. |
@@ -224,6 +236,7 @@ User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endp
 | `CONSOLE_SETUP_TOKEN` | *(generated)* | One-time code required to create the first console admin. When unset, a random code is printed to the gateway log on startup while no console login exists. |
 | `CONSOLE_SESSION_SECRET` | *(generated)* | HMAC key for console session cookies. When unset, one is generated and stored in the console catalog (shared by all instances). |
 | `CONSOLE_SESSION_TTL_HOURS` | `12` | Console session lifetime. Also editable in the console. |
+| `METRICS_TOKEN` | *(unset)* | Bearer token for `GET /metrics`. When unset, `/metrics` requires a superuser API key. See [§14.2](#142-prometheus-metrics). |
 | `PUBLIC_URL` | `http://localhost:<port>` | Externally reachable base URL, used in startup log messages (Swagger UI and admin console links). Docker Compose defaults it to the published host port (`http://localhost:3333`); set it to your real address (e.g. `https://lake.example.com`) when deployed. |
 | `SNAPSHOT_RETENTION_DAYS` | *(unset)* | Days of DuckLake snapshot history (time travel) to keep. When set, startup maintenance and pruning rules with *reclaim storage* expire older snapshots and delete unreferenced files, freeing the space used by deleted rows. Unset: snapshots are never expired. Also editable in the console. |
 
@@ -248,7 +261,7 @@ docker compose up --build -d
 
 # 4. Verify health
 docker compose ps
-curl -sf http://localhost:3333/swagger.yaml > /dev/null && echo "OK"
+curl -sf http://localhost:3333/health/ready   # {"status":"ready",...} once startup has finished
 ```
 
 The compose stack starts three services:
@@ -319,6 +332,7 @@ pm2 startup
 - **Use a reverse proxy** — Place behind nginx, Caddy, or a cloud LB for TLS termination and rate limiting
 - **Claim the admin console** — Complete first-run setup at `/console` right after deploying, and serve it over HTTPS (session cookies are marked `Secure` when the request is HTTPS)
 - **Lock down Postgres and Kafka ports** — `compose.yaml` publishes Postgres on host port `5432` with the default `postgres`/`postgres` login, and Kafka on `9092`/`9094`. Anyone who can reach them can read or change the metadata catalog directly. Change the password (it is set in `compose.yaml` as both `POSTGRES_PASSWORD` for the `db` service and `DUCKLAKE_PG_PASSWORD` for the `app` service; keep them equal), and bind the ports to `127.0.0.1` or remove them if nothing outside Docker needs them
+- **Wire up health checks and metrics** — point your load balancer / orchestrator readiness probe at `GET /health/ready` and liveness at `GET /health`; set `METRICS_TOKEN` and scrape `GET /metrics` (see [§14](#14-operations-health-metrics--limits))
 - **Decide on snapshot retention if you prune data** — set `SNAPSHOT_RETENTION_DAYS` so deleted rows actually free storage (see [§13.2](#132-features))
 
 ### 4.4 SuperLake Wizard
@@ -363,7 +377,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 
 ### 5.1 API Key Authentication
 
-All API endpoints require a valid API key passed as an HTTP header. The exceptions are the Swagger UI (`/`), the OpenAPI spec (`/swagger.yaml`) and the admin console (`/console`), which has its own logins (see [§13](#13-admin-console)):
+All API endpoints require a valid API key passed as an HTTP header. The exceptions are the Swagger UI (`/`), the OpenAPI spec (`/swagger.yaml`), the health checks (`/health`, `/health/ready`), `/metrics` (superuser key or `METRICS_TOKEN`, see [§14.2](#142-prometheus-metrics)) and the admin console (`/console`), which has its own logins (see [§13](#13-admin-console)):
 
 - **Header**: `x-api-key`
 - **Example**: `x-api-key: ICHIBI_LAKE_TEST_7a96c3e2-b1fe-4705-9064-fc1882674b13`
@@ -589,6 +603,7 @@ Query and browse the data lake with standard REST patterns.
 | `GET` | `/tables` | List the tables the caller can read (system tables are never listed) |
 | `GET` | `/tables/:tableName/schema` | Get column names and types |
 | `GET` | `/tables/:tableName` | Query table data with filters, sorting, pagination |
+| `GET` | `/tables/:tableName/export` | Download the (filtered, sorted) table as Parquet, CSV or NDJSON (see [§8.1](#81-exporting-tables)) |
 
 **Query parameters for `GET /tables/:tableName`:**
 
@@ -608,6 +623,40 @@ Access is checked per table (RBAC role, per-table permission, then ACL); system 
 curl -H "x-api-key: YOUR_KEY" \
   "http://ichibi-lake:3333/tables/ichibi_table?owner=marwan&limit=10&sort=-created_at"
 ```
+
+`GET /tables/:tableName` is for browsing and paging. To take whole tables out of the lake use the export endpoint below, and for ad-hoc SQL over large results use NDJSON streaming on `POST /query` ([§9.2](#92-raw-sql-query)).
+
+### 8.1 Exporting Tables
+
+`GET /tables/:tableName/export?format=parquet|csv|ndjson` streams the table to the client as a file download (`Content-Disposition: attachment; filename="<table>.<ext>"`). It needs read access to the table, exactly like `GET /tables/:tableName` (readers can export; keys without access get 403; system tables return 404), and accepts the same `?<column>=<value>` filters, `?sort=` and `?after=`.
+
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `?format=` | `parquet` | `parquet` (`application/vnd.apache.parquet`, zstd-compressed), `csv` (`text/csv`, header row, RFC 4180 quoting) or `ndjson` (`application/x-ndjson`, one JSON object per line) |
+| `?limit=` | `EXPORT_MAX_ROWS` | Lower the row cap for this request (it cannot raise it) |
+| `?<column>=`, `?sort=`, `?after=` | — | As for `GET /tables/:tableName` |
+
+Response headers report the size before the body starts, so a client can tell whether it received everything:
+
+| Header | Meaning |
+| :--- | :--- |
+| `X-Total-Rows` | Rows matching the filters |
+| `X-Row-Count` | Rows in this file (`min(X-Total-Rows, cap)`) |
+| `X-Export-Truncated` | `true` when the cap cut the export short — narrow the filters or page with `?sort=` + `?after=` |
+| `X-Row-Cap` | The cap that applied |
+
+The count and the rows are read in one transaction, so they come from the same snapshot.
+
+```sh
+curl -H "x-api-key: YOUR_KEY" -OJ \
+  "http://ichibi-lake:3333/tables/ichibi_table/export?format=parquet&owner=marwan"
+```
+
+**How the bytes are produced, and size limits:**
+
+- **CSV and NDJSON** are streamed straight from DuckDB in chunks of ~2,048 rows with HTTP backpressure, so the gateway never holds more than a chunk and nothing is written to disk. Values use DuckDB's text form (timestamps like `2024-02-03 04:05:06`); NDJSON uses DuckDB's `to_json()`, so nested types are real JSON. BLOB columns are base64-encoded, as in the JSON API.
+- **Parquet** cannot be streamed (its footer is written last), so DuckDB writes the file to `EXPORT_TMP_DIR`, the gateway streams it with a `Content-Length` and deletes it when the response ends or fails. Temporary disk use is therefore at most `EXPORT_CONCURRENCY` capped exports at a time.
+- Exports run on the primary DuckDB instance (the locked-down user-query instance cannot write files) on a dedicated connection, so a slow download does not hold a pooled connection. They are limited to `EXPORT_CONCURRENCY` at once (HTTP 429 with `Retry-After` beyond that), `EXPORT_TIMEOUT_MS` each (the connection is closed mid-download if exceeded), and `EXPORT_MAX_ROWS` rows. Disconnecting interrupts the query.
 
 ---
 
@@ -638,9 +687,29 @@ curl -X POST "http://ichibi-lake:3333/query" \
   -d '{"sql": "SELECT category, count(*) FROM ichibi_table GROUP BY 1"}'
 ```
 
-Requires a **superuser** API key; other keys get HTTP 403. User-supplied SQL is always read-only: DDL/DML statements and connection-revealing functions are rejected with HTTP 403 (see [§3.5](#35-sql-enforcement)).
+Requires a **superuser** API key; other keys get HTTP 403. User-supplied SQL is always read-only: DDL/DML statements and connection-revealing functions are rejected with HTTP 403 (see [§3.5](#35-sql-enforcement)). Queries run on the isolated user-query instance, at most `USER_QUERY_CONCURRENCY` at once (the rest queue).
 
-*Response:* `{ "success": true, "rows": [...] }`
+Results are read from DuckDB chunk by chunk and capped, so a large result can no longer exhaust the gateway's memory. Two response formats:
+
+**JSON (default)** — `{ "success": true, "rows": [...], "rowCount": 100, "truncated": false, "maxRows": 100000 }`. At most `QUERY_MAX_ROWS` rows within `USER_QUERY_TIMEOUT_MS`. When the result had more rows, `truncated` is `true` and the response carries `X-Result-Truncated: true`.
+
+**NDJSON (streaming)** — request it with `?format=ndjson` or `Accept: application/x-ndjson`. Each row is written as soon as DuckDB produces it, one JSON object per line, and the last line is always a trailer:
+
+```sh
+curl -N -X POST "http://ichibi-lake:3333/query?format=ndjson" \
+  -H "x-api-key: YOUR_KEY" -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT * FROM ichibi_table"}'
+```
+
+```
+{"id":"1","owner":"marwan",...}
+{"id":"2","owner":"ahmad",...}
+{"_ichibi":{"rowCount":2,"truncated":false,"maxRows":10000000}}
+```
+
+At most `QUERY_STREAM_MAX_ROWS` rows (`X-Row-Cap` header), within `USER_QUERY_STREAM_TIMEOUT_MS` for the whole transfer. Errors before the first row (bad SQL, unknown table) still return a JSON error with the usual status code; an error after streaming started (for example the timeout) ends the body with `{"_ichibi":{"error":"...","status":504}}` instead of the normal trailer, so a response without a trailer line was cut off. The gateway applies backpressure: it fetches the next chunk only when the client has read the previous one, and a client disconnect interrupts the query and frees its slot.
+
+Both formats accept `"maxRows": <n>` in the body to lower (never raise) the cap. Values serialise identically in both: BIGINTs as strings, BLOBs as base64, other DuckDB types (timestamps, lists, structs) as DuckDB's JSON value objects, as before. Arrow IPC output is not offered yet; use the Parquet table export for typed bulk data. Memory note: blocking operators (`ORDER BY`, `GROUP BY`, `DISTINCT`) still need DuckDB working memory for their input before the first row is produced; streaming bounds the gateway's memory, not DuckDB's.
 
 ---
 
@@ -1061,7 +1130,64 @@ Build DOM with `h()`, never `innerHTML`: the CSP and the XSS model rely on it.
 
 ---
 
-## 14. Testing
+## 14. Operations: Health, Metrics & Limits
+
+### 14.1 Health Checks
+
+| Endpoint | Auth | Description |
+| :--- | :--- | :--- |
+| `GET /health` | none | **Liveness.** `200 {"status":"ok","uptimeSeconds":...}` while the Node process is responsive. Touches no database, so it stays up when Postgres is down. The compose healthcheck uses it. |
+| `GET /health/ready` | none | **Readiness.** `200 {"status":"ready","checks":{...}}` only when the startup sequence (RBAC/ACL bootstrap, console, startup compaction) has finished, the DuckLake catalog is attached, and the metadata Postgres answers a query through DuckLake's own connection. Otherwise `503` with the failing check, e.g. `{"startup":"ready","ducklake":"ok","postgres":"error: ..."}`. Each check times out after 5 s. |
+
+Use `/health` for restart decisions and `/health/ready` for routing traffic (load balancer, Kubernetes readiness probe). Neither reveals data or configuration.
+
+### 14.2 Prometheus Metrics
+
+`GET /metrics` returns Prometheus text format (`text/plain; version=0.0.4`). Metrics are per gateway process and reset on restart, so scrape every instance.
+
+**Authentication.** Metrics are never public by default:
+
+- With `METRICS_TOKEN` set, the scraper must send `Authorization: Bearer <METRICS_TOKEN>` (Prometheus: `authorization: { credentials: ... }` in the scrape config). API keys are not accepted then, so a scraper token cannot be used against the data API and vice versa.
+- Without it, a **superuser** API key is required, as `x-api-key` or as a bearer token.
+
+Other callers get 401. Metrics do not contain table names, keys or query text (routes are labelled by template, e.g. `/tables/:tableName`), but do reveal traffic and catalog size.
+
+```yaml
+scrape_configs:
+  - job_name: ichibi-lake
+    authorization: { credentials: "<METRICS_TOKEN>" }
+    static_configs: [{ targets: ["ichibi-lake:3000"] }]
+```
+
+| Metric | Type | Description |
+| :--- | :--- | :--- |
+| `ichibi_http_requests_total{method,route,status}` | counter | Requests by route template |
+| `ichibi_http_request_duration_seconds{method,route}` | histogram | Latency until the response finished (for streams: the whole transfer) |
+| `ichibi_user_query_active` / `_queued` / `_concurrency` | gauge | User SQL gate: running, waiting, configured limit |
+| `ichibi_user_query_total{outcome}` | counter | Finished user SQL queries: `succeeded`, `failed`, `timeout`, `cancelled` (client disconnected) |
+| `ichibi_user_query_timeouts_total` | counter | User SQL queries that hit their timeout |
+| `ichibi_export_active`, `ichibi_export_total{format,outcome}` | gauge, counter | Table exports in progress / finished (`succeeded`, `failed`, `timeout`, `cancelled`, `rejected`) |
+| `ichibi_prune_jobs_total{status}`, `ichibi_prune_rows_deleted_total` | counter | Pruning jobs run by this instance (`succeeded`, `partial`, `failed`) and rows they deleted |
+| `ichibi_kafka_consumer_lag{topic,partition}` | gauge | Consumer offset lag as of the last processed batch (reported by kafkajs; no extra broker calls). Absent until a batch has been processed |
+| `ichibi_ducklake_up`, `ichibi_ducklake_tables`, `ichibi_ducklake_data_files`, `ichibi_ducklake_data_bytes` | gauge | Catalog size from `ducklake_table_info()`, cached for 30 s; `ichibi_ducklake_up` is 0 if that query failed |
+| `ichibi_startup_complete` | gauge | 1 once the startup sequence finished |
+| `process_resident_memory_bytes`, `nodejs_heap_used_bytes`, `process_uptime_seconds` | gauge | Process basics |
+
+Useful alerts: `ichibi_user_query_queued > 0` for several minutes (raise `USER_QUERY_CONCURRENCY` or find the slow queries), a rising `ichibi_user_query_timeouts_total`, `ichibi_prune_jobs_total{status="failed"}` increasing, `ichibi_kafka_consumer_lag` growing, and `ichibi_ducklake_data_files` growing much faster than `ichibi_ducklake_data_bytes` (many small files: compaction is not keeping up).
+
+### 14.3 Result Size Limits
+
+| Path | Row cap | Time limit | Memory |
+| :--- | :--- | :--- | :--- |
+| `GET /tables/:tableName` | `?limit=` (default 50) | — | Whole page in memory; keep pages small |
+| `POST /query` (JSON) | `QUERY_MAX_ROWS` (100,000) | `USER_QUERY_TIMEOUT_MS` (30 s) | Up to the cap in memory |
+| `POST /query` (NDJSON) | `QUERY_STREAM_MAX_ROWS` (10,000,000) | `USER_QUERY_STREAM_TIMEOUT_MS` (5 min, whole transfer) | ~one chunk (measured: ~30 MB extra RSS whether 100 MB or 1 GB is streamed) |
+| `GET /tables/:tableName/export` (CSV/NDJSON) | `EXPORT_MAX_ROWS` (5,000,000) | `EXPORT_TIMEOUT_MS` (10 min) | ~one chunk, no temp files |
+| `GET /tables/:tableName/export` (Parquet) | `EXPORT_MAX_ROWS` | `EXPORT_TIMEOUT_MS` | ~one read buffer; one temp file per export in `EXPORT_TMP_DIR` |
+
+Every cap reports truncation (`truncated` / trailer line / `X-Export-Truncated`), never silently drops rows. All limits are editable live on the console's **Query Engine** page except `EXPORT_TMP_DIR`. GraphQL `sql` and graph queries still return complete results within `USER_QUERY_TIMEOUT_MS`.
+
+## 15. Testing
 
 ```sh
 npm test                       # Run all suites, including RBAC and console (requires Docker: app, db, kafka)
@@ -1073,6 +1199,7 @@ npm run test:sql-guard         # Read-only / introspection guard for user-suppli
 npm run test:orderby           # DuckLake ORDER BY corruption regression (no Docker needed)
 npm run test:kafka-topic-filter # Kafka topic subscription filter (no Docker needed)
 npm run test:console           # Admin console integration tests (uses docker exec for a temporary admin)
+npm run test:ops               # Health, metrics, NDJSON streaming (4M rows, bounded memory), row caps, table export round trips and RBAC
 npm run test:rbac              # RBAC: superuser / writer / reader permissions, per-table overrides, superuser-only SQL and graphs, system tables
 npm run test:api               # Integration tests
 npm run test:rest              # REST API tests

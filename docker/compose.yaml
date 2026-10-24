@@ -60,6 +60,9 @@ services:
       # console link). Defaults to the host port published above; set it to
       # your real address (e.g. https://lake.example.com) when deployed.
       - PUBLIC_URL=${PUBLIC_URL:-http://localhost:${PORT:-3333}}
+      # Bearer token for GET /metrics (Prometheus). When empty, /metrics
+      # requires a superuser API key instead.
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
     volumes:
       # Persist DuckLake Parquet data files across container rebuilds.
       - ./data/ducklake:/app/data_files
@@ -75,8 +78,10 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+    # Liveness only (GET /health, no auth, no database access). Use
+    # GET /health/ready to check DuckLake + Postgres from a load balancer.
     healthcheck:
-      test: [ "CMD-SHELL", "curl -sf http://localhost:${PORT:-3000}/swagger.yaml > /dev/null" ]
+      test: [ "CMD-SHELL", "curl -sf http://localhost:${PORT:-3000}/health > /dev/null" ]
       interval: 10s
       timeout: 5s
       retries: 5

@@ -322,6 +322,20 @@ export async function getConnection() {
 }
 
 /**
+ * Open an unpooled connection on the primary instance, set up like a pooled
+ * one. For long-running work (table exports) that should neither occupy a
+ * pooled connection nor be handed back to the pool afterwards; the caller
+ * must close() it.
+ */
+export async function openDedicatedConnection() {
+    const db = await getDbInstance();
+    const conn = await db.connect();
+    await conn.run("USE ducklake;");
+    await conn.run("SET search_path = 'ducklake.main,memory.main';");
+    return conn;
+}
+
+/**
  * Return a primary connection to the pool instead of closing it.
  * When the pool is full the connection is actually closed.
  */
@@ -340,24 +354,28 @@ export function releaseConnection(conn) {
     }
 }
 
+// Convert one DuckDB value for a JSON response: BLOBs become base64, every
+// other value (BigInt, DuckDB timestamp/list/struct values) is left for
+// JSON.stringify. Shared by the materialising and the streaming readers so both
+// serialise identically.
+function convertValue(val) {
+    if (val === null || val === undefined) return null;
+    if (typeof val === 'object' && val.constructor.name === 'DuckDBBlobValue' && val.bytes) {
+        return Buffer.from(val.bytes).toString('base64');
+    }
+    if (val instanceof Uint8Array || Buffer.isBuffer(val)) {
+        return Buffer.from(val).toString('base64');
+    }
+    return val;
+}
+
 // Convert a DuckDB result object into an array of plain JS objects.
-// Shared between execute(), executeWithParams() and executeUserSql().
+// Shared between execute() and executeWithParams().
 async function _readRows(result) {
     const columns = result.columnNames();
     const rowSet = await result.getRows();
     const results = [];
     if (!rowSet) return results;
-
-    const convertValue = (val) => {
-        if (val === null || val === undefined) return null;
-        if (typeof val === 'object' && val.constructor.name === 'DuckDBBlobValue' && val.bytes) {
-            return Buffer.from(val.bytes).toString('base64');
-        }
-        if (val instanceof Uint8Array || Buffer.isBuffer(val)) {
-            return Buffer.from(val).toString('base64');
-        }
-        return val;
-    };
 
     if (typeof rowSet[Symbol.asyncIterator] === 'function' || typeof rowSet[Symbol.iterator] === 'function') {
         for (const row of rowSet) {
@@ -516,18 +534,35 @@ function releaseUserSlot() {
     if (next) next();
 }
 
+// Outcome counters for GET /metrics (per process, since start).
+const userQueryCounters = { succeeded: 0, failed: 0, timedOut: 0, cancelled: 0 };
+
+/** Snapshot of the user-query gate for GET /metrics. */
+export function userQueryStats() {
+    return {
+        active: userActive,
+        queued: userQueue.length,
+        concurrency: userQueryConcurrency(),
+        ...userQueryCounters,
+    };
+}
+
 /**
- * Runs read-only user-supplied SQL on the isolated user instance, with a
- * concurrency cap and a wall-clock timeout. When the timeout fires the
- * caller receives a 504-tagged error; the underlying DuckDB query is
- * interrupted on a best-effort basis (DuckDB does not guarantee that
- * every operator honours interruption immediately).
+ * Shared harness for SQL on the isolated user instance: takes a concurrency
+ * slot, opens a fresh connection, runs the optional `prepare` hook, arms the
+ * engine-level and wall-clock deadlines, then hands the connection to `fn`.
+ * When the deadline passes the caller receives a 504-tagged error and the
+ * DuckDB query is interrupted on a best-effort basis (DuckDB does not
+ * guarantee that every operator honours interruption immediately). `signal`
+ * (an AbortSignal) interrupts the query too, e.g. when the HTTP client
+ * disconnects mid-stream.
  */
-export async function executeUserSql(sql, { timeoutMs = userQueryTimeoutMs(), prepare = null } = {}) {
+async function withUserConnection({ timeoutMs, prepare, signal }, fn) {
     await acquireUserSlot();
     let conn;
     let timer;
     let timedOut = false;
+    let onAbort;
     try {
         conn = await getUserConnection();
 
@@ -546,34 +581,113 @@ export async function executeUserSql(sql, { timeoutMs = userQueryTimeoutMs(), pr
         // any prepare hook), since we cannot tell whether it uses GRAPH_TABLE.
         await enableDuckPgqGrammar(conn);
 
-        const queryPromise = (async () => {
-            const result = await conn.run(sql);
-            return await _readRows(result);
-        })();
+        const interrupt = () => {
+            if (conn && typeof conn.interrupt === 'function') {
+                try { conn.interrupt(); } catch (e) { /* ignore */ }
+            }
+        };
 
         const timeoutPromise = new Promise((_, reject) => {
             timer = setTimeout(() => {
                 timedOut = true;
-                if (conn && typeof conn.interrupt === 'function') {
-                    try { conn.interrupt(); } catch (e) { /* ignore */ }
-                }
+                interrupt();
                 const err = new Error(`Query exceeded ${timeoutMs}ms timeout`);
                 err.statusCode = 504;
                 reject(err);
             }, timeoutMs);
         });
 
-        return await Promise.race([queryPromise, timeoutPromise]);
+        const racers = [fn(conn, () => timedOut || !!signal?.aborted), timeoutPromise];
+        if (signal) {
+            racers.push(new Promise((_, reject) => {
+                onAbort = () => {
+                    interrupt();
+                    reject(Object.assign(new Error('Query cancelled: client disconnected'), { statusCode: 499, cancelled: true }));
+                };
+                if (signal.aborted) onAbort();
+                else signal.addEventListener('abort', onAbort, { once: true });
+            }));
+        }
+
+        const result = await Promise.race(racers);
+        userQueryCounters.succeeded++;
+        return result;
     } catch (err) {
         if (timedOut && !err.statusCode) err.statusCode = 504;
+        if (timedOut) userQueryCounters.timedOut++;
+        else if (err.cancelled) userQueryCounters.cancelled++;
+        else userQueryCounters.failed++;
         throw err;
     } finally {
         if (timer) clearTimeout(timer);
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort);
         if (conn && typeof conn.close === 'function') {
             try { await conn.close(); } catch (e) { }
         }
         releaseUserSlot();
     }
+}
+
+/**
+ * Runs read-only user-supplied SQL on the isolated user instance, with a
+ * concurrency cap and a wall-clock timeout, and returns every row as a plain
+ * object. Used by the GraphQL `sql` resolver and the graph query endpoint;
+ * POST /query uses streamUserSql() so its memory use is bounded by a row cap.
+ */
+export async function executeUserSql(sql, { timeoutMs = userQueryTimeoutMs(), prepare = null } = {}) {
+    return withUserConnection({ timeoutMs, prepare }, async (conn) => {
+        const result = await conn.run(sql);
+        return await _readRows(result);
+    });
+}
+
+/**
+ * Streams read-only user-supplied SQL from the isolated user instance in
+ * DuckDB data chunks (~2048 rows each) instead of materialising the result,
+ * under the same concurrency gate and deadline as executeUserSql().
+ *
+ *   onColumns(names)  called once before the first rows
+ *   onRows(rows)      called per chunk with plain objects (values converted
+ *                     exactly as executeUserSql() converts them); awaited, so
+ *                     the caller can apply backpressure (e.g. wait for the
+ *                     HTTP socket to drain) before the next chunk is fetched
+ *   maxRows           stop after this many rows; `truncated` reports whether
+ *                     more rows were available
+ *   signal            AbortSignal that interrupts the query
+ *
+ * Memory use is bounded by one chunk plus whatever the caller buffers. Note
+ * that blocking operators (ORDER BY, GROUP BY, ...) still need DuckDB's own
+ * working memory before the first chunk is produced.
+ *
+ * Resolves to { columns, rowCount, truncated }.
+ */
+export async function streamUserSql(sql, { maxRows = Infinity, onColumns = null, onRows, timeoutMs = userQueryTimeoutMs(), signal = null } = {}) {
+    return withUserConnection({ timeoutMs, signal }, async (conn, isCancelled) => {
+        const result = await conn.stream(sql);
+        const columns = result.columnNames();
+        if (onColumns) await onColumns(columns);
+        let rowCount = 0;
+        let truncated = false;
+        while (!isCancelled()) {
+            const chunk = await result.fetchChunk();
+            if (!chunk || chunk.rowCount === 0) break;
+            if (rowCount >= maxRows) { truncated = true; break; }
+            let rows = chunk.getRows();
+            if (rowCount + rows.length > maxRows) {
+                rows = rows.slice(0, maxRows - rowCount);
+                truncated = true;
+            }
+            const objects = rows.map(row => {
+                const obj = {};
+                columns.forEach((col, idx) => { obj[col] = convertValue(row[idx]); });
+                return obj;
+            });
+            rowCount += objects.length;
+            await onRows(objects);
+            if (truncated) break;
+        }
+        return { columns, rowCount, truncated };
+    });
 }
 
 /**
