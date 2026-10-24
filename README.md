@@ -24,6 +24,7 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [4.2 Native Node.js](#42-native-nodejs)
   - [4.3 Production Checklist](#43-production-checklist)
   - [4.4 SuperLake Wizard](#44-superlake-wizard)
+  - [4.5 Upgrading](#45-upgrading)
 - [5. Authentication & Authorization](#5-authentication--authorization)
   - [5.1 API Key Authentication](#51-api-key-authentication)
   - [5.2 Per-Table Access Control (ACL)](#52-per-table-access-control-acl)
@@ -305,6 +306,19 @@ Interactive options:
 | **Federation** | Connect multiple DuckLake instances as peers using `ATTACH` for cross-instance queries |
 
 ---
+
+### 4.5 Upgrading
+
+Existing data is migrated **automatically** on first start: the gateway attaches DuckLake with `AUTOMATIC_MIGRATION true`, so a newer DuckDB/DuckLake upgrades the catalog schema in Postgres in place. No manual steps are required, but note:
+
+- **Migration is one-way.** Upgrading to the DuckDB 2.0 release moves the catalog to DuckLake format 1.1, which older (1.5.x) gateways and DuckDB CLIs cannot open (`Only DuckLake versions ... are supported`). **Back up the Postgres metadata database before upgrading** if you may need to roll back:
+  ```sh
+  docker exec ichibi-lake-postgres pg_dump -U postgres ducklake > ducklake-backup.sql
+  ```
+- **Stop every old instance first.** Do not run old and new gateways against the same catalog (e.g. a rolling deploy) — old instances fail once the catalog is migrated.
+- **First start may be slower** on large catalogs, since migration runs during startup before requests are served.
+- **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
+- **Rebuild the image** (`docker compose up -d --build`). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`, `ui`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
 
 ## 5. Authentication & Authorization
 
@@ -648,7 +662,7 @@ A GraphQL endpoint is available at `/graphql` with a dynamic schema built from D
 
 ichibi-lake supports graph property queries via the **DuckPGQ** community extension (SQL/PGQ). Define named graphs over your relational tables and query them with PGQ `GRAPH_TABLE` syntax. The extension is loaded automatically at startup and can be disabled with `DISABLE_DUCKPGQ=1`.
 
-> **Compatibility:** DuckPGQ is pinned to **DuckDB 1.5.0**. Running a different DuckDB version may leave the extension unavailable; graph endpoints then return an error indicating DuckPGQ is not loaded.
+> **Compatibility:** The gateway is pinned to **DuckDB 2.0.0** (`@duckdb/node-api` 2.0.0-r.1), which has a matching DuckPGQ community build. DuckDB 2.0 requires grammar extensions to be enabled per session, so every gateway connection runs `SET active_grammar_extensions = ['duckpgq']` after `LOAD duckpgq`. If you bump DuckDB to a version without a DuckPGQ build, the extension will be unavailable and graph endpoints return an error indicating DuckPGQ is not loaded.
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
@@ -794,8 +808,9 @@ curl -X DELETE "http://ichibi-lake:3333/graphs/social" -H "x-api-key: YOUR_KEY"
 
 ```sh
 npm test                       # Run all suites (requires Docker: app, db, kafka)
-npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter)
+npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar)
 npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
+npm run test:pgq-grammar       # DuckDB 2.0 SQL/PGQ grammar opt-in tests (no Docker needed)
 npm run test:api               # Integration tests
 npm run test:rest              # REST API tests
 npm run test:blob              # BLOB tests
