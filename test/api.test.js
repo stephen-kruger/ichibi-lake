@@ -718,27 +718,11 @@ async function run() {
         });
     });
 
-    // ── 15. Read-only SQL enforcement (SQL_READ_ONLY=true) ──────────────────
-    // The gateway enforces read-only on every endpoint that accepts
-    // user-supplied SQL (POST /query, the /graphql `sql` resolver, and POST
-    // /graphs/:graphName/query) using the shared assertReadOnlySql() guard in
-    // src/index.js. Set SQL_READ_ONLY=false in docker/.env to disable.
-    //
-    // The test probes the server at runtime to detect whether enforcement is
-    // active, so it works regardless of the server's SQL_READ_ONLY setting.
-    const probeSql = `CREATE TABLE IF NOT EXISTS "__ro_detect_${Date.now()}" (n INTEGER)`;
-    const probeRes = await fetch(`${BASE_URL}/query`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
-        body:    JSON.stringify({ sql: probeSql }),
-    });
-    const READ_ONLY = probeRes.status === 403;
-    await describe(`Read-only SQL enforcement (server SQL_READ_ONLY=${READ_ONLY})`, async () => {
-        if (!READ_ONLY) {
-            await test('Skipped: server does not enforce SQL_READ_ONLY', async () => {});
-            return;
-        }
-
+    // ── 15. Read-only SQL enforcement ───────────────────────────────────────
+    // Every endpoint that accepts user-supplied SQL (POST /query, the /graphql
+    // `sql` resolver, and POST /graphs/:graphName/query) is always read-only,
+    // enforced by the shared assertReadOnlySql() guard in src/index.js.
+    await describe('Read-only SQL enforcement', async () => {
         const probe = `__ro_probe_${Date.now()}`;
 
         async function postQuery(sqlText) {

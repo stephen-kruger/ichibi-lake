@@ -19,6 +19,7 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [3.6 Performance & Caching](#36-performance--caching)
   - [3.7 Kafka Integration](#37-kafka-integration)
   - [3.8 Docker Compose / Deployment](#38-docker-compose--deployment)
+  - [3.9 Admin Console](#39-admin-console)
 - [4. Deployment](#4-deployment)
   - [4.1 Docker (recommended)](#41-docker-recommended)
   - [4.2 Native Node.js](#42-native-nodejs)
@@ -50,7 +51,13 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [12.2 Defining a Property Graph](#122-defining-a-property-graph)
   - [12.3 Querying a Graph](#123-querying-a-graph)
   - [12.4 Listing & Deleting Graphs](#124-listing--deleting-graphs)
-- [13. Testing](#13-testing)
+- [13. Admin Console](#13-admin-console)
+  - [13.1 Accessing the Console](#131-accessing-the-console)
+  - [13.2 Features](#132-features)
+  - [13.3 Security Model](#133-security-model)
+  - [13.4 Recovery CLI](#134-recovery-cli)
+  - [13.5 Extending the Console](#135-extending-the-console)
+- [14. Testing](#14-testing)
 
 ---
 
@@ -66,7 +73,7 @@ Once running:
 | Service | URL |
 | :--- | :--- |
 | REST API / Swagger UI | [http://localhost:3333](http://localhost:3333) |
-| DuckDB Web UI (read/write) | [http://localhost:4213](http://localhost:4213) |
+| Admin console | [http://localhost:3333/console](http://localhost:3333/console) (see [§13](#13-admin-console)) |
 | OpenAPI spec | [http://localhost:3333/swagger.yaml](http://localhost:3333/swagger.yaml) |
 
 Default API key for development:
@@ -74,6 +81,17 @@ Default API key for development:
 ```
 ICHIBI_LAKE_TEST_7a96c3e2-b1fe-4705-9064-fc1882674b13
 ```
+
+**Admin console: first sign-in.** There is no default console password. The first visitor creates the admin account using a one-time setup code from the gateway log:
+
+1. Get the setup code:
+   ```sh
+   docker logs ichibi-lake 2>&1 | grep -A3 "First-run setup"
+   ```
+2. Open [http://localhost:3333/console](http://localhost:3333/console), enter the code, and choose an admin username and password (at least 10 characters).
+3. You are signed in. Next time, sign in with that username and password.
+
+Full instructions, including adding logins and resetting a forgotten password, are in [§13.1](#131-accessing-the-console).
 
 ---
 
@@ -143,9 +161,14 @@ See [§5.3](#53-role-based-access-control-rbac) for details on roles, the admin 
 
 ### 3.5 SQL Enforcement
 
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `SQL_READ_ONLY` | `true` | When `true`, DDL/DML keywords are rejected on user-supplied SQL endpoints (`/query`, GraphQL `sql` resolver, `/graphs/:name/query`). Set to `false` to allow arbitrary statements (ops only). |
+User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endpoints `POST /graphs`, `DELETE /graphs/:name`, `POST /graphs/:name/query`) cannot be checked against RBAC roles or per-table ACLs, so it is locked down in layers:
+
+1. **Superuser keys only.** Keys with the RBAC `superuser` role, or any `API_KEYS` key when RBAC is not configured (those are superusers anyway). Readers and writers get HTTP 403 and use the table REST endpoints, which do enforce RBAC. Graph queries count as SQL because their `match`/`where`/`columns` fragments can contain subqueries.
+2. **Always read-only.** DDL/DML/admin keywords are rejected with HTTP 403. There is no setting to turn this off; change data through the REST API (upload, records, blobs) or the [admin console](#13-admin-console).
+3. **Locked-down engine.** The SQL runs on a separate DuckDB instance that has dropped its DuckLake secret, can read only the lake's data directory (no `read_text('/etc/...')`, no BLOB directory, no network), and does not attach the admin console's catalog.
+4. **No connection-string introspection.** `duckdb_databases()`, `pragma_database_list`, `duckdb_settings()`, `current_setting()`, `duckdb_secrets()` and `which_secret()` are rejected, because DuckDB would reveal the metadata Postgres password through them.
+
+**System tables** (names starting with `_`: RBAC users and their API keys, ACLs, the graph registry) are never reachable through the table REST endpoints, for any key, and cannot be targets of `/upload`, `/kafka-sink` or the Kafka consumer. They are managed through the superuser-only admin API and the console.
 
 ### 3.6 Performance & Caching
 
@@ -187,14 +210,22 @@ See [§5.3](#53-role-based-access-control-rbac) for details on roles, the admin 
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `DUCKDB_UI_ENABLED` | `1` | Set to `0` to skip starting the DuckDB UI service |
-| `DUCKDB_UI_PORT` | `4213` | Host port for the DuckDB web UI |
 | `KAFKA_LOG_RETENTION_HOURS` | `48` | Kafka log retention in hours |
 | `KAFKA_LOG_RETENTION_BYTES` | `1073741824` | Kafka log retention in bytes per partition |
 | `KAFKA_LOG_SEGMENT_BYTES` | `268435456` | Kafka segment size before roll |
 | `KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS` | `60000` | Kafka retention check interval |
 | `DOCKER_HOST_UID` | `1000` | Host UID for permission mapping (`.env.example`) |
 | `DOCKER_HOST_GID` | `1000` | Host GID for permission mapping (`.env.example`) |
+
+### 3.9 Admin Console
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `CONSOLE_SETUP_TOKEN` | *(generated)* | One-time code required to create the first console admin. When unset, a random code is printed to the gateway log on startup while no console login exists. |
+| `CONSOLE_SESSION_SECRET` | *(generated)* | HMAC key for console session cookies. When unset, one is generated and stored in DuckLake (shared by all instances). |
+| `CONSOLE_SESSION_TTL_HOURS` | `12` | Console session lifetime. Also editable in the console. |
+| `PUBLIC_URL` | `http://localhost:<port>` | Externally reachable base URL, used in startup log messages (Swagger UI and admin console links). Docker Compose defaults it to the published host port (`http://localhost:3333`); set it to your real address (e.g. `https://lake.example.com`) when deployed. |
+| `RETENTION_INTERVAL_MINUTES` | `60` | How often retention (auto-prune) rules run. Also editable in the console. |
 
 ---
 
@@ -220,14 +251,13 @@ docker compose ps
 curl -sf http://localhost:3333/swagger.yaml > /dev/null && echo "OK"
 ```
 
-The compose stack starts four services:
+The compose stack starts three services:
 
 | Service | Container | Purpose |
 | :--- | :--- | :--- |
 | `app` | `ichibi-lake` | Node.js REST gateway |
 | `db` | `ichibi-lake-postgres` | Postgres 17 (DuckLake metadata) |
 | `kafka` | `ichibi-lake-kafka` | Kafka 4.3.1 (event ingestion) |
-| `duckdb-ui` | `ichibi-lake-duckdb-ui` | DuckDB web UI (optional) |
 
 **Persistent volumes** are mounted under `docker/data/`:
 
@@ -281,13 +311,12 @@ pm2 startup
 ### 4.3 Production Checklist
 
 - **Change API keys** — Set `API_KEYS` to your own values (never use the test key)
-- **Secure the DuckDB UI** — The UI (port 4213) has **no authentication** and full read/write access. Keep it behind a VPN, auth proxy, or disable it (`DUCKDB_UI_ENABLED=0`)
-- **Set `SQL_READ_ONLY=true`** (default) — Prevents accidental or malicious DDL/DML via user-facing SQL endpoints
 - **Tune `JSON_BODY_LIMIT`** — Match your expected payload size; too large invites OOM
 - **Tune `MAX_BATCH_SIZE`** — Prevent a single upload from exhausting memory
 - **Postgres logs** — The compose.yaml configures Postgres with conservative logging (no per-query logging, 2-second slow-query threshold, 7-day log rotation)
 - **Kafka retention** — Set `KAFKA_LOG_RETENTION_HOURS` and `KAFKA_LOG_RETENTION_BYTES` to bound disk usage
 - **Use a reverse proxy** — Place behind nginx, Caddy, or a cloud LB for TLS termination and rate limiting
+- **Claim the admin console** — Complete first-run setup at `/console` right after deploying, and serve it over HTTPS (session cookies are marked `Secure` when the request is HTTPS)
 
 ### 4.4 SuperLake Wizard
 
@@ -317,8 +346,9 @@ Existing data is migrated **automatically** on first start: the gateway attaches
   ```
 - **Stop every old instance first.** Do not run old and new gateways against the same catalog (e.g. a rolling deploy) — old instances fail once the catalog is migrated.
 - **First start may be slower** on large catalogs, since migration runs during startup before requests are served.
+- **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
 - **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
-- **Rebuild the image** (`docker compose up -d --build`). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`, `ui`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
+- **Rebuild the image** (`docker compose up -d --build --remove-orphans`; `--remove-orphans` also removes the retired `duckdb-ui` container from older releases). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
 
 ## 5. Authentication & Authorization
 
@@ -366,6 +396,8 @@ The RBAC system adds fine-grained role- and per-table-based authorization on top
 | **superuser** | All tables | All tables | Bypasses all per-table restrictions unless an explicit `deny` is set. Can manage users and permissions via the admin API. |
 | **writer** | All tables | All tables (unless denied) | Has global read + write access to every table. |
 | **reader** | All tables | None (unless granted via per-table `allow_write`) | Has global read access to every table. |
+
+"All tables" means user tables through the table REST endpoints. Raw SQL (`/query`, GraphQL `sql`) and graph management/queries are **superuser-only**, and system tables (`_`-prefixed) are never accessible through the table endpoints; see [§3.5](#35-sql-enforcement).
 
 #### Per-Table Permission Overrides
 
@@ -594,7 +626,7 @@ curl -X POST "http://ichibi-lake:3333/query" \
   -d '{"sql": "SELECT category, count(*) FROM ichibi_table GROUP BY 1"}'
 ```
 
-When `SQL_READ_ONLY=true` (default), DDL/DML statements are rejected with HTTP 403.
+User-supplied SQL is always read-only: DDL/DML statements are rejected with HTTP 403 (see [§3.5](#35-sql-enforcement)).
 
 ---
 
@@ -748,7 +780,7 @@ curl -X POST "http://ichibi-lake:3333/graphs" \
 | `graphTable` | string | Raw body placed inside `GRAPH_TABLE (graphName ...)`. Mutually exclusive with `match`/`columns`. |
 | `limit` | number | Optional row limit. |
 
-You must supply either `graphTable`, or **both** `match` and `columns`; otherwise the request returns **HTTP 400**. Queries are subject to the read-only guard (`SQL_READ_ONLY`). Querying a graph that is not registered returns **HTTP 404**.
+You must supply either `graphTable`, or **both** `match` and `columns`; otherwise the request returns **HTTP 400**. Queries are subject to the always-on read-only guard ([§3.5](#35-sql-enforcement)). Querying a graph that is not registered returns **HTTP 404**.
 
 **Basic MATCH:**
 
@@ -804,13 +836,201 @@ curl -X DELETE "http://ichibi-lake:3333/graphs/social" -H "x-api-key: YOUR_KEY"
 
 ---
 
-## 13. Testing
+## 13. Admin Console
+
+A password-protected web console at **`/console`** (e.g. [http://localhost:3333/console](http://localhost:3333/console)) for managing the gateway without editing `docker/.env`: a table and data browser with inline editing, API keys, RBAC users, console logins, live settings and date-based data retention.
+
+### 13.1 Accessing the Console
+
+The console is served by the gateway itself, on the **same port as the REST API and Swagger UI**, at the `/console` path:
+
+| How you run it | Console URL |
+| :--- | :--- |
+| Docker Compose (default) | [http://localhost:3333/console](http://localhost:3333/console): the container listens on 3000, published on host port 3333 |
+| Docker Compose with `PORT=8080` in `docker/.env` | http://localhost:8080/console |
+| Natively (`node src/index.js`) | http://localhost:3000/console, or your `PORT` |
+| Deployed | `https://<your-host>/console`; set `PUBLIC_URL` so the log shows it |
+
+The gateway prints the full link at startup:
+
+```
+[Server] Swagger UI:    http://localhost:3333/
+[Server] Admin console: http://localhost:3333/console
+```
+ It uses its own usernames and passwords; **API keys do not work for the console**, and the console has **no default password**.
+
+#### First time: create the admin account
+
+While no console login exists, the console opens on a **Set up the admin console** screen that requires a one-time **setup code**.
+
+1. **Find the setup code** in the gateway log. It is printed when the gateway starts with no console logins (and once more if every login is later deleted):
+   ```sh
+   docker logs ichibi-lake 2>&1 | grep -A3 "First-run setup"
+   ```
+   ```
+   [Console] First-run setup required. Open http://localhost:3333/console and enter this setup code:
+
+       GTSX-ZN49-V5M9
+   ```
+   Running natively (`node src/index.js`)? The same message is printed to the terminal.
+2. **Open `/console`**, then enter:
+   - **Setup code**: the code from step 1 (case-sensitive, including the dashes).
+   - **Admin username**: defaults to `admin`; 3–64 characters from letters, digits and `_ . @ -`.
+   - **Password** and **Confirm password**: at least 10 characters.
+3. Select **Create admin account**. You are signed in straight away, and the setup code stops working.
+
+To choose the setup code yourself, for example in automated deployments where reading logs is awkward, set it before starting the gateway:
 
 ```sh
-npm test                       # Run all suites (requires Docker: app, db, kafka)
-npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar)
+# docker/.env
+CONSOLE_SETUP_TOKEN=pick-a-long-random-value
+```
+
+The code exists so that whoever first reaches a freshly deployed gateway cannot claim it. Complete setup promptly after deploying.
+
+#### Signing in
+
+Open `/console` and enter your username and password. Usernames are not case-sensitive. A session lasts **12 hours** by default (an admin can change this under **Settings → Security → Console session lifetime**), after which you are asked to sign in again. Use the sign-out button next to your name at the bottom of the side menu to end a session early.
+
+After **5 failed attempts** from the same IP address, or for the same username, sign-in is blocked for 15 minutes.
+
+#### Adding more people
+
+An admin adds logins under **Access → Console Logins**: enter a username, an initial password and a role, then select **Add login**.
+
+| Role | Can do |
+| :--- | :--- |
+| `admin` | Everything: change settings, manage API keys, RBAC users, logins and retention rules |
+| `viewer` | Read-only: browse every page, but cannot change anything |
+
+Share the initial password with the person securely and ask them to change it under **System → My Account**.
+
+#### Changing or resetting a password
+
+- **Your own password**: **System → My Account → Change password** (requires your current password). Your other sessions, for example on another device, are signed out.
+- **Someone else's password** (admins): **Access → Console Logins → Reset password** next to their name. Their existing sessions end immediately.
+
+#### Forgotten password or locked out
+
+If no admin can sign in, reset a password from the server with the recovery CLI. It prints a new random password:
+
+```sh
+docker exec ichibi-lake node scripts/console-admin.js list                     # show console logins
+docker exec ichibi-lake node scripts/console-admin.js reset-password admin     # new random password for "admin"
+docker exec ichibi-lake node scripts/console-admin.js create rescue --role admin
+```
+
+Sign in with the printed password, then change it under **My Account**. If every console login is deleted (`... console-admin.js delete <name>`), the next visit to `/console` shows the setup screen again, and a new setup code is printed to the log. Being throttled after failed attempts clears by itself after 15 minutes, or immediately when the gateway restarts.
+
+#### Accessing the console remotely
+
+The console is available wherever the gateway's port is reachable. Before exposing it beyond a trusted network:
+
+- **Restrict who can reach it** (firewall, IP allow-list or VPN), since the console manages API keys and can delete data.
+- **Prefer HTTPS.** Session cookies are marked `Secure` only when the request reaches the gateway over HTTPS.
+- The console assumes clients connect to the gateway directly. Behind a reverse proxy it would see every client as the proxy's address, so the per-IP login throttle (5 failures / 15 minutes) would apply to all users at once.
+
+#### Troubleshooting
+
+| Symptom | Cause / fix |
+| :--- | :--- |
+| No "First-run setup" line in the log | Setup has already been completed. Sign in, or use the recovery CLI above. If the log has rotated, run `docker restart ichibi-lake`; the code is printed again while no login exists |
+| "Invalid setup code" | Use the code from the *most recent* startup of *this* instance. Each gateway instance prints its own code, and `CONSOLE_SETUP_TOKEN` overrides the printed one |
+| "The console is still starting" | The gateway is still attaching DuckLake; wait a few seconds and reload |
+| "Too many failed attempts" | Wait 15 minutes, restart the gateway, or reset the password with the CLI |
+| Signed out unexpectedly | The session expired, your password was changed or reset, or your login was deleted |
+
+### 13.2 Features
+
+The side menu groups pages by area. **Admins** can change everything; **viewers** have read-only access.
+
+| Page | What it does |
+| :--- | :--- |
+| **Overview** | Version, uptime, DuckDB/DuckPGQ status, table, key and rule counts |
+| **API Keys** | Generate (shown once) and revoke `x-api-key` values; revert to the `docker/.env` list |
+| **RBAC Users** | Create role-based API users (superuser / writer / reader), change roles, activate or deactivate. Users defined by `RBAC_SUPERUSERS` / `RBAC_USERS` in `docker/.env`, or by the `API_KEYS` list, are re-applied on every restart, so they are shown read-only with where to change them |
+| **Console Logins** | Add console users, change roles, reset passwords, delete logins (at least one admin always remains) |
+| **Tables & Data** | Browse every user table with paging, sorting, per-column filters and full-text search; edit cells inline; add and delete rows; view and edit schemas; create, rename and drop tables (see below) |
+| **Retention & Pruning** | Per-table rules that delete rows older than *N* days by a date/timestamp column, with preview and **Run now**. Filesystem BLOB files referenced by pruned rows are deleted too |
+| **Security / Ingestion / Query Engine / Storage / Kafka** | Effective configuration, showing each value's source (default, `docker/.env`, or console override) |
+| **Audit Log** | Who changed what, from which IP, across all instances |
+| **My Account** | Change your own password |
+
+**How settings work.** Console changes are stored as overrides in DuckLake, so every gateway instance shares them (instances refresh every 30 s) and they survive restarts and image rebuilds. Only settings the gateway reads on use are editable, and they **apply immediately**:
+
+| Editable live | Read-only (set in `docker/.env`, restart required) |
+| :--- | :--- |
+| `API_KEYS` (via the API Keys page), `MAX_BATCH_SIZE`, `DEFAULT_PARTITION_KEY`, `USER_QUERY_TIMEOUT_MS`, `USER_QUERY_CONCURRENCY`, `CONSOLE_SESSION_TTL_HOURS`, `RETENTION_INTERVAL_MINUTES` | Database connection, storage paths, Kafka, `JSON_BODY_LIMIT`, pool sizes, RBAC bootstrap variables |
+
+Resetting a setting removes the override and returns to the `docker/.env` value or the default. Overrides are loaded at startup before the RBAC bootstrap, so an API key list edited in the console (including revoked keys) survives restarts. Revoking an API key also deactivates the RBAC user that the legacy bootstrap created for it; otherwise the key would keep working.
+
+**Tables & Data.** Open **Data → Tables & Data**, pick a table, and switch between the **Data** and **Schema** tabs. Each table has its own link (`#/tables/<name>`, `#/tables/<name>/schema`).
+
+- **Browsing**: choose 25–500 rows per page and jump to any page; click a column header to sort (ascending, descending, off); search across all columns; and stack filters (*contains, equals, does not equal, starts with, >, ≥, <, ≤, is NULL, is not NULL*). Values longer than 1,000 characters are truncated for display.
+- **Editing** (admins): double-click a cell, or focus it and press **Enter**. **Enter** saves, **Tab** saves and moves to the next cell, **Esc** cancels; **NULL** sets the cell to NULL. Values are converted to the column's type, so an invalid value is rejected with DuckDB's message. If someone else changed the cell since you loaded the page, the edit is refused rather than overwriting their change. A table's `updated` timestamp column is set automatically on edit, and `created`/`updated` on rows added with **Add row**. Scalar types are editable; STRUCT, LIST, MAP and BLOB columns are read-only in the grid. Rows are identified by DuckLake's stable `rowid`, so edits never hit the wrong row even in tables without a primary key.
+- **Schema** (admins): add columns (with an optional default that backfills existing rows), rename columns, change defaults and NULL-ability, change types and drop columns. In the **Edit column** dialog every type can be chosen:
+  - **(in place)**: widening changes DuckLake supports natively (e.g. `INTEGER → BIGINT`, `FLOAT → DOUBLE`). Data and column position are unchanged.
+  - **(convert)**: any other change (e.g. `VARCHAR → INTEGER`, `BIGINT → VARCHAR`). The console copies the converted values into a new column, drops the old one, and renames the new one, all in **one transaction**, so nothing changes if any step fails. Row ids are preserved; the column **moves to the end** of the table and **loses its default**; NOT NULL is kept. Use **Check values** first: if any value cannot be converted (e.g. `"n/a"` to INTEGER), the change is refused with a count and examples unless you tick **Set values that cannot be converted to NULL**. Converting is blocked while a property graph references the table, or while a retention rule prunes by the column and the new type is not a date/timestamp.
+- **Tables** (admins): create tables with a column builder, rename them (table ACLs, RBAC table permissions and retention rules follow the new name; API clients using the old name will fail), and drop them, which requires typing the table name. Tables referenced by a property graph cannot be renamed or dropped, and their columns cannot be renamed or dropped, until the graph is removed.
+- **Not shown**: system tables (prefixed `_`, e.g. RBAC users, ACLs, console logins and settings) never appear here; they are managed on their own pages. Tables created from the console have no ACL row, so only RBAC superusers can reach them through the REST API until an ACL is set (`PATCH /tables/:name/acl`).
+
+Every change (cell edits, inserts, deletes, schema and table changes) is recorded in the audit log with the table, row and column, but not the cell values.
+
+**Retention notes.** Rules run every `RETENTION_INTERVAL_MINUTES` on each instance (deletes are idempotent). Deleted rows cannot be recovered except from backups, so use **Preview** first. System tables (prefixed `_`) cannot be pruned. DuckLake records deletions as delete files; the startup maintenance (`compactDuckLake`) reclaims the space.
+
+### 13.3 Security Model
+
+- **Passwords** are hashed with scrypt (N=2¹⁵, r=8, p=1, per-user salt).
+- **Sessions** are HMAC-signed, `HttpOnly`, `SameSite=Strict` cookies scoped to `/console` (and `Secure` over HTTPS). Changing a password signs out that user's other sessions.
+- **CSRF**: state-changing requests must carry an `X-Console-Request` header and a same-origin `Origin`. The console is mounted before the global CORS middleware, so it never sends permissive CORS headers.
+- **Brute force**: logins are throttled per IP and per username (5 failures per 15 minutes), as are setup attempts.
+- **Browser hardening**: strict Content-Security-Policy (no inline script or style), `X-Frame-Options: DENY`, `no-referrer`. API responses are `no-store`.
+- Secrets (API keys, the Postgres password) are masked in the UI. A generated key is shown exactly once.
+- **Console data is isolated.** Console logins, settings (including the session-signing secret), retention rules and the audit log live in a separate DuckLake catalog (`ichibi_console`, Postgres schema `ichibi_console`, rows stored inline in Postgres). Only the primary gateway instance attaches it; user-supplied SQL runs on an instance that cannot see it ([§3.5](#35-sql-enforcement)). Releases before this change kept these tables in the main catalog; they are moved automatically on first start.
+
+### 13.4 Recovery CLI
+
+`scripts/console-admin.js` runs inside the container against the same catalog (see [§13.1](#131-accessing-the-console) for when to use it):
+
+```sh
+docker exec ichibi-lake node scripts/console-admin.js list
+docker exec ichibi-lake node scripts/console-admin.js reset-password admin
+docker exec ichibi-lake node scripts/console-admin.js create alice --role viewer
+docker exec ichibi-lake node scripts/console-admin.js delete alice
+```
+
+Without `--password`, a strong random password is generated and printed. If every login is deleted, the next visit to `/console` runs setup again, with a fresh code printed to the log.
+
+### 13.5 Extending the Console
+
+The menu and settings forms are driven by metadata in [`src/console/registry.js`](src/console/registry.js):
+
+- **New settings category**: add a `SECTIONS` entry with `kind: 'settings'` and `SETTINGS` entries pointing at it. The UI renders the form from each setting's `type` (`boolean`, `number`, `enum`, `string`, `list`, `secret`) with validation (`min`/`max`/`options`/`validate`). Mark a setting `editable: true` only if the code reads `process.env.X` *on use*, not into a startup constant.
+- **New custom page**: add a section with `kind: 'custom'`, add its API routes in [`src/console/index.js`](src/console/index.js) (behind `requireSession`, and `requireAdmin` for changes, and audited with `store.audit`), then register the view in [`public/console/app.js`](public/console/app.js):
+
+```js
+registerView('my-page', async (ctx) => {
+    const data = await api('GET', '/my-page');
+    return [pageHeader('My Page', 'What it does'), h('div', { class: 'card' }, /* ... */)];
+});
+```
+
+Larger views can live in their own file under `public/console/views/` (as `tables.js` does), added as another `<script defer>` after `app.js` in `public/console/index.html`; they use the same globals (`registerView`, `h`, `api`, `modal`, ...). `ctx.params` holds the route segments after the section id, and `ctx.navigate(...)` changes the route.
+
+Build DOM with `h()`, never `innerHTML`: the CSP and the XSS model rely on it.
+
+---
+
+## 14. Testing
+
+```sh
+npm test                       # Run all suites, including RBAC and console (requires Docker: app, db, kafka)
+npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console)
 npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
 npm run test:pgq-grammar       # DuckDB 2.0 SQL/PGQ grammar opt-in tests (no Docker needed)
+npm run test:console-unit      # Admin console auth/settings/retention unit tests (no Docker needed)
+npm run test:console           # Admin console integration tests (uses docker exec for a temporary admin)
+npm run test:rbac              # RBAC: superuser / writer / reader permissions, per-table overrides, superuser-only SQL and graphs, system tables
 npm run test:api               # Integration tests
 npm run test:rest              # REST API tests
 npm run test:blob              # BLOB tests

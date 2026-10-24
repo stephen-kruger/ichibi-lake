@@ -37,7 +37,6 @@ async function generateServer() {
     const sharePath    = await prompt('Host directory to export', '/srv/ichibi-lake');
     const apiKeyInput  = await prompt('API key(s), comma-separated (blank = generate one)', '');
     const apiKeys      = apiKeyInput.trim() || `ICHIBI_LAKE_${randomToken(16)}`;
-    const sqlRO        = await promptYN('Enforce SQL_READ_ONLY on user-supplied SQL endpoints?', true);
 
     const outDir = await ensureOutputDir('option2-nfs-server');
 
@@ -106,9 +105,8 @@ echo "==> Done. Verify with:  showmount -e ${serverIp}"
 `;
 
     const envBody = renderEnv(
-        { API_KEYS: apiKeys, SQL_READ_ONLY: String(sqlRO) },
-        { API_KEYS: 'Distribute this value to every gateway-client .env',
-          SQL_READ_ONLY: 'Catalog host does not run a gateway; informational only' },
+        { API_KEYS: apiKeys },
+        { API_KEYS: 'Distribute this value to every gateway-client .env' },
         `SuperLake — Option 2 (NFS), catalog+storage host @ ${serverIp}`,
     );
 
@@ -166,7 +164,6 @@ async function generateClient() {
     const hostPort     = await promptInt('Host port for the gateway', 3333, { min: 1024, max: 60000 });
     const includeKafka = await promptYN('Include a local Kafka broker?', false);
     const apiKeys      = await promptRequired('API key(s) (must match catalog host\'s .env)', '');
-    const sqlRO        = await promptYN('Enforce SQL_READ_ONLY on user-supplied SQL endpoints?', true);
 
     const outDir = await ensureOutputDir('option2-nfs-client');
 
@@ -228,7 +225,6 @@ services:
       - USE_FILESYSTEM_BLOBS=1
       - BLOBS_PATH=/app/blobs
       - API_KEYS=\${API_KEYS}
-      - SQL_READ_ONLY=\${SQL_READ_ONLY:-true}
       - KAFKA_BROKERS=${kafkaEnv}
       - PORT=3000
     volumes:
@@ -278,8 +274,8 @@ echo "==> Done. Verify with:  ls -la $MOUNT/ducklake $MOUNT/blobs"
 `;
 
     const envBody = renderEnv(
-        { API_KEYS: apiKeys, SQL_READ_ONLY: String(sqlRO) },
-        { API_KEYS: 'Must match the catalog host', SQL_READ_ONLY: 'Reject DDL/DML on /query etc.' },
+        { API_KEYS: apiKeys },
+        { API_KEYS: 'Must match the catalog host' },
         `SuperLake — Option 2 (NFS), gateway-client → ${serverIp}`,
     );
 

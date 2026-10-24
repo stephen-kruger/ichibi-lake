@@ -57,7 +57,12 @@ async function runTests() {
         const pgqCheck = await post('/query', {
             sql: "SELECT loaded, installed FROM duckdb_extensions() WHERE extension_name = 'duckpgq'"
         });
-        const row = pgqCheck.ok && Array.isArray(pgqCheck.body.rows) ? pgqCheck.body.rows[0] : null;
+        if (!pgqCheck.ok) {
+            // A failing preflight query is a server problem, not a missing
+            // extension: fail loudly instead of skipping the whole suite.
+            throw new Error(`FAIL: DuckPGQ preflight query returned ${pgqCheck.status}: ${JSON.stringify(pgqCheck.body)}`);
+        }
+        const row = Array.isArray(pgqCheck.body.rows) ? pgqCheck.body.rows[0] : null;
         const loaded = !!row && (row.loaded === true || row.loaded === 'true');
         if (!loaded) {
             if (!row) {

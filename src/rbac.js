@@ -418,3 +418,53 @@ export async function legacyBootstrap() {
     invalidateRbacCache();
     console.log(`[RBAC] Legacy bootstrap complete: ${keys.length} superuser(s)`);
 }
+
+/**
+ * Reconcile RBAC rows with an edited API_KEYS list (used by the admin
+ * console). legacyBootstrap() copies every API_KEYS entry into _rbac_users as
+ * an active superuser, and authentication consults _rbac_users first, so
+ * removing a key from API_KEYS alone would NOT revoke it. Keys added here are
+ * promoted exactly as legacyBootstrap() does (only when RBAC env vars are not
+ * in use, mirroring startup); removed keys that were created by the legacy
+ * bootstrap are deactivated. Users created through RBAC are never touched.
+ */
+export async function syncLegacyApiKeys(newKeys, oldKeys) {
+    const next = new Set(newKeys);
+    const removed = oldKeys.filter(k => !next.has(k));
+    await initRbacTables();
+
+    for (const key of removed) {
+        await executeWithParams(
+            `UPDATE _rbac_users SET is_active = 'false' WHERE api_key = ? AND created_by = 'legacy-bootstrap'`,
+            [key], [VARCHAR]
+        );
+    }
+
+    if (!isRbacConfigured() && newKeys.length > 0) {
+        const saved = process.env.API_KEYS;
+        process.env.API_KEYS = newKeys.join(',');
+        try { await legacyBootstrap(); } finally { process.env.API_KEYS = saved; }
+    }
+
+    invalidateRbacCache();
+    return { removed: removed.length };
+}
+
+/**
+ * True when `apiKey` may use superuser-only features (user-supplied SQL,
+ * graph management): an active RBAC user with the superuser role, or, in
+ * legacy (non-RBAC) mode, a key from API_KEYS, which the legacy bootstrap
+ * promotes to superuser anyway.
+ */
+export async function isSuperuserKey(apiKey) {
+    if (!apiKey) return false;
+    try {
+        const user = await findUser(apiKey);
+        if (user) {
+            const active = user.is_active === true || user.is_active === 'true';
+            return active && (await getUserRoles(apiKey)).includes('superuser');
+        }
+    } catch (_) { /* RBAC tables unavailable: fall through to the legacy rule */ }
+    if (isRbacConfigured()) return false;
+    return (process.env.API_KEYS || process.env.API_KEY || '').split(',').map(k => k.trim()).includes(apiKey);
+}

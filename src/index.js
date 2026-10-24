@@ -29,8 +29,10 @@ import { startKafkaConsumer } from './kafka-consumer.js';
 import { getKafka } from './kafka-producer.js';
 import { migrateTimestamps } from './migrate-timestamps.js';
 import { initAclTable, ensureTableAcl, checkReadAccess, checkWriteAccess, getTableAcl, updateTableAcl, invalidateAclCache, migrateToAcl } from './acl.js';
-import { initRbacTables, bootstrapRbac, isValidApiKey, checkAccess, isRbacConfigured, legacyBootstrap } from './rbac.js';
+import { initRbacTables, bootstrapRbac, isValidApiKey, checkAccess, isRbacConfigured, legacyBootstrap, isSuperuserKey } from './rbac.js';
+import { assertReadOnlySql } from './sql-guard.js';
 import adminRouter from './rbac-api.js';
+import { createConsoleRouter, initConsole, loadSettingOverrides, publicBaseUrl } from './console/index.js';
 import swaggerUi from 'swagger-ui-express';
 import YAML from 'yamljs';
 import { createHandler } from 'graphql-http/lib/use/express';
@@ -57,8 +59,11 @@ process.emitWarning = (warning, ...args) => {
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(cors());
 app.use(compression());
+// Admin console (password-protected web UI). Mounted before CORS so console
+// responses never carry permissive cross-origin headers.
+app.use('/console', createConsoleRouter());
+app.use(cors());
 // JSON body limit. Previously 2gb, which is large enough to let a single
 // request exhaust the Node heap and trigger long GC pauses that look like
 // the whole gateway hanging. Configure via JSON_BODY_LIMIT for stress runs.
@@ -87,7 +92,23 @@ function requireTableAcl(tableName) {
 /**
  * Throw a 403 error if the requesting API key is not in the table's read ACL.
  */
+// System tables ("_"-prefixed: RBAC users and their API keys, ACLs, graph
+// registry, gateway metadata) are never reachable through the table REST API,
+// whatever the caller's role. They have dedicated, superuser-only APIs.
+function isSystemTableName(name) {
+    return typeof name === 'string' && name.startsWith('_');
+}
+
+function assertNotSystemTable(tableName) {
+    if (isSystemTableName(tableName)) {
+        const err = new Error(`Table "${tableName}" not found`);
+        err.statusCode = 404;
+        throw err;
+    }
+}
+
 async function requireReadAccess(tableName, req) {
+    assertNotSystemTable(tableName);
     const hasAccess = await checkReadAccess(tableName, req.apiKey);
     if (!hasAccess) {
         const err = new Error(`Access denied: no read permission for table "${tableName}"`);
@@ -100,6 +121,7 @@ async function requireReadAccess(tableName, req) {
  * Throw a 403 error if the requesting API key is not in the table's write ACL.
  */
 async function requireWriteAccess(tableName, req) {
+    assertNotSystemTable(tableName);
     const hasAccess = await checkWriteAccess(tableName, req.apiKey);
     if (!hasAccess) {
         const err = new Error(`Access denied: no write permission for table "${tableName}"`);
@@ -115,47 +137,24 @@ const BLOBS_PATH = process.env.BLOBS_PATH || './data/blobs';
 // --- Batch Ingest Guard ---
 // Hard ceiling on how many rows a single /upload request may contain.
 // Prevents the gateway from OOM-ing when clients accidentally (or maliciously)
-// send massive arrays. Configure via MAX_BATCH_SIZE.
-const MAX_BATCH_SIZE = Math.max(1, parseInt(process.env.MAX_BATCH_SIZE || '10000', 10));
+// send massive arrays. Configure via MAX_BATCH_SIZE. Read on use so the
+// admin console can change it live.
+const maxBatchSize = () => Math.max(1, parseInt(process.env.MAX_BATCH_SIZE || '10000', 10) || 10000);
 
-// --- Read-only SQL enforcement ---
-// User-supplied SQL endpoints (POST /query, the /graphql `sql` resolver and
-// POST /graphs/:graphName/query) are intended to be read-only per swagger.yaml.
-// Set SQL_READ_ONLY=false to disable the guard (e.g. for ops/migration work).
-const SQL_READ_ONLY = String(process.env.SQL_READ_ONLY ?? 'true').toLowerCase() !== 'false';
-
-// Single regex used for every user-supplied SQL path. Matches a write/DDL/admin
-// keyword as a whole word so SELECTs containing the word inside a string
-// literal (which is stripped first by stripSqlLiterals) are not blocked.
-const FORBIDDEN_SQL_RE = /\b(CREATE|DROP|INSERT|UPDATE|DELETE|ALTER|ATTACH|DETACH|COPY|TRUNCATE|MERGE|REPLACE|GRANT|REVOKE|VACUUM|CHECKPOINT|INSTALL|LOAD|EXPORT|IMPORT|CALL|PRAGMA|SET|RESET|USE)\b/i;
-
-// Strip SQL comments and quoted literals so the keyword scan only sees
-// executable tokens. This keeps queries like SELECT 'DROP me' FROM t legal.
-function stripSqlLiterals(sql) {
-    return String(sql)
-        .replace(/--[^\n]*/g, ' ')
-        .replace(/\/\*[\s\S]*?\*\//g, ' ')
-        .replace(/'(?:''|[^'])*'/g, "''")
-        .replace(/"(?:""|[^"])*"/g, '""');
-}
-
-// Throws a 403-tagged Error when the SQL contains a forbidden keyword and the
-// guard is enabled. Callers should translate err.statusCode into res.status.
-function assertReadOnlySql(sql) {
-    if (!SQL_READ_ONLY) return;
-    const scrubbed = stripSqlLiterals(sql || '');
-    const m = scrubbed.match(FORBIDDEN_SQL_RE);
-    if (m) {
-        const err = new Error(
-            `Read-only enforcement: statement "${m[0].toUpperCase()}" is not allowed. ` +
-            `Set SQL_READ_ONLY=false in the environment to disable this guard.`
-        );
+// --- User-supplied SQL ---
+// POST /query, the GraphQL `sql` resolver and the graph endpoints accept SQL
+// (graph query fragments can embed subqueries), and RBAC roles / table ACLs
+// cannot be applied to arbitrary SQL. They are therefore superuser-only, always
+// read-only (assertReadOnlySql in src/sql-guard.js) and run on the locked-down
+// user-query instance (src/db.js). Readers and writers use the table-scoped
+// REST endpoints, which do check RBAC and ACLs.
+async function requireSuperuser(req) {
+    if (!(await isSuperuserKey(req.apiKey))) {
+        const err = new Error('Forbidden: user-supplied SQL and graph management require a superuser API key. Use the table REST endpoints instead.');
         err.statusCode = 403;
         throw err;
     }
 }
-
-console.log(`[Security] SQL_READ_ONLY=${SQL_READ_ONLY} (user-supplied SQL endpoints ${SQL_READ_ONLY ? 'will reject' : 'will accept'} DDL/DML).`);
 
 // Reject SQL/PGQ pattern fragments (match / where / columns / graphTable) that
 // contain statement terminators or comment sequences. These are the injection
@@ -198,8 +197,9 @@ async function migrateExistingTables() {
  * because partitioning is a performance optimisation, not a correctness
  * requirement.
  */
-const DEFAULT_PARTITION_KEY_RAW = (process.env.DEFAULT_PARTITION_KEY ?? 'created').trim();
 async function applyDefaultPartitioning(tableName) {
+    // Read on use so the admin console can change it live.
+    const DEFAULT_PARTITION_KEY_RAW = (process.env.DEFAULT_PARTITION_KEY ?? 'created').trim();
     if (!DEFAULT_PARTITION_KEY_RAW || DEFAULT_PARTITION_KEY_RAW.toLowerCase() === 'none') return;
     const requested = DEFAULT_PARTITION_KEY_RAW.split(',').map(s => s.trim()).filter(Boolean);
     if (requested.length === 0) return;
@@ -257,6 +257,13 @@ app.use(['/admin', '/graphql', '/query', '/kafka-sink', '/kafka-subscribe/:topic
 
     console.error(`[Auth] 401 Unauthorized from ${req.ip}. No valid API keys configured.`);
     return res.status(401).json({ error: 'Unauthorized: No API keys configured' });
+});
+
+// Refuse system tables on every route with a :tableName parameter before the
+// handler runs (e.g. /upload/_rbac_users would otherwise reach the insert path).
+app.param('tableName', (req, res, next, tableName) => {
+    if (isSystemTableName(tableName)) return res.status(404).json({ success: false, error: `Table "${tableName}" not found` });
+    next();
 });
 
 // POST /blobs/:blobColumn - Upload raw binary BLOB (default table, generated ID)
@@ -915,6 +922,7 @@ app.post('/query', async (req, res) => {
     try {
         const { sql } = req.body;
         if (!sql) return res.status(400).json({ error: 'Missing sql in body' });
+        await requireSuperuser(req);
         assertReadOnlySql(sql);
         const rows = await executeUserSql(sql);
         res.json({ success: true, rows });
@@ -934,8 +942,9 @@ const schema = buildSchema(`
 `);
 
 const root = {
-    sql: async ({ query }) => {
+    sql: async ({ query }, context) => {
         try {
+            await requireSuperuser({ apiKey: context?.apiKey });
             assertReadOnlySql(query);
             // Routed through the isolated user instance so a runaway query
             // cannot block the primary REST/ingest connection pool.
@@ -959,6 +968,9 @@ const root = {
 app.all('/graphql', createHandler({
     schema: schema,
     rootValue: root,
+    // Expose the authenticated API key to resolvers (the sql resolver is
+    // superuser-only).
+    context: (req) => ({ apiKey: req.raw?.apiKey }),
 }));
 
 // --- Graph Query Endpoints (SQL/PGQ via DuckPGQ) ---
@@ -985,10 +997,17 @@ app.get('/graphs', async (req, res) => {
 // on first query (see ensureGraphMaterialized).
 app.post('/graphs', async (req, res) => {
     try {
+        await requireSuperuser(req);
         // Validate + build first so malformed bodies fail with 400 before we
         // touch the registry.
         const sql = buildCreatePropertyGraphSql(req.body);
         const name = req.body.name;
+        const referenced = [
+            ...(req.body.vertexTables || []).map(v => (typeof v === 'string' ? v : v?.name)),
+            ...(req.body.edgeTables || []).flatMap(e => [e?.name, e?.source, e?.destination]),
+        ];
+        const system = referenced.find(isSystemTableName);
+        if (system) return res.status(400).json({ success: false, error: `Invalid table "${system}": system tables cannot be used in property graphs` });
 
         await saveGraphDefinition(name, req.body, req.apiKey || null);
 
@@ -999,7 +1018,7 @@ app.post('/graphs', async (req, res) => {
 
         res.json({ success: true, message: `Property graph ${name} created`, sql });
     } catch (error) {
-        const status = /Invalid|must be/.test(error.message) ? 400 : 500;
+        const status = error.statusCode || (/Invalid|must be/.test(error.message) ? 400 : 500);
         res.status(status).json({ success: false, error: error.message });
     }
 });
@@ -1011,13 +1030,14 @@ app.delete('/graphs/:graphName', async (req, res) => {
         if (!isSafeIdentifier(graphName)) {
             return res.status(400).json({ success: false, error: 'Invalid graph name' });
         }
+        await requireSuperuser(req);
         await deleteGraphDefinition(graphName);
         // Drop the materialized catalog entry on the primary instance too. The
         // user instance simply stops being able to re-materialize it.
         try { await execute(`DROP PROPERTY GRAPH ${graphName}`); } catch (_) { /* not materialized here */ }
         res.json({ success: true, message: `Property graph ${graphName} dropped` });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
 });
 
@@ -1028,6 +1048,10 @@ app.post('/graphs/:graphName/query', async (req, res) => {
         if (!isSafeIdentifier(graphName)) {
             return res.status(400).json({ success: false, error: 'Invalid graph name' });
         }
+
+        // Graph query fragments (match/where/columns/graphTable) can embed
+        // subqueries over any table, so this is user-supplied SQL.
+        await requireSuperuser(req);
 
         const body = req.body || {};
         const { match, where, columns, graphTable, limit } = body;
@@ -1126,6 +1150,11 @@ app.post('/kafka-sink', async (req, res) => {
         return res.status(400).json({
             error: `Invalid topic "${topic}". Must match ${KAFKA_TOPIC_IDENTIFIER_RE} (start with a letter or underscore, contain only letters/digits/underscore, max 63 chars).`
         });
+    }
+    // The topic names the target table; "_"-prefixed names are reserved for
+    // system tables and must not be created or written through this endpoint.
+    if (isSystemTableName(topic)) {
+        return res.status(400).json({ error: `Invalid topic "${topic}": names starting with "_" are reserved for system tables.` });
     }
 
     const data = req.body;
@@ -1543,8 +1572,8 @@ app.post(['/upload', '/upload/:tableName'], async (req, res) => {
     if (data.length === 0) {
         return res.json({ success: true, message: 'No data to insert' });
     }
-    if (data.length > MAX_BATCH_SIZE) {
-        return res.status(400).json({ success: false, error: `Batch too large. Maximum ${MAX_BATCH_SIZE} rows allowed.` });
+    if (data.length > maxBatchSize()) {
+        return res.status(400).json({ success: false, error: `Batch too large. Maximum ${maxBatchSize()} rows allowed.` });
     }
 
     try {
@@ -1676,8 +1705,13 @@ app.get('/', swaggerUi.setup(swaggerDocument));
 // --- Start Server ---
 app.listen(port, '0.0.0.0', async () => {
     console.log(`ichibi-lake server listening on 0.0.0.0:${port}`);
+    console.log(`[Server] Swagger UI:    ${publicBaseUrl()}/`);
+    console.log(`[Server] Admin console: ${publicBaseUrl()}/console`);
     try {
         await initRbacTables();
+        // Console overrides (e.g. an API_KEYS list edited in the console) must
+        // be in effect before the bootstrap below promotes/re-activates keys.
+        await loadSettingOverrides();
         if (isRbacConfigured()) {
             await bootstrapRbac();
         } else {
@@ -1688,6 +1722,10 @@ app.listen(port, '0.0.0.0', async () => {
         await migrateExistingTables();
         await migrateToAcl();
         await migrateTimestamps();
+        // Admin console: loads setting overrides (applied to process.env) and
+        // starts the retention scheduler. Runs after RBAC/ACL bootstrap so an
+        // API_KEYS override can reconcile against the bootstrapped users.
+        await initConsole();
         // Compact tiny Parquet files left over from high-frequency one-row
         // ingestion. This is often the single biggest win for scan speed.
         await compactDuckLake();

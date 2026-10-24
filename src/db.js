@@ -1,8 +1,10 @@
-import { DuckDBInstance, VARCHAR, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE } from '@duckdb/node-api';
+import { DuckDBInstance, VARCHAR, BIGINT, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE } from '@duckdb/node-api';
 import fs from 'fs/promises';
+import path from 'path';
+import os from 'os';
 import { buildCreatePropertyGraphSql } from './graphs.js';
 
-export { VARCHAR, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE };
+export { VARCHAR, BIGINT, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE };
 
 let instance = null;
 // Promise-based guard: prevents concurrent callers from racing into fromCache()
@@ -102,6 +104,13 @@ async function loadDuckPgq(conn) {
     await enableDuckPgqGrammar(conn);
 }
 
+// Admin-console state (logins, settings incl. the session secret, retention
+// rules, audit log) lives in its own DuckLake catalog, stored in a separate
+// Postgres schema with all rows inlined in Postgres (no Parquet files). Only
+// the primary instance attaches it; the user-query instance, which runs
+// user-supplied SQL, cannot see it.
+export const CONSOLE_CATALOG = 'ichibi_console';
+
 // Configure a fresh in-memory DuckDB instance to act as a DuckLake gateway.
 // Used for both the primary instance (writes + reads) and the isolated user-
 // query instance (read-only ad-hoc SQL) so they share the same setup path.
@@ -168,6 +177,33 @@ async function _attachDuckLake(label) {
     // columns under blocking operators. See DISABLED_OPTIMIZERS above for the full
     // rationale; applied instance-wide so every connection inherits it.
     await applyOptimizerWorkaround(conn, label);
+
+    if (label === 'user') {
+        // This instance runs user-supplied SQL. Lock it down once attached:
+        // 1. Drop the DuckLake secret; it holds the Postgres connection string
+        //    (with password) and is not needed after ATTACH.
+        // 2. Restrict file access to the lake's data directory and disable all
+        //    other external access (no read_text('/etc/...'), no reading the
+        //    BLOB directory, no new network connections). This cannot be
+        //    re-enabled while the instance runs.
+        // The connection string remains visible to DuckDB introspection
+        // functions, which src/sql-guard.js rejects.
+        await conn.run('DROP SECRET __default_ducklake;');
+        // The extension directory (binaries only) stays readable so LOAD and
+        // duckdb_extensions() keep working on new connections.
+        const extResult = await conn.run(`SELECT current_setting('extension_directory')`);
+        const extSetting = String((await extResult.getRows())[0]?.[0] || '');
+        const extensionDir = path.resolve(extSetting || path.join(os.homedir(), '.duckdb', 'extensions')) + path.sep;
+        const allowed = [path.resolve(dataPath) + path.sep, extensionDir];
+        const list = allowed.map(d => `'${d.replace(/'/g, "''")}'`).join(', ');
+        await conn.run(`SET GLOBAL allowed_directories = [${list}];`);
+        await conn.run('SET GLOBAL enable_external_access = false;');
+        console.log(`[DB:${label}] External access disabled (file access limited to ${allowed.join(', ')}).`);
+    } else {
+        const consolePath = path.join(dataPath, '_console') + path.sep;
+        try { await fs.mkdir(consolePath, { recursive: true }); } catch (e) { /* attach reports problems */ }
+        await conn.run(`ATTACH 'ducklake:' AS ${CONSOLE_CATALOG} (DATA_PATH '${consolePath.replace(/'/g, "''")}', METADATA_SCHEMA '${CONSOLE_CATALOG}', AUTOMATIC_MIGRATION true, DATA_INLINING_ROW_LIMIT 1000000);`);
+    }
 
     console.log(`[DB:${label}] Successfully attached to remote DuckLake database '${pgDb}'.`);
 
@@ -459,14 +495,15 @@ async function getUserConnection() {
     return conn;
 }
 
-const USER_QUERY_CONCURRENCY = Math.max(1, parseInt(process.env.USER_QUERY_CONCURRENCY || '4', 10));
-const USER_QUERY_TIMEOUT_MS = Math.max(1000, parseInt(process.env.USER_QUERY_TIMEOUT_MS || '30000', 10));
+// Read on use so the admin console can change them live.
+const userQueryConcurrency = () => Math.max(1, parseInt(process.env.USER_QUERY_CONCURRENCY || '4', 10) || 4);
+const userQueryTimeoutMs = () => Math.max(1000, parseInt(process.env.USER_QUERY_TIMEOUT_MS || '30000', 10) || 30000);
 
 let userActive = 0;
 const userQueue = [];
 
 function acquireUserSlot() {
-    if (userActive < USER_QUERY_CONCURRENCY) {
+    if (userActive < userQueryConcurrency()) {
         userActive++;
         return Promise.resolve();
     }
@@ -486,7 +523,7 @@ function releaseUserSlot() {
  * interrupted on a best-effort basis (DuckDB does not guarantee that
  * every operator honours interruption immediately).
  */
-export async function executeUserSql(sql, { timeoutMs = USER_QUERY_TIMEOUT_MS, prepare = null } = {}) {
+export async function executeUserSql(sql, { timeoutMs = userQueryTimeoutMs(), prepare = null } = {}) {
     await acquireUserSlot();
     let conn;
     let timer;

@@ -38,7 +38,6 @@ export default async function run() {
 
     const apiKeyInput = await prompt('API key(s), comma-separated (blank = generate one)', '');
     const apiKeys     = apiKeyInput.trim() || `ICHIBI_LAKE_${randomToken(16)}`;
-    const sqlRO       = await promptYN('Enforce SQL_READ_ONLY on user-supplied SQL endpoints?', true);
 
     const outDir = await ensureOutputDir(`option5-federation-${selfName}`);
 
@@ -89,7 +88,6 @@ services:
       - USE_FILESYSTEM_BLOBS=1
       - BLOBS_PATH=/app/blobs
       - API_KEYS=\${API_KEYS}
-      - SQL_READ_ONLY=\${SQL_READ_ONLY:-true}
       - PORT=3000
       # Consumed by the db-federation-patch.md changes in src/db.js
       - DUCKLAKE_LOCAL_NAME=${selfName}
@@ -117,7 +115,6 @@ networks:
     const envBody = renderEnv(
         {
             API_KEYS:       apiKeys,
-            SQL_READ_ONLY:  String(sqlRO),
             DUCKLAKE_PEERS: peersEnv,
         },
         {
@@ -198,7 +195,7 @@ ${peers.map(p => `SELECT * FROM ${p.name}.main.orders`).join('\nUNION ALL\n') ||
 
 ## Notes
 
-- Set \`SQL_READ_ONLY=true\` (default) to prevent accidental cross-lake DML.
+- User-supplied SQL is always read-only, which prevents accidental cross-lake DML.
 - Peers do NOT need to share an API key — the cross-attach is over the raw
   Postgres protocol (catalog only). Parquet data files remain local to each
   host; remote reads will fail unless those files are also reachable.

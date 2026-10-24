@@ -40,7 +40,7 @@ async function testBlobs() {
     // never collides with test.js on the shared 'ichibi_table' (test.js seeds
     // numeric ids there; this suite needs VARCHAR ids). Using the explicit
     // /tables/:tableName/... variants keeps identical coverage without relying
-    // on a DROP that SQL_READ_ONLY=true silently blocks.
+    // on a DROP, which the always-on read-only SQL guard blocks.
     const defaultTable = `blob_default_test_${Date.now()}`;
 
     const defaultTestId = `default_blob_${Date.now()}`;
