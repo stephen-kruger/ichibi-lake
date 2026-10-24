@@ -144,3 +144,5 @@ vite.config.ts.timestamp-*
 
 # data directory
 docker/data/
+
+.continue
