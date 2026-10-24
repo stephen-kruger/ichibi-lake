@@ -1,8 +1,8 @@
-# ichibi-lake Gateway v1.6.18
+# ichibi-lake Gateway v1.6.18.1
 
 ![ichibi-lake](graphics/ichibi-lake-2.jpg "iChibi Lake")
 
-A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schema evolution, Kafka integration, GraphQL, and graph (PGQ) query support — ready for AI/ML data pipelines.
+A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schema evolution, Kafka integration, GraphQL, graph (PGQ) query support, role-based access control and a built-in admin console (data browser, retention/pruning, settings) — ready for AI/ML data pipelines.
 
 ---
 
@@ -42,9 +42,9 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [9.1 JSON Upload](#91-json-upload)
   - [9.2 Raw SQL Query](#92-raw-sql-query)
 - [10. Kafka Integration](#10-kafka-integration)
-  - [10.1 HTTP Sink](#101-http-sink)
+  - [10.1 HTTP Sink](#101-http-sink-post-kafka-sink)
   - [10.2 Internal Background Consumer](#102-internal-background-consumer)
-  - [10.3 SSE Subscription](#103-sse-subscription)
+  - [10.3 SSE Subscription](#103-sse-subscription-get-kafka-subscribetopicname)
 - [11. GraphQL](#11-graphql)
 - [12. Graph Queries (SQL/PGQ)](#12-graph-queries-sqlpgq)
   - [12.1 Architecture: Durable Registry & Lazy Materialization](#121-architecture-durable-registry--lazy-materialization)
@@ -100,13 +100,14 @@ Full instructions, including adding logins and resetting a forgotten password, a
 ichibi-lake is a Node.js gateway that wraps a **DuckDB** in-memory instance backed by the **DuckLake** storage extension. Parquet data files are persisted to disk; table metadata (schemas, ACLs, and graph definitions) lives in a companion **PostgreSQL** database. BLOBs can be stored as standalone files or inline in Parquet.
 
 ```
-Client → REST/GraphQL → ichibi-lake gateway → DuckDB (DuckLake) → Parquet files
-                              │                       └── PostgreSQL (metadata)
-                              ├── Kafka (sink / SSE / consumer)
-                              └── Filesystem (blobs)
+Client → REST/GraphQL ──┐
+Browser → /console ─────┼─► ichibi-lake gateway ─► DuckDB (DuckLake) ─► Parquet files
+                        │          │                       └── PostgreSQL (metadata)
+                        │          ├── Kafka (sink / SSE / consumer)
+                        │          └── Filesystem (blobs)
 ```
 
-The gateway maintains two classes of DuckDB connection: a **primary** pool for DDL, ingestion, and registry writes, and an isolated **user-query** instance for read-only SQL and graph traversals so heavy queries cannot stall ingestion. Durable state (table data, ACLs, RBAC, and **property-graph definitions**) is persisted through DuckLake so it survives restarts and is shared across instances. Property graphs are an exception that DuckPGQ stores only in the in-memory catalog of whichever DuckDB instance created them — ichibi-lake works around this with a **durable graph registry** (see [§12.1](#121-architecture-durable-registry--lazy-materialization)).
+The gateway runs two DuckDB instances: a **primary** instance (connection pool) for REST reads and writes, ingestion, DDL, the admin console and registry writes, and an isolated, locked-down **user-query** instance that runs user-supplied SQL and graph queries (superuser-only, read-only, no file or network access outside the lake; see [§3.5](#35-sql-enforcement)), so heavy queries cannot stall ingestion. Durable state (table data, ACLs, RBAC, and **property-graph definitions**) is persisted through DuckLake so it survives restarts and is shared across instances. Admin-console state (logins, settings, pruning rules, audit log) lives in a separate DuckLake catalog, `ichibi_console`, that only the primary instance attaches. Property graphs are an exception that DuckPGQ stores only in the in-memory catalog of whichever DuckDB instance created them — ichibi-lake works around this with a **durable graph registry** (see [§12.1](#121-architecture-durable-registry--lazy-materialization)).
 
 ---
 
@@ -118,7 +119,7 @@ The gateway maintains two classes of DuckDB connection: a **primary** pool for D
 | :--- | :--- | :--- |
 | `PORT` | `3000` | Port the Node gateway listens on |
 | `JSON_BODY_LIMIT` | `50mb` | Max JSON request body size (e.g. `2gb`, `50mb`) |
-| `MAX_BATCH_SIZE` | `10000` | Max rows per `/upload` request; prevents OOM |
+| `MAX_BATCH_SIZE` | `10000` | Max rows per `/upload` request; prevents OOM. Also editable live in the console. |
 | `NODE_ENV` | `production` | Node environment |
 
 ### 3.2 DuckLake (Postgres Metadata)
@@ -132,13 +133,15 @@ The gateway maintains two classes of DuckDB connection: a **primary** pool for D
 | `DUCKLAKE_PG_DB` | `ducklake` | Postgres database name |
 | `DUCKLAKE_DATA_PATH` | `data_files/` | Directory for DuckLake Parquet data files |
 | `DISABLE_DUCKPGQ` | *(unset)* | Set to `1` to disable the DuckPGQ graph extension |
-| `DUCKDB_ALLOW_COMMUNITY_EXTENSIONS` | `1` | Allow community DuckDB extensions (DuckPGQ) |
+| `DISABLE_DUCKLAKE_COMPACTION` | *(unset)* | Set to `1` to skip DuckLake maintenance (file compaction, snapshot expiry, file cleanup) at startup |
+
+The DuckDB extensions the gateway needs (`ducklake`, `postgres`, `duckpgq`) are pre-installed in the Docker image. When running natively they are downloaded on first start (or run `node scripts/install-extensions.js` once).
 
 ### 3.3 Authentication
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `API_KEYS` | — | Comma-separated list of valid API keys (preferred). Each request must pass one via the `x-api-key` header. |
+| `API_KEYS` | — | Comma-separated list of valid API keys (preferred). Each request must pass one via the `x-api-key` header. When no RBAC variables are set, these keys are promoted to RBAC superusers at startup. Also manageable on the console's **API Keys** page. |
 | `API_KEY` | — | Single API key (fallback if `API_KEYS` is unset) |
 
 **RBAC (Role-Based Access Control) — optional, adds role-based authorization on top of API keys:**
@@ -175,12 +178,11 @@ User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endp
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PRIMARY_POOL_SIZE` | `4` | Number of warm DuckDB connections kept in the pool |
-| `PARQUET_ROW_GROUP_SIZE` | `100000` | Target rows per Parquet row group |
-| `USER_QUERY_CONCURRENCY` | `4` | Max concurrent user SQL queries |
-| `USER_QUERY_TIMEOUT_MS` | `30000` | Timeout for user SQL queries (ms) |
+| `USER_QUERY_CONCURRENCY` | `4` | Max concurrent user SQL / graph queries. Also editable live in the console. |
+| `USER_QUERY_TIMEOUT_MS` | `30000` | Timeout for user SQL / graph queries (ms). Also editable live in the console. |
 | `COLUMN_CACHE_TTL_MS` | `60000` | Per-table column schema cache TTL (ms) |
 | `ACL_CACHE_TTL_MS` | `60000` | ACL cache TTL (ms) |
-| `DEFAULT_PARTITION_KEY` | `created` | Column(s) to partition new tables by. Comma-separated for multi-column partitioning. Set to `none` to disable. |
+| `DEFAULT_PARTITION_KEY` | `created` | Column(s) to partition new tables by. Comma-separated for multi-column partitioning. Set to `none` to disable. Also editable live in the console. |
 
 ### 3.7 Kafka Integration
 
@@ -189,10 +191,10 @@ User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endp
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `KAFKA_BROKERS` | — | Comma-separated broker list (e.g. `kafka:9092`). Leave empty to disable. |
-| `KAFKA_CLIENT_ID` | `ducklake-consumer` | Kafka consumer client ID |
+| `KAFKA_CLIENT_ID` | `ducklake-consumer` | Client ID for the consumer. The same variable also sets the producer's client ID (see below), so one value applies to both. |
 | `KAFKA_GROUP_ID` | `ducklake-ingestion-group` | Consumer group ID |
 | `KAFKA_TOPIC_REGEX` | `.*` | Regex to match topics for auto-ingestion |
-| `KAFKA_BATCH_SIZE` | `100` | Max messages per batch |
+| `KAFKA_BATCH_SIZE` | `100` | Max messages per consumer batch (also caps the producer's messages per batch) |
 | `KAFKA_BATCH_TIMEOUT_MS` | `5000` | Max wait to complete a batch (ms) |
 | `KAFKA_METADATA_MAX_AGE_MS` | `10000` | Metadata refresh interval (ms) |
 
@@ -200,7 +202,7 @@ User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endp
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `KAFKA_CLIENT_ID` | `ichibi-lake-sse` | Producer client ID |
+| `KAFKA_CLIENT_ID` | `ichibi-lake-sse` | Producer client ID when the variable is unset (one variable for both; see above) |
 | `KAFKA_MAX_MESSAGE_BYTES` | `950000` | Max size of a single produced message |
 | `KAFKA_MAX_BATCH_BYTES` | `950000` | Max batch size for produced messages |
 | `KAFKA_MAX_REQUEST_SIZE` | `10485760` | Max produce request size (should match broker's `KAFKA_MESSAGE_MAX_BYTES`) |
@@ -214,18 +216,16 @@ User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endp
 | `KAFKA_LOG_RETENTION_BYTES` | `1073741824` | Kafka log retention in bytes per partition |
 | `KAFKA_LOG_SEGMENT_BYTES` | `268435456` | Kafka segment size before roll |
 | `KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS` | `60000` | Kafka retention check interval |
-| `DOCKER_HOST_UID` | `1000` | Host UID for permission mapping (`.env.example`) |
-| `DOCKER_HOST_GID` | `1000` | Host GID for permission mapping (`.env.example`) |
 
 ### 3.9 Admin Console
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `CONSOLE_SETUP_TOKEN` | *(generated)* | One-time code required to create the first console admin. When unset, a random code is printed to the gateway log on startup while no console login exists. |
-| `CONSOLE_SESSION_SECRET` | *(generated)* | HMAC key for console session cookies. When unset, one is generated and stored in DuckLake (shared by all instances). |
+| `CONSOLE_SESSION_SECRET` | *(generated)* | HMAC key for console session cookies. When unset, one is generated and stored in the console catalog (shared by all instances). |
 | `CONSOLE_SESSION_TTL_HOURS` | `12` | Console session lifetime. Also editable in the console. |
 | `PUBLIC_URL` | `http://localhost:<port>` | Externally reachable base URL, used in startup log messages (Swagger UI and admin console links). Docker Compose defaults it to the published host port (`http://localhost:3333`); set it to your real address (e.g. `https://lake.example.com`) when deployed. |
-| `RETENTION_INTERVAL_MINUTES` | `60` | How often retention (auto-prune) rules run. Also editable in the console. |
+| `SNAPSHOT_RETENTION_DAYS` | *(unset)* | Days of DuckLake snapshot history (time travel) to keep. When set, startup maintenance and pruning rules with *reclaim storage* expire older snapshots and delete unreferenced files, freeing the space used by deleted rows. Unset: snapshots are never expired. Also editable in the console. |
 
 ---
 
@@ -264,7 +264,7 @@ The compose stack starts three services:
 ```
 docker/data/
 ├── blobs/       # BLOB files (when USE_FILESYSTEM_BLOBS=1)
-├── ducklake/    # Parquet data files
+├── ducklake/    # Parquet data files (console data is stored in Postgres, schema ichibi_console)
 ├── postgres/    # Postgres data directory
 └── kafka/       # Kafka KRaft logs
 ```
@@ -293,7 +293,8 @@ export DUCKLAKE_PG_USER=postgres
 export DUCKLAKE_PG_PASSWORD=postgres
 export DUCKLAKE_PG_DB=ducklake
 export DUCKLAKE_DATA_PATH=./data_files
-export DUCKDB_ALLOW_COMMUNITY_EXTENSIONS=1
+# Optional: download the DuckDB extensions now instead of on first start
+node scripts/install-extensions.js
 
 # 3. Launch
 node src/index.js
@@ -317,6 +318,8 @@ pm2 startup
 - **Kafka retention** — Set `KAFKA_LOG_RETENTION_HOURS` and `KAFKA_LOG_RETENTION_BYTES` to bound disk usage
 - **Use a reverse proxy** — Place behind nginx, Caddy, or a cloud LB for TLS termination and rate limiting
 - **Claim the admin console** — Complete first-run setup at `/console` right after deploying, and serve it over HTTPS (session cookies are marked `Secure` when the request is HTTPS)
+- **Lock down Postgres and Kafka ports** — `compose.yaml` publishes Postgres on host port `5432` with the default `postgres`/`postgres` login, and Kafka on `9092`/`9094`. Anyone who can reach them can read or change the metadata catalog directly. Change the password (it is set in `compose.yaml` as both `POSTGRES_PASSWORD` for the `db` service and `DUCKLAKE_PG_PASSWORD` for the `app` service; keep them equal), and bind the ports to `127.0.0.1` or remove them if nothing outside Docker needs them
+- **Decide on snapshot retention if you prune data** — set `SNAPSHOT_RETENTION_DAYS` so deleted rows actually free storage (see [§13.2](#132-features))
 
 ### 4.4 SuperLake Wizard
 
@@ -330,9 +333,13 @@ Interactive options:
 
 | Option | Description |
 | :--- | :--- |
-| **SSHFS mount** | Mount a remote DuckLake data directory over SSHFS for a shared-nothing multi-node setup |
-| **S3 / MinIO** | Configure DuckDB's `httpfs` with S3-compatible storage (MinIO, AWS S3, etc.) |
-| **Federation** | Connect multiple DuckLake instances as peers using `ATTACH` for cross-instance queries |
+| **Single-host scale-out** | Several gateway containers on one host sharing one data directory and one Postgres |
+| **Multi-host NFS** | One storage host exports the data directory over NFS; gateway hosts mount it |
+| **Multi-host MinIO** | Self-hosted S3-compatible storage on your LAN (DuckDB `httpfs`) |
+| **Multi-host SSHFS** | Mount the data directory over SSH (FUSE), no extra services |
+| **Federation** | Separate lakes per host, cross-attached as peers for cross-lake queries |
+
+The wizard writes `compose.yaml`, `.env` and a README for the chosen layout.
 
 ---
 
@@ -346,6 +353,8 @@ Existing data is migrated **automatically** on first start: the gateway attaches
   ```
 - **Stop every old instance first.** Do not run old and new gateways against the same catalog (e.g. a rolling deploy) — old instances fail once the catalog is migrated.
 - **First start may be slower** on large catalogs, since migration runs during startup before requests are served.
+- **Admin console data moves to its own catalog.** Console logins, settings and the audit log from earlier releases are moved from the main catalog to `ichibi_console` on first start, and old single-table retention rules are converted into pruning rules (`RETENTION_INTERVAL_MINUTES` becomes each rule's schedule; the setting is gone). Console logins and passwords keep working.
+- **The bundled DuckDB web UI was removed** (it had no authentication). Use the console's **Tables & Data** page instead.
 - **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
 - **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
 - **Rebuild the image** (`docker compose up -d --build --remove-orphans`; `--remove-orphans` also removes the retired `duckdb-ui` container from older releases). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
@@ -354,7 +363,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 
 ### 5.1 API Key Authentication
 
-All API endpoints require a valid API key passed as an HTTP header:
+All API endpoints require a valid API key passed as an HTTP header. The exceptions are the Swagger UI (`/`), the OpenAPI spec (`/swagger.yaml`) and the admin console (`/console`), which has its own logins (see [§13](#13-admin-console)):
 
 - **Header**: `x-api-key`
 - **Example**: `x-api-key: ICHIBI_LAKE_TEST_7a96c3e2-b1fe-4705-9064-fc1882674b13`
@@ -362,7 +371,7 @@ All API endpoints require a valid API key passed as an HTTP header:
 
 Configure valid keys via one or both of the following mechanisms (they are **complementary**, not exclusive):
 
-1. **Legacy `API_KEYS` / `API_KEY` env vars** — keys from these environment variables are accepted at authentication time and automatically promoted to **superusers** in the RBAC tables on startup.
+1. **Legacy `API_KEYS` / `API_KEY` env vars** — keys from these environment variables are accepted at authentication time. When **no** RBAC variables are set, they are also promoted to **superusers** in the RBAC tables on startup.
 2. **RBAC environment variables** (`RBAC_SUPERUSERS`, `RBAC_USERS`, etc.) — see [§5.3](#53-role-based-access-control-rbac).
 
 The authentication flow is: **RBAC tables first**, then fall back to the legacy `API_KEYS` env-var set. This means admin-created RBAC users can authenticate even without being listed in `API_KEYS`.
@@ -373,7 +382,7 @@ Each table has an ACL with two roles:
 
 | Role | Permission | Allowed Operations |
 | :--- | :--- | :--- |
-| **Owner** | Read + Write | Query, upload, blob, patch, delete, manage ACL |
+| **Owner** | Read + Write | Read rows, upload, blob, patch, delete, manage ACL |
 | **Reader** | Read only | `GET /tables/:name`, `GET /tables/:name/schema`, blob downloads |
 | *(none)* | No access | HTTP 403 |
 
@@ -428,7 +437,7 @@ The RBAC admin API is mounted at `/admin/` and requires superuser authentication
 #### Coexistence with Legacy `API_KEYS`
 
 - `API_KEYS` and RBAC are **complementary**. You can use one, the other, or both.
-- On startup, `legacyBootstrap()` promotes all keys from the `API_KEYS` env var to **superusers** in RBAC tables. This ensures existing deployments keep working without configuration changes.
+- At startup the gateway runs **one** bootstrap: if `RBAC_SUPERUSERS` or `RBAC_USERS` is set, `bootstrapRbac()` syncs those users; otherwise `legacyBootstrap()` promotes every `API_KEYS` key to **superuser**. Existing single-key deployments keep working without configuration changes.
 - The authentication middleware tries RBAC first (`isValidApiKey()`), then falls back to the legacy `API_KEYS` env-var `Set`. Keys from either source are accepted.
 - ACL data access functions (`checkReadAccess`, `checkWriteAccess`) delegate to RBAC first; if RBAC returns `false` or the RBAC tables are not initialized, they fall through to the legacy `_table_acls` system for backward compatibility.
 
@@ -455,17 +464,17 @@ RBAC_TABLE_PERMISSIONS='[
 ]'
 ```
 
-Users created via env vars are also manageable through the admin API at runtime.
+Users defined in env vars are re-applied (re-activated, roles re-added) on every restart, so change them in the environment; the admin console shows them read-only. Users created through the admin API or the console are fully manageable at runtime.
 
 #### Example: Hybrid Mode
 
 ```sh
-API_KEYS="sk-deploy-key"                          # becomes a superuser
-RBAC_SUPERUSERS="sk-admin-01"                     # another superuser
+API_KEYS="sk-deploy-key"                          # authenticates, but is NOT a superuser here
+RBAC_SUPERUSERS="sk-admin-01"                     # superuser
 RBAC_USERS='[{"apiKey":"sk-writer-01","name":"Writer","roles":["writer"]}]'
 ```
 
-All three keys are valid. `sk-deploy-key` and `sk-admin-01` are superusers; `sk-writer-01` can write to all tables by default.
+All three keys authenticate. Because RBAC variables are set, the legacy bootstrap does not run: `sk-admin-01` is a superuser and `sk-writer-01` can write to all tables, but `sk-deploy-key` has no RBAC role. It can only reach tables whose ACL lists it (for example tables it created) and cannot use superuser-only features such as `/query`. To make it a superuser, add it to `RBAC_SUPERUSERS` as well.
 
 ### 5.4 ACL Management Endpoints
 
@@ -577,7 +586,7 @@ Query and browse the data lake with standard REST patterns.
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/tables` | List all tables (requires at least read access) |
+| `GET` | `/tables` | List the tables the caller can read (system tables are never listed) |
 | `GET` | `/tables/:tableName/schema` | Get column names and types |
 | `GET` | `/tables/:tableName` | Query table data with filters, sorting, pagination |
 
@@ -585,12 +594,15 @@ Query and browse the data lake with standard REST patterns.
 
 | Parameter | Example | Description |
 | :--- | :--- | :--- |
-| `?owner=marwan` | `?owner=marwan` | Filter by column value (equality) |
-| `?limit=100` | `?limit=100` | Max rows (default: all) |
-| `?sort=-created_at` | `?sort=-created_at` | Sort by column; prefix `-` for descending |
-| `?offset=50` | `?offset=50` | Pagination offset |
+| `?<column>=<value>` | `?owner=marwan` | Filter by column value (equality); repeat for several columns |
+| `?limit=` | `?limit=100` | Max rows (default: **50**) |
+| `?sort=` | `?sort=-created_at` | Sort by column; prefix `-` for descending |
+| `?offset=` | `?offset=50` | Pagination offset |
+| `?after=` | `?after=2024-06-01T10:00:00` | Keyset pagination: rows after this value of the `sort` column (requires `sort`). Faster than `offset` for deep pages |
 
-Results are scoped by ACL — only tables the caller has read access to are visible.
+*Response:* `{ "success": true, "tableName": "...", "rowCount": 10, "rows": [...], "nextCursor": "..." }`. With `?sort=`, `nextCursor` is the last row's sort value; pass it as `?after=` to fetch the next page.
+
+Access is checked per table (RBAC role, per-table permission, then ACL); system tables (`_`-prefixed) return 404 for every key.
 
 ```sh
 curl -H "x-api-key: YOUR_KEY" \
@@ -608,7 +620,7 @@ curl -H "x-api-key: YOUR_KEY" \
 | `POST` | `/upload` | Upload JSON array to `ichibi_table` |
 | `POST` | `/upload/:tableName` | Upload JSON array to a specific table |
 
-New tables are created automatically with type inference; the caller is registered as an ACL owner.
+New tables are created automatically with type inference; the caller is registered as an ACL owner. New columns in later uploads are added automatically (schema evolution). Batches larger than `MAX_BATCH_SIZE` are rejected, and table names starting with `_` (reserved for system tables) return 404.
 
 ```sh
 curl -X POST "http://ichibi-lake:3333/upload/user_stats" \
@@ -626,7 +638,9 @@ curl -X POST "http://ichibi-lake:3333/query" \
   -d '{"sql": "SELECT category, count(*) FROM ichibi_table GROUP BY 1"}'
 ```
 
-User-supplied SQL is always read-only: DDL/DML statements are rejected with HTTP 403 (see [§3.5](#35-sql-enforcement)).
+Requires a **superuser** API key; other keys get HTTP 403. User-supplied SQL is always read-only: DDL/DML statements and connection-revealing functions are rejected with HTTP 403 (see [§3.5](#35-sql-enforcement)).
+
+*Response:* `{ "success": true, "rows": [...] }`
 
 ---
 
@@ -634,7 +648,7 @@ User-supplied SQL is always read-only: DDL/DML statements are rejected with HTTP
 
 ### 10.1 HTTP Sink (`POST /kafka-sink`)
 
-Designed for Kafka Connect. Automatically flattens `.value` schemas. New tables are registered under the `kafka-internal` ACL key.
+Designed for Kafka Connect: accepts an array of Kafka records, flattens each record's `value` into columns (plus `_ingest_timestamp` and `_kafka_key`), and appends them to a table named after the topic (creating it, and evolving its schema, as needed). The topic is taken from the `X-Kafka-Topic` header, else the `?topic=` query parameter, else `ichibi_table`. The caller's API key becomes the ACL owner of tables it creates; topic names starting with `_` are rejected with HTTP 400.
 
 ```sh
 curl -X POST "http://ichibi-lake:3333/kafka-sink" \
@@ -645,7 +659,7 @@ curl -X POST "http://ichibi-lake:3333/kafka-sink" \
 
 ### 10.2 Internal Background Consumer
 
-Enable by setting `KAFKA_BROKERS` in the environment. The consumer automatically ingests events from matching Kafka topics into DuckDB tables (one table per topic).
+Enable by setting `KAFKA_BROKERS` in the environment. The consumer automatically ingests events from topics matching `KAFKA_TOPIC_REGEX` into DuckDB tables (one table per topic, registered under the `kafka-internal` ACL key). Kafka's internal `__` topics are never subscribed, and topics whose table name would start with `_` are skipped.
 
 Configure via environment variables in [§3.7](#37-kafka-integration).
 
@@ -668,7 +682,7 @@ data: {"topic":"my-topic","partition":0,"offset":"42","key":"mykey","value":"{\"
 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
-| `?groupId=` | `ichibi-lake-sse-<sanitized-api-key>` | Override consumer group |
+| `?groupId=` | `ichibi-lake-sse-<sanitized-api-key>-<random>` | Consumer group. By default each connection gets its own group, so concurrent subscribers do not trigger rebalances; pass a fixed value to share delivery |
 | `?since=` | *(all data)* | Publish DuckDB rows newer than this timestamp before subscribing. Supports absolute ISO 8601 (`2024-06-09T10:00:00Z`), relative duration (`5m`, `1h`, `2d`), or plain number in minutes (`5`). |
 | `?sinceColumn=` | `updated` | Column name to filter `?since=` on |
 
@@ -676,17 +690,21 @@ data: {"topic":"my-topic","partition":0,"offset":"42","key":"mykey","value":"{\"
 
 ## 11. GraphQL
 
-A GraphQL endpoint is available at `/graphql` with a dynamic schema built from DuckDB tables. Each table exposes query fields with filtering, sorting, and pagination. An embedded `sql` resolver allows raw DuckDB SQL within GraphQL queries.
+A GraphQL endpoint is available at `/graphql` (`GET` and `POST`, via `graphql-http`) with two queries:
 
-```graphql
-{
-  ichibi_table(limit: 5, where: { owner: "marwan" }, orderBy: { created_at: DESC }) {
-    id
-    owner
-    created_at
-  }
-}
+| Query | Returns | Access |
+| :--- | :--- | :--- |
+| `tables` | Names of user tables (system tables are hidden) | Any valid API key |
+| `sql(query: String!)` | Rows of a read-only SQL query, as JSON | **Superuser** keys only, with the same rules as `POST /query` ([§3.5](#35-sql-enforcement)) |
+
+```sh
+curl -X POST "http://ichibi-lake:3333/graphql" \
+  -H "x-api-key: YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ tables sql(query: \"SELECT count(*) AS n FROM ichibi_table\") }"}'
 ```
+
+*Response:* `{ "data": { "tables": ["ichibi_table", ...], "sql": [{ "n": "42" }] } }`. Errors (for example a non-superuser calling `sql`) are returned in the standard GraphQL `errors` array.
 
 ---
 
@@ -696,12 +714,14 @@ ichibi-lake supports graph property queries via the **DuckPGQ** community extens
 
 > **Compatibility:** The gateway is pinned to **DuckDB 2.0.0** (`@duckdb/node-api` 2.0.0-r.1), which has a matching DuckPGQ community build. DuckDB 2.0 requires grammar extensions to be enabled per session, so every gateway connection runs `SET active_grammar_extensions = ['duckpgq']` after `LOAD duckpgq`. If you bump DuckDB to a version without a DuckPGQ build, the extension will be unavailable and graph endpoints return an error indicating DuckPGQ is not loaded.
 
-| Method | Endpoint | Description |
-| :--- | :--- | :--- |
-| `POST` | `/graphs` | Create (or replace) a named graph from table relationships |
-| `GET` | `/graphs` | List all registered graphs with their definitions |
-| `DELETE` | `/graphs/:graphName` | Drop a graph and remove its registration |
-| `POST` | `/graphs/:graphName/query` | Execute a SQL/PGQ pattern query against the graph |
+| Method | Endpoint | Description | Access |
+| :--- | :--- | :--- | :--- |
+| `POST` | `/graphs` | Create (or replace) a named graph from table relationships | Superuser |
+| `GET` | `/graphs` | List all registered graphs with their definitions | Any valid key |
+| `DELETE` | `/graphs/:graphName` | Drop a graph and remove its registration | Superuser |
+| `POST` | `/graphs/:graphName/query` | Execute a SQL/PGQ pattern query against the graph | Superuser |
+
+Creating, deleting and querying graphs is superuser-only because query fragments can contain subqueries over any table ([§3.5](#35-sql-enforcement)). System tables (`_`-prefixed) cannot be used in graph definitions.
 
 ### 12.1 Architecture: Durable Registry & Lazy Materialization
 
@@ -745,7 +765,7 @@ Each `edgeTables` entry is an object:
 | `destinationRef` | string | Referenced column on the destination table (used with `destinationKey`). |
 | `label` | string | Optional edge label. |
 
-All identifiers are validated; malformed bodies return **HTTP 400**. Re-posting an existing `name` replaces the definition.
+All identifiers are validated; malformed bodies, and definitions that reference system tables, return **HTTP 400**. Re-posting an existing `name` replaces the definition. Tables used by a graph cannot be renamed or dropped (nor their columns renamed, dropped or converted) from the admin console until the graph is deleted.
 
 ```sh
 curl -X POST "http://ichibi-lake:3333/graphs" \
@@ -838,7 +858,7 @@ curl -X DELETE "http://ichibi-lake:3333/graphs/social" -H "x-api-key: YOUR_KEY"
 
 ## 13. Admin Console
 
-A password-protected web console at **`/console`** (e.g. [http://localhost:3333/console](http://localhost:3333/console)) for managing the gateway without editing `docker/.env`: a table and data browser with inline editing, API keys, RBAC users, console logins, live settings and date-based data retention.
+A password-protected web console at **`/console`** (e.g. [http://localhost:3333/console](http://localhost:3333/console)) for managing the gateway without editing `docker/.env`: a table and data browser with inline and schema editing, scheduled age- and count-based pruning, API keys, RBAC users, console logins, live settings and an audit log.
 
 ### 13.1 Accessing the Console
 
@@ -857,7 +877,8 @@ The gateway prints the full link at startup:
 [Server] Swagger UI:    http://localhost:3333/
 [Server] Admin console: http://localhost:3333/console
 ```
- It uses its own usernames and passwords; **API keys do not work for the console**, and the console has **no default password**.
+
+The console uses its own usernames and passwords; **API keys do not work for the console**, and the console has **no default password**.
 
 #### First time: create the admin account
 
@@ -900,8 +921,8 @@ An admin adds logins under **Access → Console Logins**: enter a username, an i
 
 | Role | Can do |
 | :--- | :--- |
-| `admin` | Everything: change settings, manage API keys, RBAC users, logins and retention rules |
-| `viewer` | Read-only: browse every page, but cannot change anything |
+| `admin` | Everything: edit data and schemas, manage pruning rules, settings, API keys, RBAC users and logins |
+| `viewer` | Read-only: browse every page, including table data and pruning previews, but cannot change anything |
 
 Share the initial password with the person securely and ask them to change it under **System → My Account**.
 
@@ -951,7 +972,7 @@ The side menu groups pages by area. **Admins** can change everything; **viewers*
 | **RBAC Users** | Create role-based API users (superuser / writer / reader), change roles, activate or deactivate. Users defined by `RBAC_SUPERUSERS` / `RBAC_USERS` in `docker/.env`, or by the `API_KEYS` list, are re-applied on every restart, so they are shown read-only with where to change them |
 | **Console Logins** | Add console users, change roles, reset passwords, delete logins (at least one admin always remains) |
 | **Tables & Data** | Browse every user table with paging, sorting, per-column filters and full-text search; edit cells inline; add and delete rows; view and edit schemas; create, rename and drop tables (see below) |
-| **Retention & Pruning** | Per-table rules that delete rows older than *N* days by a date/timestamp column, with preview and **Run now**. Filesystem BLOB files referenced by pruned rows are deleted too |
+| **Retention & Pruning** | Rules that delete rows older than a given age and/or beyond the newest *N* rows, for tables selected by name or wildcard, each on its own schedule; preview, **Run now**, and a run log with per-table results (see below) |
 | **Security / Ingestion / Query Engine / Storage / Kafka** | Effective configuration, showing each value's source (default, `docker/.env`, or console override) |
 | **Audit Log** | Who changed what, from which IP, across all instances |
 | **My Account** | Change your own password |
@@ -960,7 +981,7 @@ The side menu groups pages by area. **Admins** can change everything; **viewers*
 
 | Editable live | Read-only (set in `docker/.env`, restart required) |
 | :--- | :--- |
-| `API_KEYS` (via the API Keys page), `MAX_BATCH_SIZE`, `DEFAULT_PARTITION_KEY`, `USER_QUERY_TIMEOUT_MS`, `USER_QUERY_CONCURRENCY`, `CONSOLE_SESSION_TTL_HOURS`, `RETENTION_INTERVAL_MINUTES` | Database connection, storage paths, Kafka, `JSON_BODY_LIMIT`, pool sizes, RBAC bootstrap variables |
+| `API_KEYS` (via the API Keys page), `MAX_BATCH_SIZE`, `DEFAULT_PARTITION_KEY`, `USER_QUERY_TIMEOUT_MS`, `USER_QUERY_CONCURRENCY`, `CONSOLE_SESSION_TTL_HOURS`, `SNAPSHOT_RETENTION_DAYS` | Database connection, storage paths, Kafka, `JSON_BODY_LIMIT`, pool sizes, RBAC bootstrap variables |
 
 Resetting a setting removes the override and returns to the `docker/.env` value or the default. Overrides are loaded at startup before the RBAC bootstrap, so an API key list edited in the console (including revoked keys) survives restarts. Revoking an API key also deactivates the RBAC user that the legacy bootstrap created for it; otherwise the key would keep working.
 
@@ -970,13 +991,29 @@ Resetting a setting removes the override and returns to the `docker/.env` value 
 - **Editing** (admins): double-click a cell, or focus it and press **Enter**. **Enter** saves, **Tab** saves and moves to the next cell, **Esc** cancels; **NULL** sets the cell to NULL. Values are converted to the column's type, so an invalid value is rejected with DuckDB's message. If someone else changed the cell since you loaded the page, the edit is refused rather than overwriting their change. A table's `updated` timestamp column is set automatically on edit, and `created`/`updated` on rows added with **Add row**. Scalar types are editable; STRUCT, LIST, MAP and BLOB columns are read-only in the grid. Rows are identified by DuckLake's stable `rowid`, so edits never hit the wrong row even in tables without a primary key.
 - **Schema** (admins): add columns (with an optional default that backfills existing rows), rename columns, change defaults and NULL-ability, change types and drop columns. In the **Edit column** dialog every type can be chosen:
   - **(in place)**: widening changes DuckLake supports natively (e.g. `INTEGER → BIGINT`, `FLOAT → DOUBLE`). Data and column position are unchanged.
-  - **(convert)**: any other change (e.g. `VARCHAR → INTEGER`, `BIGINT → VARCHAR`). The console copies the converted values into a new column, drops the old one, and renames the new one, all in **one transaction**, so nothing changes if any step fails. Row ids are preserved; the column **moves to the end** of the table and **loses its default**; NOT NULL is kept. Use **Check values** first: if any value cannot be converted (e.g. `"n/a"` to INTEGER), the change is refused with a count and examples unless you tick **Set values that cannot be converted to NULL**. Converting is blocked while a property graph references the table, or while a retention rule prunes by the column and the new type is not a date/timestamp.
-- **Tables** (admins): create tables with a column builder, rename them (table ACLs, RBAC table permissions and retention rules follow the new name; API clients using the old name will fail), and drop them, which requires typing the table name. Tables referenced by a property graph cannot be renamed or dropped, and their columns cannot be renamed or dropped, until the graph is removed.
+  - **(convert)**: any other change (e.g. `VARCHAR → INTEGER`, `BIGINT → VARCHAR`). The console copies the converted values into a new column, drops the old one, and renames the new one, all in **one transaction**, so nothing changes if any step fails. Row ids are preserved; the column **moves to the end** of the table and **loses its default**; NOT NULL is kept. Use **Check values** first: if any value cannot be converted (e.g. `"n/a"` to INTEGER), the change is refused with a count and examples unless you tick **Set values that cannot be converted to NULL**. Converting is blocked while a property graph references the table, or while a pruning rule prunes this table by the age of the column and the new type is not a date/timestamp.
+- **Tables** (admins): create tables with a column builder, rename them (table ACLs, RBAC table permissions and pruning rules that name the table exactly follow the new name; wildcard rules simply re-match; API clients using the old name will fail), and drop them, which requires typing the table name. Tables referenced by a property graph cannot be renamed or dropped, and their columns cannot be renamed or dropped, until the graph is removed.
 - **Not shown**: system tables (prefixed `_`, e.g. RBAC users, ACLs, console logins and settings) never appear here; they are managed on their own pages. Tables created from the console have no ACL row, so only RBAC superusers can reach them through the REST API until an ACL is set (`PATCH /tables/:name/acl`).
 
 Every change (cell edits, inserts, deletes, schema and table changes) is recorded in the audit log with the table, row and column, but not the cell values.
 
-**Retention notes.** Rules run every `RETENTION_INTERVAL_MINUTES` on each instance (deletes are idempotent). Deleted rows cannot be recovered except from backups, so use **Preview** first. System tables (prefixed `_`) cannot be pruned. DuckLake records deletions as delete files; the startup maintenance (`compactDuckLake`) reclaims the space.
+**Retention & Pruning.** A rule deletes rows that violate **either** of its criteria, like Kafka's time- and size-based retention:
+
+| Setting | Meaning |
+| :--- | :--- |
+| **Tables** / **Except** | Comma-separated names or wildcards (`*`, `?`), case-insensitive, e.g. `sensor_*, events` except `*_archive`. Matched every run, so tables created later are covered automatically. |
+| **Older than** *N* hours/days, based on a column | Deletes rows whose date/timestamp column is older than the cutoff. Tables without that column (or where it is not a date) are skipped and reported. |
+| **Beyond the newest** *N* rows, ordered by a column | Keeps the newest *N* rows by that column (newest first; ties and the default use insertion order) and deletes the rest. |
+| **Schedule** | Per rule, as a 5-field cron expression in **UTC** (presets: every 15 minutes, hourly, every 6 hours, daily 02:00, weekly, monthly). The editor shows the next run times. |
+| **Safety limit** | Optional. If a run would delete more than this many rows from one table, that table is left untouched and the run is marked failed. |
+| **Reclaim storage** | After deleting, rewrite the affected tables' data files and expire snapshots older than `SNAPSHOT_RETENTION_DAYS`. Without snapshot expiry, deleted rows still occupy storage because older snapshots reference them (time travel). |
+
+- **Preview** (also in the editor) is a dry run showing, per matching table, how many rows each criterion would delete. **Run now** starts a job in the background.
+- **Activity** lists recent jobs (manual or scheduled) with status (`running`, `succeeded`, `partial`, `failed`, `abandoned`), rows deleted and duration; expand a job for per-table counts (by age / by count), skips and errors. The page refreshes itself while a job runs. Job outcomes and rule changes are also written to the audit log. Run history is kept for 90 days.
+- **Multiple gateway instances** each run the scheduler; a due rule is claimed with a token that is re-read after commit, so only one instance runs it. Jobs interrupted by a restart are marked `abandoned`.
+- **Never pruned:** system tables (anything starting with `_`, plus an explicit protected list covering RBAC users and API keys, ACLs, the graph registry and console tables). Console logins, password hashes and settings are in a separate catalog the pruning engine cannot see. Patterns starting with `_` are rejected, and `*` never matches system tables.
+- Filesystem BLOB files referenced by deleted rows are removed too. Deleted rows cannot be recovered except from backups or, within the snapshot retention window, DuckLake time travel.
+- Rules from earlier releases (one table each, with the global `RETENTION_INTERVAL_MINUTES`) are converted automatically: the interval becomes each rule's cron schedule.
 
 ### 13.3 Security Model
 
@@ -986,7 +1023,7 @@ Every change (cell edits, inserts, deletes, schema and table changes) is recorde
 - **Brute force**: logins are throttled per IP and per username (5 failures per 15 minutes), as are setup attempts.
 - **Browser hardening**: strict Content-Security-Policy (no inline script or style), `X-Frame-Options: DENY`, `no-referrer`. API responses are `no-store`.
 - Secrets (API keys, the Postgres password) are masked in the UI. A generated key is shown exactly once.
-- **Console data is isolated.** Console logins, settings (including the session-signing secret), retention rules and the audit log live in a separate DuckLake catalog (`ichibi_console`, Postgres schema `ichibi_console`, rows stored inline in Postgres). Only the primary gateway instance attaches it; user-supplied SQL runs on an instance that cannot see it ([§3.5](#35-sql-enforcement)). Releases before this change kept these tables in the main catalog; they are moved automatically on first start.
+- **Console data is isolated.** Console logins, settings (including the session-signing secret), pruning rules and their run log, and the audit log live in a separate DuckLake catalog (`ichibi_console`, Postgres schema `ichibi_console`, rows stored inline in Postgres). Only the primary gateway instance attaches it; user-supplied SQL runs on an instance that cannot see it ([§3.5](#35-sql-enforcement)). Releases before this change kept these tables in the main catalog; they are moved automatically on first start.
 
 ### 13.4 Recovery CLI
 
@@ -1025,10 +1062,13 @@ Build DOM with `h()`, never `innerHTML`: the CSP and the XSS model rely on it.
 
 ```sh
 npm test                       # Run all suites, including RBAC and console (requires Docker: app, db, kafka)
-npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console)
+npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console, SQL guard)
 npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
 npm run test:pgq-grammar       # DuckDB 2.0 SQL/PGQ grammar opt-in tests (no Docker needed)
-npm run test:console-unit      # Admin console auth/settings/retention unit tests (no Docker needed)
+npm run test:console-unit      # Admin console auth, settings, data browser, pruning and cron unit tests (no Docker needed)
+npm run test:sql-guard         # Read-only / introspection guard for user-supplied SQL (no Docker needed)
+npm run test:orderby           # DuckLake ORDER BY corruption regression (no Docker needed)
+npm run test:kafka-topic-filter # Kafka topic subscription filter (no Docker needed)
 npm run test:console           # Admin console integration tests (uses docker exec for a temporary admin)
 npm run test:rbac              # RBAC: superuser / writer / reader permissions, per-table overrides, superuser-only SQL and graphs, system tables
 npm run test:api               # Integration tests
@@ -1041,4 +1081,4 @@ npm run test:kafka-retroactive # Kafka retroactive (history dump) tests
 npm run test:stress            # Stress test (customize via env vars)
 ```
 
-Integration tests expect the Docker stack to be running. Set `BASE_URL` and `API_KEY` environment variables to target a remote or custom deployment.
+Integration tests expect the Docker stack to be running, and read the API keys and port from `docker/.env`. To target another deployment, set `BASE_URL`, `API_KEY` (a superuser key) and optionally `ALT_API_KEY`. The console suite creates a temporary admin with `docker exec` in the container named by `CONSOLE_CONTAINER` (default `ichibi-lake`) and deletes it afterwards; alternatively set `CONSOLE_ADMIN_USER` / `CONSOLE_ADMIN_PASSWORD` to use an existing login.
