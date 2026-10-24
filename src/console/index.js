@@ -7,7 +7,7 @@
 import express, { Router } from 'express';
 import os from 'os';
 import fs from 'fs';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { fileURLToPath } from 'url';
 import { execute } from '../db.js';
 import { SECTIONS, SETTINGS, getSettingDef, normaliseSettingValue, maskSecret } from './registry.js';
@@ -17,7 +17,8 @@ import {
     getDummyHash, passwordFingerprint, createSessionToken, verifySessionToken, parseCookies,
     sessionCookie, LoginThrottle, safeEqual, generateSetupCode, generateApiKey,
 } from './auth.js';
-import { listPrunableTables, validateRule, pruneTable, runRule, scheduleRetention, isSystemTable } from './retention.js';
+import { isSystemTable, normaliseRule, computeNextRun, matchTables, previewRule, startJob, startPruneScheduler, storageInfo } from './retention.js';
+import { nextRuns, validateCron, SCHEDULE_PRESETS } from './cron.js';
 import * as data from './data.js';
 import {
     listUsers as listRbacUsers, getUserRoles, createUser as createRbacUser, updateUser as updateRbacUser,
@@ -36,13 +37,22 @@ let setupCode = null;
 const throttle = new LoginThrottle();
 
 // Side effects run after a live setting changes.
-const SETTING_HOOKS = {
-    RETENTION_INTERVAL_MINUTES: () => scheduleRetention(),
-};
+const SETTING_HOOKS = {};
 
 /** Opaque, stable id for an API key so raw keys never appear in URLs. */
 function keyId(apiKey) {
     return createHash('sha256').update(String(apiKey)).digest('hex').slice(0, 16);
+}
+
+/** One-line summary of a rule's criteria and schedule for the audit log. */
+function describeRule(rule) {
+    const parts = [`tables ${rule.tablePattern}${rule.excludePattern ? ` except ${rule.excludePattern}` : ''}`];
+    if (rule.maxAgeValue) parts.push(`older than ${rule.maxAgeValue} ${rule.maxAgeUnit} by ${rule.dateColumn}`);
+    if (rule.maxRows) parts.push(`keep newest ${rule.maxRows} by ${rule.orderColumn || 'insertion order'}`);
+    parts.push(`schedule "${rule.schedule}"`, rule.enabled ? 'enabled' : 'disabled');
+    if (rule.safetyLimit) parts.push(`safety limit ${rule.safetyLimit}`);
+    if (rule.reclaimStorage) parts.push('reclaim storage');
+    return parts.join(', ');
 }
 
 function httpError(statusCode, message) {
@@ -105,7 +115,7 @@ export async function initConsole() {
     }, SETTINGS_REFRESH_MS);
     refresh.unref?.();
 
-    scheduleRetention();
+    await startPruneScheduler();
     ready = true;
     console.log(`[Console] Admin console ready at ${publicBaseUrl()}/console`);
 }
@@ -363,7 +373,7 @@ export function createConsoleRouter() {
             `SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' AND table_type = 'BASE TABLE'`
         );
         const ext = await execute(`SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'duckpgq'`);
-        const rules = await store.listRetentionRules();
+        const rules = await store.listPruneRules();
         const overridden = SETTINGS.filter(s => store.describeSetting(s).source === 'console').length;
         res.json({
             gateway: { version: PACKAGE.version, uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000), hostname: os.hostname(), node: process.version },
@@ -375,7 +385,7 @@ export function createConsoleRouter() {
                 rbacUsers: (await listRbacUsers()).length,
                 consoleLogins: await store.countUsers(),
             },
-            retention: { rules: rules.length, enabled: rules.filter(r => r.enabled === 'true').length },
+            retention: { rules: rules.length, enabled: rules.filter(r => r.enabled).length },
             settings: { overridden },
             kafka: { brokers: process.env.KAFKA_BROKERS || '' },
         });
@@ -530,47 +540,83 @@ export function createConsoleRouter() {
         res.json({ success: true });
     }));
 
-    // ---- Retention ----------------------------------------------------------------------
+    // ---- Pruning (retention rules, jobs, run log) ------------------------------------------
+    async function prunableTables() {
+        const rows = await execute(
+            `SELECT table_name, column_name, data_type FROM information_schema.columns
+             WHERE table_catalog = 'ducklake' AND table_schema = 'main' ORDER BY table_name, ordinal_position`);
+        const tables = new Map();
+        for (const r of rows) {
+            if (isSystemTable(r.table_name)) continue;
+            if (!tables.has(r.table_name)) tables.set(r.table_name, { name: r.table_name, columns: [], dateColumns: [] });
+            const t = tables.get(r.table_name);
+            t.columns.push(r.column_name);
+            if (/^(DATE|TIMESTAMP)/i.test(String(r.data_type))) t.dateColumns.push(r.column_name);
+        }
+        return [...tables.values()];
+    }
+
+    function ruleView(rule, tableNames) {
+        return { ...rule, matches: matchTables(tableNames, rule.tablePattern, rule.excludePattern) };
+    }
+
     api.get('/retention', wrap(async (req, res) => {
+        const tables = await prunableTables();
+        const names = tables.map(t => t.name);
         res.json({
-            rules: await store.listRetentionRules(),
-            tables: await listPrunableTables(),
-            interval: settingPayload(getSettingDef('RETENTION_INTERVAL_MINUTES')),
+            rules: (await store.listPruneRules()).map(r => ruleView(r, names)),
+            tables,
+            presets: SCHEDULE_PRESETS,
+            storage: { ...storageInfo(), setting: settingPayload(getSettingDef('SNAPSHOT_RETENTION_DAYS')) },
         });
     }));
 
-    api.put('/retention/:table', requireAdmin, wrap(async (req, res) => {
-        const spec = {
-            tableName: req.params.table,
-            columnName: req.body?.columnName,
-            keepDays: Number(req.body?.keepDays),
-        };
-        const err = validateRule(spec);
-        if (err) return res.status(400).json({ error: err });
-        // Validates the table/column exist and the column is a date type.
-        await pruneTable(spec, { dryRun: true });
-        const enabled = req.body?.enabled !== false;
-        await store.upsertRetentionRule({ ...spec, enabled, updatedBy: req.consoleUser.username });
-        await store.audit(req.consoleUser.username, 'retention.save',
-            `${spec.tableName}: keep ${spec.keepDays} day(s) by ${spec.columnName} (${enabled ? 'enabled' : 'disabled'})`, clientIp(req));
+    api.post('/retention/rules', requireAdmin, wrap(async (req, res) => {
+        const rule = normaliseRule(req.body || {});
+        const id = randomBytes(8).toString('hex');
+        await store.createPruneRule({ ...rule, id, nextRunMs: rule.enabled ? computeNextRun(rule.schedule) : null, user: req.consoleUser.username });
+        await store.audit(req.consoleUser.username, 'prune.rule_create', `${rule.name}: ${describeRule(rule)}`, clientIp(req));
+        res.json({ success: true, id });
+    }));
+
+    api.put('/retention/rules/:id', requireAdmin, wrap(async (req, res) => {
+        const existing = await store.getPruneRule(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Rule not found' });
+        const rule = normaliseRule(req.body || {});
+        const reschedule = rule.schedule !== existing.schedule || rule.enabled !== existing.enabled || !existing.nextRunMs;
+        const nextRunMs = !rule.enabled ? null : reschedule ? computeNextRun(rule.schedule) : existing.nextRunMs;
+        await store.updatePruneRule(req.params.id, { ...rule, nextRunMs, user: req.consoleUser.username });
+        await store.audit(req.consoleUser.username, 'prune.rule_update', `${rule.name}: ${describeRule(rule)}`, clientIp(req));
         res.json({ success: true });
     }));
 
-    api.delete('/retention/:table', requireAdmin, wrap(async (req, res) => {
-        await store.deleteRetentionRule(req.params.table);
-        await store.audit(req.consoleUser.username, 'retention.delete', req.params.table, clientIp(req));
+    api.delete('/retention/rules/:id', requireAdmin, wrap(async (req, res) => {
+        const existing = await store.getPruneRule(req.params.id);
+        if (!existing) return res.status(404).json({ error: 'Rule not found' });
+        await store.deletePruneRule(req.params.id);
+        await store.audit(req.consoleUser.username, 'prune.rule_delete', existing.name, clientIp(req));
         res.json({ success: true });
     }));
 
-    api.post('/retention/preview', requireAdmin, wrap(async (req, res) => {
-        const spec = { tableName: req.body?.tableName, columnName: req.body?.columnName, keepDays: Number(req.body?.keepDays) };
-        res.json({ success: true, ...(await pruneTable(spec, { dryRun: true })) });
+    api.post('/retention/rules/:id/run', requireAdmin, wrap(async (req, res) => {
+        const jobId = await startJob(req.params.id, { trigger: 'manual', username: req.consoleUser.username });
+        res.status(202).json({ success: true, jobId });
     }));
 
-    api.post('/retention/:table/run', requireAdmin, wrap(async (req, res) => {
-        const result = await runRule(req.params.table, { trigger: 'manual', username: req.consoleUser.username, ip: clientIp(req) });
-        if (result.error) return res.status(500).json({ error: result.error });
-        res.json({ success: true, ...result });
+    // Dry run. Read-only, so viewers may use it too.
+    api.post('/retention/preview', wrap(async (req, res) => {
+        res.json(await previewRule(req.body || {}));
+    }));
+
+    api.post('/retention/schedule', wrap(async (req, res) => {
+        const cron = String(req.body?.schedule || '');
+        const error = validateCron(cron);
+        if (error) return res.json({ valid: false, error });
+        res.json({ valid: true, next: nextRuns(cron, 3).map(d => d.getTime()) });
+    }));
+
+    api.get('/retention/runs', wrap(async (req, res) => {
+        res.json({ jobs: await store.listRuns({ ruleId: req.query.rule || null, limit: req.query.limit }) });
     }));
 
     // ---- Tables & data ------------------------------------------------------------------------

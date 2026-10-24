@@ -22,7 +22,8 @@ import { withConnection, VARCHAR, BIGINT, invalidateColumnCache } from '../db.js
 import { invalidateAclCache } from '../acl.js';
 import { invalidateRbacCache } from '../rbac.js';
 import { listGraphDefinitions } from '../db.js';
-import { RETENTION } from './store.js';
+import * as consoleStore from './store.js';
+import { matchTables } from './retention.js';
 
 export const SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 export const PAGE_SIZES = [25, 50, 100, 250, 500];
@@ -516,9 +517,9 @@ async function convertColumnType(conn, tableName, col, type, { onInvalid } = {})
     const column = col.column_name;
     await assertNoGraphs(tableName, 'convert a column');
     if (!DATE_TYPE_RE.test(type)) {
-        const rule = await rows(conn, `SELECT 1 FROM ${RETENTION} WHERE table_name = ? AND column_name = ?`,
-            [tableName, column], [VARCHAR, VARCHAR]).catch(() => []);
-        if (rule.length) throw httpError(409, `A retention rule prunes "${tableName}" by "${column}"; remove the rule before converting it to a non-date type.`);
+        const rules = (await consoleStore.listPruneRules().catch(() => []))
+            .filter(r => r.maxAgeValue && r.dateColumn === column && matchTables([tableName], r.tablePattern, r.excludePattern).length);
+        if (rules.length) throw httpError(409, `Pruning rule(s) ${rules.map(r => `"${r.name}"`).join(', ')} prune "${tableName}" by the age of "${column}"; change them before converting it to a non-date type.`);
     }
     const lenient = onInvalid === 'null';
     if (!lenient) {
@@ -597,9 +598,8 @@ export async function alterColumn(tableName, column, changes = {}) {
             await ddl(conn, `ALTER TABLE ${t} RENAME COLUMN ${c} TO ${quoteIdent(changes.newName)}`);
             applied.push(`renamed to ${changes.newName}`);
             c = quoteIdent(changes.newName);
-            // Keep retention rules pointing at the renamed column.
-            await conn.run(`UPDATE ${RETENTION} SET column_name = ? WHERE table_name = ? AND column_name = ?`,
-                [changes.newName, tableName, column], [VARCHAR, VARCHAR, VARCHAR]).catch(() => {});
+            // Keep exact-name pruning rules pointing at the renamed column.
+            await consoleStore.renameColumnInRules(tableName, column, changes.newName).catch(() => {});
         }
         invalidateColumnCache(tableName);
         return { applied };
@@ -613,15 +613,13 @@ export async function dropColumn(tableName, column) {
         if (cols.length === 1) throw httpError(400, 'Cannot drop the only column; drop the table instead');
         await assertNoGraphs(tableName, 'drop a column');
         await ddl(conn, `ALTER TABLE ${quoteIdent(tableName)} DROP COLUMN ${quoteIdent(column)}`);
-        await conn.run(`DELETE FROM ${RETENTION} WHERE table_name = ? AND column_name = ?`,
-            [tableName, column], [VARCHAR, VARCHAR]).catch(() => {});
         invalidateColumnCache(tableName);
         return { dropped: column };
     });
 }
 
 /** Tables keyed by table name that must follow a rename or be cleaned on drop. */
-const TABLE_REFERENCES = ['_table_acls', '_rbac_table_permissions', RETENTION];
+const TABLE_REFERENCES = ['_table_acls', '_rbac_table_permissions'];
 
 export async function renameTable(tableName, newName) {
     requireNewName(newName, 'Table');
@@ -633,6 +631,7 @@ export async function renameTable(tableName, newName) {
         for (const ref of TABLE_REFERENCES) {
             await conn.run(`UPDATE ${ref} SET table_name = ? WHERE table_name = ?`, [newName, tableName], [VARCHAR, VARCHAR]).catch(() => {});
         }
+        await consoleStore.renameTableInRules(tableName, newName).catch(() => {});
         invalidateColumnCache(tableName); invalidateColumnCache(newName);
         invalidateAclCache(); invalidateRbacCache();
         return { table: newName };

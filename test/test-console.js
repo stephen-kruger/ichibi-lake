@@ -12,7 +12,6 @@ import { API_KEY, BASE_URL } from './_env.js';
 
 const CONTAINER = process.env.CONSOLE_CONTAINER || 'ichibi-lake';
 const TS = Date.now();
-const TABLE = `console_ret_${TS}`;
 
 let passed = 0, failed = 0;
 async function test(name, fn) {
@@ -224,44 +223,126 @@ async function run() {
             assert((await admin('DELETE', `/logins/${viewer}`)).status === 200, 'delete');
         });
 
-        console.log('\n▸ Retention');
+        console.log('\n▸ Pruning');
         const now = new Date();
         const daysAgo = (d) => new Date(now.getTime() - d * 86400000).toISOString().replace('T', ' ').slice(0, 19);
-        await test('seed a table with old and recent rows', async () => {
-            const r = await gateway('POST', `/upload/${TABLE}`, [
-                { id: 'old1', event_time: daysAgo(400) },
-                { id: 'old2', event_time: daysAgo(100) },
-                { id: 'new1', event_time: daysAgo(1) },
-            ]);
-            assert(r.status === 200, JSON.stringify(r.data));
+        const P = `prune_${TS}`;
+        const seed = (name, ages) => gateway('POST', `/upload/${name}`, ages.map((d, i) => ({ id: `${name}_${i}`, event_time: daysAgo(d) })));
+        const ids = async (table) => ((await gateway('POST', '/query', { sql: `SELECT id FROM ${table} ORDER BY id` })).data.rows || []).map(r => r.id);
+        async function waitForJob(jobId, timeoutMs = 60000) {
+            const until = Date.now() + timeoutMs;
+            while (Date.now() < until) {
+                const jobs = (await admin('GET', '/retention/runs?limit=50')).data.jobs || [];
+                const job = jobs.find(j => j.jobId === jobId);
+                if (job && job.status !== 'running') return job;
+                await new Promise(r => setTimeout(r, 1000));
+            }
+            throw new Error(`job ${jobId} did not finish within ${timeoutMs}ms`);
+        }
+        const createRule = async (rule) => {
+            const r = await admin('POST', '/retention/rules', { schedule: '0 2 * * *', ...rule });
+            assert(r.status === 200, `create rule: ${JSON.stringify(r.data)}`);
+            return r.data.id;
+        };
+        const runRule = async (id) => {
+            const r = await admin('POST', `/retention/rules/${id}/run`);
+            assert(r.status === 202, `run: ${JSON.stringify(r.data)}`);
+            return waitForJob(r.data.jobId);
+        };
+        const createdRules = [];
+
+        await test('seed tables: two matching, one excluded, one without the date column', async () => {
+            assert((await seed(`${P}_a`, [400, 100, 1])).status === 200, 'a');
+            assert((await seed(`${P}_b`, [50, 40, 3, 2, 1])).status === 200, 'b');
+            assert((await seed(`${P}_keep`, [400, 400])).status === 200, 'keep');
+            assert((await gateway('POST', `/upload/${P}_nodate`, [{ id: 'x' }])).status === 200, 'nodate');
         });
-        await test('table appears with its timestamp column', async () => {
-            const r = await admin('GET', '/retention');
-            const t = r.data.tables.find(x => x.name === TABLE);
-            assert(t && t.dateColumns.some(c => c.name === 'event_time'), JSON.stringify(t));
-            assert(!r.data.tables.some(x => x.name.startsWith('_')), 'system tables must be hidden');
+        await test('rules cannot target system tables; "*" never reaches them', async () => {
+            for (const tablePattern of ['_rbac_users', '_*', '_console_users']) {
+                const r = await admin('POST', '/retention/rules', { name: 'bad', tablePattern, maxRows: 1, schedule: '@daily' });
+                assert(r.status === 400, `${tablePattern} -> ${r.status}`);
+            }
+            const all = await admin('POST', '/retention/preview', { tablePattern: '*', maxRows: 1 });
+            assert(all.status === 200 && all.data.tables.length > 0, JSON.stringify(all.data).slice(0, 200));
+            assert(!all.data.tables.some(t => t.table.startsWith('_')), 'a system table matched "*"');
         });
-        await test('preview counts rows older than the window without deleting', async () => {
-            const r = await admin('POST', '/retention/preview', { tableName: TABLE, columnName: 'event_time', keepDays: 30 });
-            assert(r.status === 200 && r.data.matched === 2 && r.data.deleted === 0, JSON.stringify(r.data));
+        await test('invalid rules and schedules are rejected', async () => {
+            assert((await admin('POST', '/retention/rules', { name: 'x', tablePattern: `${P}_a`, schedule: '@daily' })).status === 400, 'no criterion');
+            assert((await admin('POST', '/retention/rules', { name: 'x', tablePattern: `${P}_a`, maxRows: 1, schedule: '61 * * * *' })).status === 400, 'bad cron');
+            const sched = await admin('POST', '/retention/schedule', { schedule: '*/15 * * * *' });
+            assert(sched.data.valid && sched.data.next.length === 3, JSON.stringify(sched.data));
+            assert((await admin('POST', '/retention/schedule', { schedule: 'nope' })).data.valid === false, 'invalid cron preview');
         });
-        await test('rules reject system tables and non-date columns', async () => {
-            assert((await admin('PUT', '/retention/_console_audit', { columnName: 'ts', keepDays: 1 })).status === 400, 'system table');
-            assert((await admin('PUT', `/retention/${TABLE}`, { columnName: 'id', keepDays: 1 })).status === 400, 'non-date column');
+        await test('preview: wildcard + exclusion, per-table counts, skipped tables explained', async () => {
+            const r = await admin('POST', '/retention/preview', { tablePattern: `${P}_*`, excludePattern: '*_keep', maxAgeValue: 30, dateColumn: 'event_time' });
+            const by = Object.fromEntries(r.data.tables.map(t => [t.table, t]));
+            assert(!by[`${P}_keep`], 'excluded table matched');
+            assert(by[`${P}_a`].total === 2 && by[`${P}_b`].total === 2, JSON.stringify(r.data.tables));
+            assert(by[`${P}_nodate`].status === 'skipped' && /event_time/.test(by[`${P}_nodate`].reason), JSON.stringify(by[`${P}_nodate`]));
+            assert((await ids(`${P}_a`)).length === 3, 'preview must not delete');
         });
-        await test('save a rule and run it now: only old rows are deleted', async () => {
-            assert((await admin('PUT', `/retention/${TABLE}`, { columnName: 'event_time', keepDays: 30, enabled: true })).status === 200, 'save');
-            const run = await admin('POST', `/retention/${TABLE}/run`);
-            assert(run.status === 200 && run.data.deleted === 2, JSON.stringify(run.data));
-            const left = await gateway('POST', '/query', { sql: `SELECT id FROM ${TABLE} ORDER BY id` });
-            const ids = (left.data.rows || []).map(r => r.id);
-            assert(ids.length === 1 && ids[0] === 'new1', `remaining: ${JSON.stringify(ids)}`);
-            const rules = await admin('GET', '/retention');
-            const rule = rules.data.rules.find(x => x.table_name === TABLE);
-            assert(rule && Number(rule.last_deleted) === 2, JSON.stringify(rule));
+        await test('age rule: run now deletes only old rows in matching tables', async () => {
+            const id = await createRule({ name: `age ${TS}`, tablePattern: `${P}_*`, excludePattern: '*_keep', maxAgeValue: 30, dateColumn: 'event_time' });
+            createdRules.push(id);
+            const job = await runRule(id);
+            assert(job.status === 'succeeded' && job.rowsDeleted === 4, JSON.stringify({ status: job.status, deleted: job.rowsDeleted, msg: job.message }));
+            const t = Object.fromEntries(job.tables.map(x => [x.table, x]));
+            assert(t[`${P}_nodate`].status === 'skipped', 'nodate should be skipped');
+            assert(t[`${P}_a`].rowsByAge === 2 && t[`${P}_a`].rowsDeleted === 2, JSON.stringify(t[`${P}_a`]));
+            assert((await ids(`${P}_a`)).join() === `${P}_a_2`, `a: ${await ids(`${P}_a`)}`);
+            assert((await ids(`${P}_keep`)).length === 2, 'excluded table was pruned');
+            const rule = (await admin('GET', '/retention')).data.rules.find(r => r.id === id);
+            assert(rule.lastStatus === 'succeeded' && rule.lastDeleted === 4 && rule.matches.length === 3, JSON.stringify(rule));
         });
-        await test('remove the rule', async () => {
-            assert((await admin('DELETE', `/retention/${TABLE}`)).status === 200, 'delete');
+        await test('count rule keeps the newest N rows by a column', async () => {
+            assert((await seed(`${P}_c`, [5, 4, 3, 2, 1])).status === 200, 'seed c');
+            const id = await createRule({ name: `count ${TS}`, tablePattern: `${P}_c`, maxRows: 2, orderColumn: 'event_time' });
+            createdRules.push(id);
+            const job = await runRule(id);
+            assert(job.rowsDeleted === 3, JSON.stringify(job));
+            assert((await ids(`${P}_c`)).join() === `${P}_c_3,${P}_c_4`, `c: ${await ids(`${P}_c`)}`);
+        });
+        await test('age and count combined: a row is deleted if it fails either', async () => {
+            assert((await seed(`${P}_d`, [100, 10, 3, 2, 1])).status === 200, 'seed d');
+            const prev = await admin('POST', '/retention/preview', { tablePattern: `${P}_d`, maxAgeValue: 30, dateColumn: 'event_time', maxRows: 3, orderColumn: 'event_time' });
+            const t = prev.data.tables[0];
+            assert(t.byAge === 1 && t.byCount === 2 && t.total === 2, JSON.stringify(t));
+        });
+        await test('safety limit refuses a run that would delete too much, deleting nothing', async () => {
+            assert((await seed(`${P}_e`, [90, 80, 70])).status === 200, 'seed e');
+            const id = await createRule({ name: `safety ${TS}`, tablePattern: `${P}_e`, maxAgeValue: 30, dateColumn: 'event_time', safetyLimit: 1 });
+            createdRules.push(id);
+            const job = await runRule(id);
+            assert(job.status === 'failed' && job.tables[0].status === 'failed' && /safety limit/.test(job.tables[0].message), JSON.stringify(job));
+            assert((await ids(`${P}_e`)).length === 3, 'rows were deleted despite the safety limit');
+        });
+        await test('disabling a rule clears its next run; edits are validated', async () => {
+            const id = createdRules[0];
+            const rule = (await admin('GET', '/retention')).data.rules.find(r => r.id === id);
+            assert((await admin('PUT', `/retention/rules/${id}`, { ...rule, enabled: false })).status === 200, 'disable');
+            const after = (await admin('GET', '/retention')).data.rules.find(r => r.id === id);
+            assert(!after.enabled && after.nextRunMs === null, JSON.stringify(after));
+            assert((await admin('PUT', `/retention/rules/${id}`, { ...rule, tablePattern: '_rbac_users' })).status === 400, 'system table on edit');
+        });
+        await test('scheduled rules run automatically (every-minute schedule)', async () => {
+            assert((await seed(`${P}_f`, [60, 1])).status === 200, 'seed f');
+            const id = await createRule({ name: `sched ${TS}`, tablePattern: `${P}_f`, maxAgeValue: 30, dateColumn: 'event_time', schedule: '* * * * *' });
+            createdRules.push(id);
+            const until = Date.now() + 120000;
+            let job = null;
+            while (Date.now() < until && !job) {
+                await new Promise(r => setTimeout(r, 3000));
+                job = ((await admin('GET', `/retention/runs?rule=${id}`)).data.jobs || []).find(j => j.trigger === 'schedule' && j.status !== 'running');
+            }
+            assert(job, 'no scheduled run within 120s');
+            assert(job.status === 'succeeded' && job.rowsDeleted === 1, JSON.stringify(job));
+            const rule = (await admin('GET', '/retention')).data.rules.find(r => r.id === id);
+            assert(rule.nextRunMs > Date.now() - 1000, 'next run should be scheduled in the future');
+        });
+        await test('rules can be deleted', async () => {
+            for (const id of createdRules) assert((await admin('DELETE', `/retention/rules/${id}`)).status === 200, `delete ${id}`);
+            const left = (await admin('GET', '/retention')).data.rules.filter(r => createdRules.includes(r.id));
+            assert(left.length === 0, 'rules remain');
         });
 
         console.log('\n▸ Tables & data browser');
@@ -520,7 +601,7 @@ async function run() {
         await test('audit log records console actions', async () => {
             const r = await admin('GET', '/audit?limit=100');
             const actions = new Set(r.data.entries.map(e => e.action));
-            for (const a of ['console.login', 'setting.update', 'api_key.revoke', 'login.create', 'retention.run',
+            for (const a of ['console.login', 'setting.update', 'api_key.revoke', 'login.create', 'prune.rule_create', 'prune.job',
                 'row.update', 'row.insert', 'row.delete', 'schema.add_column', 'schema.alter_column', 'table.rename', 'table.drop', 'table.create']) {
                 assert(actions.has(a), `missing audit action ${a}`);
             }
