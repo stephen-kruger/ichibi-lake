@@ -68,6 +68,40 @@ export async function applyOptimizerWorkaround(conn, label = 'db') {
     }
 }
 
+// Since DuckDB 2.0, parser extensions must be activated per session via
+// active_grammar_extensions (it cannot be SET GLOBAL), otherwise
+// CREATE PROPERTY GRAPH / DROP PROPERTY GRAPH / GRAPH_TABLE fail with a parser
+// error even though DuckPGQ is loaded. Enabling it has no effect on plain SQL,
+// so it is applied unconditionally because callers cannot know in advance
+// whether a statement uses SQL/PGQ.
+//
+// It must run as its OWN statement before the SQL that needs it: DuckDB parses
+// a whole multi-statement string before executing any of it, so prepending
+// "SET active_grammar_extensions = ...;" to the same string still fails to
+// parse the PGQ part. And because a RESET (or a failed LOAD at connection
+// creation) leaves a session without it, it is re-applied every time a
+// connection is handed out rather than only once when the connection is
+// created. Non-fatal: graph endpoints surface a clearer error if used.
+export async function enableDuckPgqGrammar(conn) {
+    if (process.env.DISABLE_DUCKPGQ === '1') return;
+    try {
+        await conn.run("SET active_grammar_extensions = ['duckpgq'];");
+    } catch (err) {
+        // The setting is unknown until duckpgq is loaded on this connection.
+        try {
+            await conn.run("LOAD duckpgq;");
+            await conn.run("SET active_grammar_extensions = ['duckpgq'];");
+        } catch (_) { /* non-fatal */ }
+    }
+}
+
+// Load DuckPGQ on a freshly created connection and opt it in to its grammar.
+async function loadDuckPgq(conn) {
+    if (process.env.DISABLE_DUCKPGQ === '1') return;
+    try { await conn.run("LOAD duckpgq;"); } catch (err) { /* non-fatal */ }
+    await enableDuckPgqGrammar(conn);
+}
+
 // Configure a fresh in-memory DuckDB instance to act as a DuckLake gateway.
 // Used for both the primary instance (writes + reads) and the isolated user-
 // query instance (read-only ad-hoc SQL) so they share the same setup path.
@@ -215,6 +249,7 @@ export async function getConnection() {
     while (primaryPool.length > 0) {
         const pooled = primaryPool.pop();
         if (pooled && pooled._generation === instanceGeneration) {
+            await enableDuckPgqGrammar(pooled);
             return pooled;
         }
         if (pooled && typeof pooled.close === 'function') {
@@ -239,15 +274,9 @@ export async function getConnection() {
     }
     // Ensure graph query support is available on this connection. The
     // extension was installed at startup; LOAD is cheap and idempotent.
-    // Skip entirely when DISABLE_DUCKPGQ=1 so we never trigger a native
+    // Skipped entirely when DISABLE_DUCKPGQ=1 so we never trigger a native
     // crash from a broken duckpgq binary on a per-request basis.
-    if (process.env.DISABLE_DUCKPGQ !== '1') {
-        try {
-            await conn.run("LOAD duckpgq;");
-        } catch (err) {
-            // Non-fatal: graph endpoints will surface a clearer error if used.
-        }
-    }
+    await loadDuckPgq(conn);
     // NOTE: SET parquet_row_group_size is not recognised by some DuckDB
     // versions and would spam the logs with harmless warnings. Row-group
     // sizing for Parquet exports is controlled at COPY-time instead.
@@ -424,9 +453,7 @@ async function getUserConnection() {
     } catch (err) {
         console.error("[DB:user] Failed to set search path:", err);
     }
-    if (process.env.DISABLE_DUCKPGQ !== '1') {
-        try { await conn.run("LOAD duckpgq;"); } catch (err) { /* non-fatal */ }
-    }
+    await loadDuckPgq(conn);
     // (Same note as in getConnection: parquet_row_group_size is not a
     // session-level parameter in current DuckDB versions.)
     return conn;
@@ -477,6 +504,10 @@ export async function executeUserSql(sql, { timeoutMs = USER_QUERY_TIMEOUT_MS, p
         // Engine-level deadline (DuckDB ≥ recent versions). If the SET fails
         // we silently fall back to the wall-clock race below.
         try { await conn.run(`SET max_execution_time = ${Number(timeoutMs)}`); } catch (e) { /* unsupported */ }
+
+        // Re-assert the SQL/PGQ grammar immediately before the user SQL (after
+        // any prepare hook), since we cannot tell whether it uses GRAPH_TABLE.
+        await enableDuckPgqGrammar(conn);
 
         const queryPromise = (async () => {
             const result = await conn.run(sql);
