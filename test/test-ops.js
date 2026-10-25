@@ -329,9 +329,10 @@ async function run() {
             assertEqual((await query({ sql: 'SELECT 1' }, { format: 'arrow' })).status, 400, 'format=arrow');
         });
 
-        await it('still refuses writes and non-superusers', async () => {
+        await it('still refuses writes, and system tables for non-superusers', async () => {
             assertEqual((await query({ sql: `DELETE FROM "${T}"` }, { format: 'ndjson' })).status, 403, 'write SQL');
-            assertEqual((await query({ sql: 'SELECT 1' }, { key: READER_KEY, format: 'ndjson' })).status, 403, 'reader key');
+            assertEqual((await query({ sql: 'SELECT * FROM _rbac_users' }, { key: READER_KEY, format: 'ndjson' })).status, 404, 'reader on system table');
+            assertEqual((await query({ sql: `SELECT count(*) AS n FROM "${T}"` }, { key: READER_KEY, format: 'ndjson' })).status, 200, 'reader on readable table');
         });
     });
 

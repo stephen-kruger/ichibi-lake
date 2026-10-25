@@ -2,11 +2,12 @@
  * Guard for user-supplied SQL (POST /query, the GraphQL `sql` resolver and
  * POST /graphs/:graphName/query).
  *
- * These endpoints are superuser-only (RBAC roles and table ACLs cannot be
- * applied to arbitrary SQL) and run on the isolated user-query instance, which
- * has no access to the console catalog, has external file/network access
- * disabled, and has dropped its DuckLake secret (see src/db.js). This guard is
- * the remaining layer:
+ * These endpoints run on the isolated user-query instance, which has no access
+ * to the console catalog, has external file/network access disabled, and has
+ * dropped its DuckLake secret (see src/db.js). For non-superusers, /query and
+ * the GraphQL resolver also parse the SQL with DuckDB and authorize every table
+ * it reads (src/sql-tables.js); graph queries are superuser-only. This guard is
+ * an additional layer for every caller:
  *
  *  1. Read-only: rejects DDL/DML/admin keywords.
  *  2. No introspection that reveals connection details: DuckDB exposes the
