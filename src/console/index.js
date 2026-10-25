@@ -715,6 +715,15 @@ export function createConsoleRouter() {
         res.json(await data.readRows(req.params.table, { page, pageSize, sort, filters, search }));
     }));
 
+    // Download several tables (?tables=a,b,c; omitted = every user table) as
+    // one ZIP, read in one transaction. Read-only, so open to every console role.
+    api.get('/data/export', wrap(async (req, res) => {
+        const { format = 'parquet' } = req.query;
+        const tables = req.query.tables ? String(req.query.tables).split(',').map(t => t.trim()).filter(Boolean) : [];
+        await audit(req, 'tables.export', `${tables.length ? `${tables.length} table(s): ${tables.join(', ').slice(0, 500)}` : 'all tables'} as ${format} (zip)`);
+        await data.exportTables(tables, { format: String(format) }, res);
+    }));
+
     // Download a table (or the rows matching the grid's filters/search/sort).
     // Read-only, so open to every console role; audited like other data access
     // that leaves the console.

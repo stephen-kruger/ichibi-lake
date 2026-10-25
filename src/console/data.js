@@ -24,7 +24,7 @@ import { invalidateRbacCache } from '../rbac.js';
 import { listGraphDefinitions } from '../db.js';
 import * as consoleStore from './store.js';
 import { matchTables, isDateType, isEpochType } from './retention.js';
-import { EXPORT_FORMATS, runExport } from '../export.js';
+import { EXPORT_FORMATS, runExport, runMultiExport } from '../export.js';
 import { resolveTypeConflict } from '../schema-evolution.js';
 import { getTableKeys, setTableKeys, normaliseKeyList, assertKeysMatchColumns, countDuplicateKeys, renameKeyColumn } from '../table-keys.js';
 import { isTransactionConflict } from '../conflict.js';
@@ -711,6 +711,39 @@ export async function exportTable(tableName, { format = 'parquet', filters, sear
         filename: tableName,
         res,
     });
+}
+
+/**
+ * Download several tables (default: every user table) as one ZIP archive, read
+ * in a single transaction. Whole tables only; EXPORT_MAX_ROWS applies per table
+ * and is reported in the archive's manifest.json.
+ */
+export async function exportTables(tableNames, { format = 'parquet' } = {}, res) {
+    if (!Object.hasOwn(EXPORT_FORMATS, format)) {
+        throw httpError(400, `Unsupported export format "${format}". Use one of: ${Object.keys(EXPORT_FORMATS).join(', ')}`);
+    }
+    const names = tableNames && tableNames.length ? [...new Set(tableNames)] : (await listTables()).map(t => t.name);
+    if (!names.length) throw httpError(400, 'There are no tables to export');
+    const tables = await withConnection(async (conn) => {
+        const out = [];
+        const used = new Set();
+        for (const name of names) {
+            const cols = await requireTable(conn, name);
+            // BLOBs travel base64-encoded in the text formats, like the JSON API.
+            const select = cols.map(({ column_name: c, data_type: t }) =>
+                format !== 'parquet' && /^BLOB/i.test(String(t)) ? `base64(${quoteIdent(c)}) AS ${quoteIdent(c)}` : quoteIdent(c)).join(', ');
+            // Archive member names: never a path, unique case-insensitively
+            // (archives are often extracted on case-insensitive file systems).
+            const base = String(name).replace(/[^A-Za-z0-9_.-]/g, '_').replace(/^\.+/, '_') || 'table';
+            let file = base;
+            for (let i = 2; used.has(file.toLowerCase()); i++) file = `${base}_${i}`;
+            used.add(file.toLowerCase());
+            out.push({ name, file, selectSql: `SELECT ${select} FROM ${quoteIdent(name)}`, countSql: `SELECT count(*) FROM ${quoteIdent(name)}` });
+        }
+        return out;
+    });
+    const stamp = new Date().toISOString().replace(/[:]/g, '').replace(/\..*$/, '');
+    await runMultiExport({ format, tables, filename: `lake-export-${stamp}`, res });
 }
 
 // --- Import ----------------------------------------------------------------------------

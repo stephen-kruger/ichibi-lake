@@ -58,8 +58,9 @@
 
         const create = h('button', { class: 'btn primary', type: 'button', disabled: !ctx.isAdmin, onclick: () => createTableDialog(ctx) }, icon('plus'), 'New table');
         const importBtn = h('button', { class: 'btn', type: 'button', disabled: !ctx.isAdmin, onclick: () => importDialog(ctx, { tables: res.tables.map(t => t.name) }) }, icon('upload'), 'Import');
+        const exportBtn = h('button', { class: 'btn', type: 'button', disabled: !res.tables.length, onclick: () => exportTablesDialog(res.tables) }, icon('download'), 'Export');
         return [
-            pageHeader('Tables & Data', 'Browse, edit and restructure DuckLake tables. System tables (prefixed "_") are managed on their own pages and hidden here.', importBtn, create),
+            pageHeader('Tables & Data', 'Browse, edit and restructure DuckLake tables. System tables (prefixed "_") are managed on their own pages and hidden here.', exportBtn, importBtn, create),
             h('div', { class: 'card' },
                 h('div', { class: 'card-header' }, h('h2', {}, `${res.tables.length} table(s)`), filter),
                 h('div', { class: 'card-body flush table-wrap' },
@@ -653,6 +654,72 @@
         a.click();
         a.remove();
         toast('Export started; your browser will save the file.', 'success');
+    }
+
+    // Several tables as one ZIP (one file per table + manifest.json), read in a
+    // single transaction so the tables are consistent with each other.
+    async function exportTablesDialog(tables) {
+        const selected = new Set(tables.map(t => t.name));
+        const format = h('select', {},
+            h('option', { value: 'parquet' }, 'Parquet (typed, compressed)'),
+            h('option', { value: 'csv' }, 'CSV'),
+            h('option', { value: 'ndjson' }, 'NDJSON (one JSON object per line)'));
+        const filter = h('input', { type: 'text', placeholder: 'Filter tables…' });
+        const list = h('div', { class: 'picker-list', role: 'group', 'aria-label': 'Tables to export' });
+        const summary = h('span', { class: 'muted small' });
+        const shownTables = () => {
+            const q = filter.value.trim().toLowerCase();
+            return tables.filter(t => !q || t.name.toLowerCase().includes(q));
+        };
+        const syncSummary = () => {
+            const rows = tables.filter(t => selected.has(t.name)).reduce((n, t) => n + (t.rows || 0), 0);
+            summary.textContent = `${selected.size} of ${tables.length} selected · ${rows.toLocaleString()} row(s)`;
+        };
+        const draw = () => {
+            const shown = shownTables();
+            list.replaceChildren(...(shown.length ? shown.map(t => {
+                const box = h('input', { type: 'checkbox', checked: selected.has(t.name) });
+                const row = h('label', { class: `picker-row ${selected.has(t.name) ? 'on' : ''}` }, box, h('span', { class: 'mono' }, t.name),
+                    h('span', { class: 'muted small picker-cols' }, t.rows === null ? '—' : `${t.rows.toLocaleString()} row(s)`));
+                box.addEventListener('change', () => {
+                    if (box.checked) selected.add(t.name); else selected.delete(t.name);
+                    row.classList.toggle('on', box.checked);
+                    syncSummary();
+                });
+                return row;
+            }) : [h('div', { class: 'muted small picker-empty' }, 'No tables match the filter.')]));
+            syncSummary();
+        };
+        const setShown = (on) => { for (const t of shownTables()) on ? selected.add(t.name) : selected.delete(t.name); draw(); };
+        filter.addEventListener('input', draw);
+        draw();
+        const picker = h('div', { class: 'table-picker' },
+            h('div', { class: 'picker-head' }, filter,
+                h('button', { class: 'btn small', type: 'button', onclick: () => setShown(true) }, 'Select all'),
+                h('button', { class: 'btn small', type: 'button', onclick: () => setShown(false) }, 'Select none')),
+            list);
+        const ok = await modal({
+            title: 'Export tables',
+            body: h('div', { class: 'row-gap' },
+                field('Format', format),
+                h('div', {}, h('div', { class: 'label-row' }, h('label', { class: 'label' }, 'Tables'), summary), picker),
+                h('div', { class: 'help' }, 'Downloads one ZIP file with a file per table and a manifest.json listing row counts. ' +
+                    'All tables are read at the same point in time. Each table is capped by EXPORT_MAX_ROWS; the manifest flags any table that was truncated.')),
+            actions: [{ label: 'Cancel', value: false }, { label: 'Download ZIP', value: true, primary: true }],
+            wide: true,
+        });
+        if (!ok) return;
+        if (!selected.size) return toast('Select at least one table to export.', 'error');
+        const params = new URLSearchParams({ format: format.value });
+        // Every table selected: let the server list them (keeps the URL short).
+        if (selected.size < tables.length) params.set('tables', [...selected].join(','));
+        if (params.toString().length > 6000) return toast('Too many tables selected for one link; select all tables or fewer.', 'error');
+        // A plain link streams the archive straight to disk (no in-memory blob).
+        const a = h('a', { href: `api/data/export?${params}`, download: '' });
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        toast(`Export of ${selected.size} table(s) started; your browser will save the ZIP file.`, 'success');
     }
 
     function importUrl(file, opts) {
