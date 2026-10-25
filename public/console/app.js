@@ -63,6 +63,8 @@ const ICONS = {
     trash: 'M6 19a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z',
     edit: 'M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z',
     filter: 'M10 18h4v-2h-4v2zM3 6v2h18V6H3zm3 7h12v-2H6v2z',
+    book: 'M18 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zM6 4h5v8l-2.5-1.5L6 12V4z',
+    external: 'M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z',
     refresh: 'M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z',
 };
 
@@ -293,7 +295,12 @@ function renderShell() {
     const nav = h('nav', { class: 'nav' }, groups.map(g =>
         h('div', { class: 'nav-group' },
             h('div', { class: 'nav-group-title' }, g.name),
-            g.items.map(s => h('a', { href: `#/${s.id}`, dataset: { id: s.id } }, icon(s.icon), s.title)))));
+            g.items.map(s => h('a', { href: `#/${s.id}`, dataset: { id: s.id } }, icon(s.icon), s.title)))),
+        // Swagger UI is served by the gateway at its root (src/index.js).
+        h('div', { class: 'nav-group' },
+            h('div', { class: 'nav-group-title' }, 'Resources'),
+            h('a', { href: '../', target: '_blank', rel: 'noopener', title: 'Open the REST API reference (Swagger UI) in a new tab' },
+                icon('book'), 'API Reference', h('span', { class: 'nav-external' }, icon('external')))));
 
     const logout = h('button', { class: 'icon-btn', title: 'Sign out', 'aria-label': 'Sign out', onclick: async () => {
         await api('POST', '/logout').catch(() => {});

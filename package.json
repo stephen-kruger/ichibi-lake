@@ -1,6 +1,6 @@
 {
   "name": "duckserver",
-  "version": "1.6.18.1",
+  "version": "1.6.25.1",
   "description": "",
   "main": "index.js",
   "scripts": {
