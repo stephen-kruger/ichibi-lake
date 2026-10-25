@@ -19,21 +19,36 @@ services:
       - DUCKLAKE_PG_USER=postgres
       - DUCKLAKE_PG_PASSWORD=postgres
       - DUCKLAKE_PG_DB=ducklake
-      # Where DuckLake writes Parquet data files. Persisted via the
-      # bind mount to docker/data/ducklake so records survive container restarts.
-      - DUCKLAKE_DATA_PATH=/app/data_files
+      # Where DuckLake writes Parquet data files: a local directory (default,
+      # persisted via the bind mount to docker/data/ducklake) or an s3:// URL.
+      # For object storage set DUCKLAKE_DATA_PATH=s3://<bucket>/<prefix>/ and
+      # the S3_* variables in docker/.env; `COMPOSE_PROFILES=minio` also starts
+      # a bundled MinIO server (see the minio service below and README §1.6).
+      - DUCKLAKE_DATA_PATH=${DUCKLAKE_DATA_PATH:-/app/data_files}
+      - S3_ENDPOINT=${S3_ENDPOINT:-}
+      - S3_REGION=${S3_REGION:-}
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:-}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:-}
+      - S3_SESSION_TOKEN=${S3_SESSION_TOKEN:-}
+      - S3_URL_STYLE=${S3_URL_STYLE:-}
+      - S3_USE_SSL=${S3_USE_SSL:-}
+      # Writes of fewer rows than this are kept in the Postgres catalog until
+      # scheduled lake maintenance flushes them to Parquet (0 = every write
+      # creates a Parquet file).
+      - DATA_INLINING_ROW_LIMIT=${DATA_INLINING_ROW_LIMIT:-1000}
       # Allow the DuckPGQ community extension (SQL/PGQ graph queries).
       - DUCKDB_ALLOW_COMMUNITY_EXTENSIONS=1
-      # The compaction crash that used to require disabling startup maintenance
-      # ("DuckLakeCompaction - expected a single output file") is fixed as of
-      # the DuckDB/DuckLake version now pinned in package.json (see its
-      # "_comments" entry for the full history and the related issue that
-      # compactDuckLake() in src/db.js still works around). Maintenance is
-      # enabled by default; set DISABLE_DUCKLAKE_COMPACTION=1 here as an
-      # emergency escape hatch if it ever needs to be skipped again.
+      # Lake maintenance (flush inlined rows, merge small files, rewrite files
+      # with deletes, expire snapshots, delete unreferenced files) runs at
+      # startup and on the schedule set in the admin console (Retention &
+      # Pruning page). Set DISABLE_DUCKLAKE_COMPACTION=1 here as an emergency
+      # escape hatch to stop every maintenance run (see package.json's
+      # "_comments" entry for the DuckLake issues maintenance works around).
       # - DISABLE_DUCKLAKE_COMPACTION=1
       # Store BLOBs as separate files on the local filesystem instead of inline
-      # in Parquet. Only filesystem paths are stored in DuckLake tables.
+      # in Parquet. Only filesystem paths are stored in DuckLake tables. BLOB
+      # files always stay on this local (or mounted) directory, also when the
+      # lake itself is on object storage.
       - USE_FILESYSTEM_BLOBS=1
       # Directory where BLOB files are written. Persisted via the bind mount
       # to docker/data/blobs so files survive container restarts.
@@ -78,6 +93,10 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      # Only with the minio profile: wait until the bucket exists.
+      minio-init:
+        condition: service_completed_successfully
+        required: false
     # Liveness only (GET /health, no auth, no database access). Use
     # GET /health/ready to check DuckLake + Postgres from a load balancer.
     healthcheck:
@@ -235,6 +254,55 @@ services:
       retries: 10
       start_period: 30s
     restart: unless-stopped
+
+  # Optional S3-compatible object storage for the lake (COMPOSE_PROFILES=minio).
+  # The minio/minio images are no longer published on Docker Hub or quay.io;
+  # Chainguard's build is used instead (override with MINIO_IMAGE). Point the
+  # gateway at it in docker/.env:
+  #   DUCKLAKE_DATA_PATH=s3://ichibi-lake/lake/
+  #   S3_ENDPOINT=minio:9000
+  #   S3_ACCESS_KEY=<MINIO_ROOT_USER>   S3_SECRET_KEY=<MINIO_ROOT_PASSWORD>
+  #   S3_USE_SSL=false
+  minio:
+    profiles: [ "minio" ]
+    image: ${MINIO_IMAGE:-cgr.dev/chainguard/minio:latest}
+    container_name: ichibi-lake-minio
+    command: [ "server", "/data", "--console-address", ":9001" ]
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-ichibi-lake}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-change-me-minio-secret}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - ./data/minio:/data
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # One-shot: wait for MinIO and create the bucket (idempotent). Uses curl's
+  # built-in SigV4 signing, so no MinIO client image is needed.
+  minio-init:
+    profiles: [ "minio" ]
+    image: curlimages/curl:8.11.1
+    container_name: ichibi-lake-minio-init
+    depends_on:
+      - minio
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-ichibi-lake}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-change-me-minio-secret}
+      - MINIO_BUCKET=${MINIO_BUCKET:-ichibi-lake}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        for i in $$(seq 1 60); do curl -sf http://minio:9000/minio/health/live > /dev/null && break; sleep 1; done
+        code=$$(curl -s -o /dev/null -w '%{http_code}' --aws-sigv4 'aws:amz:us-east-1:s3' --user "$$MINIO_ROOT_USER:$$MINIO_ROOT_PASSWORD" -X PUT "http://minio:9000/$$MINIO_BUCKET")
+        echo "create bucket $$MINIO_BUCKET: HTTP $$code"
+        [ "$$code" = 200 ] || [ "$$code" = 409 ]
+    networks:
+      - app-network
+    restart: "no"
 
 networks:
   app-network:

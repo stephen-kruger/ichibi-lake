@@ -13,6 +13,7 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
 - [3. Environment Variables](#3-environment-variables)
   - [3.1 Core / Server](#31-core--server)
   - [3.2 DuckLake (Postgres Metadata)](#32-ducklake-postgres-metadata)
+  - [3.2.1 Object Storage (S3 / MinIO)](#321-object-storage-s3--minio)
   - [3.3 Authentication](#33-authentication)
   - [3.4 Blob Storage](#34-blob-storage)
   - [3.5 SQL Enforcement](#35-sql-enforcement)
@@ -26,6 +27,8 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [4.3 Production Checklist](#43-production-checklist)
   - [4.4 SuperLake Wizard](#44-superlake-wizard)
   - [4.5 Upgrading](#45-upgrading)
+  - [4.6 Object Storage (S3 / MinIO)](#46-object-storage-s3--minio)
+  - [4.7 Lake Maintenance (Small Files)](#47-lake-maintenance-small-files)
 - [5. Authentication & Authorization](#5-authentication--authorization)
   - [5.1 API Key Authentication](#51-api-key-authentication)
   - [5.2 Per-Table Access Control (ACL)](#52-per-table-access-control-acl)
@@ -102,12 +105,12 @@ Full instructions, including adding logins and resetting a forgotten password, a
 
 ## 2. Architecture
 
-ichibi-lake is a Node.js gateway that wraps a **DuckDB** in-memory instance backed by the **DuckLake** storage extension. Parquet data files are persisted to disk; table metadata (schemas, ACLs, and graph definitions) lives in a companion **PostgreSQL** database. BLOBs can be stored as standalone files or inline in Parquet.
+ichibi-lake is a Node.js gateway that wraps a **DuckDB** in-memory instance backed by the **DuckLake** storage extension. Parquet data files are persisted to a local directory or to **S3-compatible object storage** (AWS S3, MinIO, R2; see [§4.6](#46-object-storage-s3--minio)); table metadata (schemas, ACLs, and graph definitions) and small not-yet-flushed writes live in a companion **PostgreSQL** database. BLOBs can be stored as standalone files or inline in Parquet. Scheduled **lake maintenance** keeps the number of Parquet files small ([§4.7](#47-lake-maintenance-small-files)).
 
 ```
 Client → REST/GraphQL ──┐
-Browser → /console ─────┼─► ichibi-lake gateway ─► DuckDB (DuckLake) ─► Parquet files
-                        │          │                       └── PostgreSQL (metadata)
+Browser → /console ─────┼─► ichibi-lake gateway ─► DuckDB (DuckLake) ─► Parquet files (disk or s3://)
+                        │          │                       └── PostgreSQL (metadata + inlined rows)
                         │          ├── Kafka (sink / SSE / consumer)
                         │          └── Filesystem (blobs)
 ```
@@ -136,11 +139,29 @@ The gateway runs two DuckDB instances: a **primary** instance (connection pool) 
 | `DUCKLAKE_PG_USER` | `postgres` | Postgres user |
 | `DUCKLAKE_PG_PASSWORD` | `postgres` | Postgres password |
 | `DUCKLAKE_PG_DB` | `ducklake` | Postgres database name |
-| `DUCKLAKE_DATA_PATH` | `data_files/` | Directory for DuckLake Parquet data files |
+| `DUCKLAKE_DATA_PATH` | `data_files/` | Where DuckLake writes Parquet data files: a local directory, or an `s3://bucket/prefix/` URL for object storage ([§3.2.1](#321-object-storage-s3--minio)) |
+| `DATA_INLINING_ROW_LIMIT` | `1000` | A write of fewer rows than this is stored in the Postgres catalog instead of creating a Parquet file; [lake maintenance](#47-lake-maintenance-small-files) flushes these rows to Parquet in bulk. `0` = every write creates a Parquet file (the behaviour before this setting existed) |
 | `DISABLE_DUCKPGQ` | *(unset)* | Set to `1` to disable the DuckPGQ graph extension |
-| `DISABLE_DUCKLAKE_COMPACTION` | *(unset)* | Set to `1` to skip DuckLake maintenance (file compaction, snapshot expiry, file cleanup) at startup |
+| `DISABLE_DUCKLAKE_COMPACTION` | *(unset)* | Set to `1` to stop all [lake maintenance](#47-lake-maintenance-small-files) runs (scheduled, startup and manual). Emergency switch only: without maintenance, inlined rows are never flushed and small files are never merged |
+| `STARTUP_ATTEMPTS` | `5` | How often the startup sequence (RBAC/ACL bootstrap, migrations, admin console) is attempted before the process exits so its supervisor can restart it. Each step is also retried on DuckLake transaction conflicts, which occur when several instances start against one catalog at the same moment |
 
-The DuckDB extensions the gateway needs (`ducklake`, `postgres`, `duckpgq`) are pre-installed in the Docker image. When running natively they are downloaded on first start (or run `node scripts/install-extensions.js` once).
+The DuckDB extensions the gateway needs (`ducklake`, `postgres`, `duckpgq`, and `httpfs`/`aws` for object storage) are pre-installed in the Docker image. When running natively they are downloaded on first start (or run `node scripts/install-extensions.js` once).
+
+#### 3.2.1 Object Storage (S3 / MinIO)
+
+Used when `DUCKLAKE_DATA_PATH` is an `s3://` URL. S3-compatible stores (MinIO, Cloudflare R2, Ceph, GCS interoperability) use `s3://` with `S3_ENDPOINT`. See [§4.6](#46-object-storage-s3--minio).
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `S3_ENDPOINT` | *(empty: AWS)* | `host:port` of an S3-compatible server, e.g. `minio:9000` (an `http(s)://` prefix is ignored; use `S3_USE_SSL`) |
+| `S3_REGION` | `us-east-1` | Bucket region |
+| `S3_ACCESS_KEY` | *(empty)* | Access key id. Empty: DuckDB's AWS **credential chain** (environment `AWS_*` variables, `~/.aws`, EC2 instance / ECS task / IRSA role) |
+| `S3_SECRET_KEY` | *(empty)* | Secret access key (required with `S3_ACCESS_KEY`) |
+| `S3_SESSION_TOKEN` | *(empty)* | Session token for temporary credentials |
+| `S3_URL_STYLE` | `path` with an endpoint, `vhost` without | `path` (MinIO and most self-hosted stores) or `vhost` (AWS). `S3_PATH_STYLE=true\|false` is accepted as an alias |
+| `S3_USE_SSL` | `true` | `false` for a plain-HTTP endpoint such as a local MinIO |
+| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` / `MINIO_BUCKET` | `ichibi-lake` / `change-me-minio-secret` / `ichibi-lake` | Compose `minio` profile only: credentials of the bundled MinIO server and the bucket created at startup |
+| `MINIO_IMAGE` / `MINIO_PORT` / `MINIO_CONSOLE_PORT` | `cgr.dev/chainguard/minio:latest` / `9000` / `9001` | Compose `minio` profile only: image and published host ports |
 
 ### 3.3 Authentication
 
@@ -167,13 +188,15 @@ See [§5.3](#53-role-based-access-control-rbac) for details on roles, the admin 
 | `USE_FILESYSTEM_BLOBS` | `0` | `1` = store BLOBs as separate files on disk; `0` / unset = inline in Parquet as `BLOB` |
 | `BLOBS_PATH` | `./data/blobs` | Directory for filesystem BLOB files |
 
+Filesystem BLOBs always use a **local (or mounted) directory**, also when the lake's Parquet files are on object storage. With several gateway hosts, either mount a shared directory at `BLOBS_PATH` or use `USE_FILESYSTEM_BLOBS=0`, which stores BLOBs inside the lake (and therefore in the bucket).
+
 ### 3.5 SQL Enforcement
 
 User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endpoints `POST /graphs`, `DELETE /graphs/:name`, `POST /graphs/:name/query`) cannot be checked against RBAC roles or per-table ACLs, so it is locked down in layers:
 
 1. **Superuser keys only.** Keys with the RBAC `superuser` role, or any `API_KEYS` key when RBAC is not configured (those are superusers anyway). Readers and writers get HTTP 403 and use the table REST endpoints, which do enforce RBAC. Graph queries count as SQL because their `match`/`where`/`columns` fragments can contain subqueries.
 2. **Always read-only.** DDL/DML/admin keywords are rejected with HTTP 403. There is no setting to turn this off; change data through the REST API (upload, records, blobs) or the [admin console](#13-admin-console).
-3. **Locked-down engine.** The SQL runs on a separate DuckDB instance that has dropped its DuckLake secret, can read only the lake's data directory (no `read_text('/etc/...')`, no BLOB directory, no network), and does not attach the admin console's catalog.
+3. **Locked-down engine.** The SQL runs on a separate DuckDB instance that has dropped its DuckLake secret, can read only the lake's data directory (no `read_text('/etc/...')`, no BLOB directory, no network), and does not attach the admin console's catalog. With object storage, the only remote location it can read is the lake's own `s3://bucket/prefix/` (other prefixes, other buckets and `http(s)://` are refused). It keeps the S3 secret, because reading the lake needs it, but DuckDB only ever shows it redacted and refuses to display it unredacted once external access is disabled.
 4. **No connection-string introspection.** `duckdb_databases()`, `pragma_database_list`, `duckdb_settings()`, `current_setting()`, `duckdb_secrets()` and `which_secret()` are rejected, because DuckDB would reveal the metadata Postgres password through them.
 
 **System tables** (names starting with `_`: RBAC users and their API keys, ACLs, the graph registry) are never reachable through the table REST endpoints, for any key, and cannot be targets of `/upload`, `/kafka-sink` or the Kafka consumer. They are managed through the superuser-only admin API and the console.
@@ -238,7 +261,7 @@ User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endp
 | `CONSOLE_SESSION_TTL_HOURS` | `12` | Console session lifetime. Also editable in the console. |
 | `METRICS_TOKEN` | *(unset)* | Bearer token for `GET /metrics`. When unset, `/metrics` requires a superuser API key. See [§14.2](#142-prometheus-metrics). |
 | `PUBLIC_URL` | `http://localhost:<port>` | Externally reachable base URL, used in startup log messages (Swagger UI and admin console links). Docker Compose defaults it to the published host port (`http://localhost:3333`); set it to your real address (e.g. `https://lake.example.com`) when deployed. |
-| `SNAPSHOT_RETENTION_DAYS` | *(unset)* | Days of DuckLake snapshot history (time travel) to keep. When set, startup maintenance and pruning rules with *reclaim storage* expire older snapshots and delete unreferenced files, freeing the space used by deleted rows. Unset: snapshots are never expired. Also editable in the console. |
+| `SNAPSHOT_RETENTION_DAYS` | *(unset)* | Days of DuckLake snapshot history (time travel) to keep. When set, [lake maintenance](#47-lake-maintenance-small-files) and pruning rules with *reclaim storage* expire older snapshots and delete unreferenced files, freeing the space used by deleted rows. Unset: snapshots are never expired. Also editable in the console. |
 
 ---
 
@@ -271,6 +294,7 @@ The compose stack starts three services:
 | `app` | `ichibi-lake` | Node.js REST gateway |
 | `db` | `ichibi-lake-postgres` | Postgres 17 (DuckLake metadata) |
 | `kafka` | `ichibi-lake-kafka` | Kafka 4.3.1 (event ingestion) |
+| `minio` *(profile `minio`)* | `ichibi-lake-minio` | Optional S3-compatible object storage for the lake ([§4.6](#46-object-storage-s3--minio)) |
 
 **Persistent volumes** are mounted under `docker/data/`:
 
@@ -279,7 +303,8 @@ docker/data/
 ├── blobs/       # BLOB files (when USE_FILESYSTEM_BLOBS=1)
 ├── ducklake/    # Parquet data files (console data is stored in Postgres, schema ichibi_console)
 ├── postgres/    # Postgres data directory
-└── kafka/       # Kafka KRaft logs
+├── kafka/       # Kafka KRaft logs
+└── minio/       # MinIO objects (only with the minio profile)
 ```
 
 **Stopping:**
@@ -334,6 +359,8 @@ pm2 startup
 - **Lock down Postgres and Kafka ports** — `compose.yaml` publishes Postgres on host port `5432` with the default `postgres`/`postgres` login, and Kafka on `9092`/`9094`. Anyone who can reach them can read or change the metadata catalog directly. Change the password (it is set in `compose.yaml` as both `POSTGRES_PASSWORD` for the `db` service and `DUCKLAKE_PG_PASSWORD` for the `app` service; keep them equal), and bind the ports to `127.0.0.1` or remove them if nothing outside Docker needs them
 - **Wire up health checks and metrics** — point your load balancer / orchestrator readiness probe at `GET /health/ready` and liveness at `GET /health`; set `METRICS_TOKEN` and scrape `GET /metrics` (see [§14](#14-operations-health-metrics--limits))
 - **Decide on snapshot retention if you prune data** — set `SNAPSHOT_RETENTION_DAYS` so deleted rows actually free storage (see [§13.2](#132-features))
+- **Put the lake on object storage** for durability and multi-host deployments — see [§4.6](#46-object-storage-s3--minio). Keep [lake maintenance](#47-lake-maintenance-small-files) enabled; with inlining it is what turns small writes into Parquet files
+- **Back up Postgres, not just the bucket** — the catalog is the source of truth for which files make up each table, and it also holds inlined rows that maintenance has not flushed yet
 
 ### 4.4 SuperLake Wizard
 
@@ -349,7 +376,7 @@ Interactive options:
 | :--- | :--- |
 | **Single-host scale-out** | Several gateway containers on one host sharing one data directory and one Postgres |
 | **Multi-host NFS** | One storage host exports the data directory over NFS; gateway hosts mount it |
-| **Multi-host MinIO** | Self-hosted S3-compatible storage on your LAN (DuckDB `httpfs`) |
+| **Multi-host MinIO** | Self-hosted S3-compatible storage on your LAN (uses the built-in object-storage support, [§4.6](#46-object-storage-s3--minio)) |
 | **Multi-host SSHFS** | Mount the data directory over SSH (FUSE), no extra services |
 | **Federation** | Separate lakes per host, cross-attached as peers for cross-lake queries |
 
@@ -372,6 +399,57 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 - **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
 - **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
 - **Rebuild the image** (`docker compose up -d --build --remove-orphans`; `--remove-orphans` also removes the retired `duckdb-ui` container from older releases). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
+
+### 4.6 Object Storage (S3 / MinIO)
+
+Set `DUCKLAKE_DATA_PATH` to an `s3://bucket/prefix/` URL and the gateway writes all Parquet files there. Postgres stays the catalog. Both DuckDB instances (primary and user-query) get a temporary DuckDB S3 secret **scoped to that prefix**, created from the `S3_*` variables ([§3.2.1](#321-object-storage-s3--minio)). Nothing is written to disk.
+
+**Bundled MinIO (single host / trying it out).** In `docker/.env`:
+
+```sh
+COMPOSE_PROFILES=minio                  # also start the minio + minio-init services
+MINIO_ROOT_USER=ichibi-lake
+MINIO_ROOT_PASSWORD=<a long random secret>
+MINIO_BUCKET=ichibi-lake                # created by minio-init (idempotent)
+
+DUCKLAKE_DATA_PATH=s3://ichibi-lake/lake/
+S3_ENDPOINT=minio:9000
+S3_ACCESS_KEY=ichibi-lake               # = MINIO_ROOT_USER (or a dedicated MinIO user)
+S3_SECRET_KEY=<the same secret>
+S3_USE_SSL=false
+```
+
+Then `docker compose up -d --build`. MinIO keeps its data in `docker/data/minio/`; its web console is on host port `9001`. The `minio/minio` images are no longer published on Docker Hub or quay.io, so the profile uses Chainguard's build (`cgr.dev/chainguard/minio`, set `MINIO_IMAGE` to use another).
+
+**AWS S3.** Leave `S3_ENDPOINT` empty and set `S3_REGION`. Either set `S3_ACCESS_KEY`/`S3_SECRET_KEY`, or leave them empty to use the credential chain (instance/task role). The IAM policy needs `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `prefix/*`.
+
+**Other S3-compatible stores** (R2, Ceph, Wasabi, GCS interoperability): `S3_ENDPOINT` = the provider's host, plus `S3_URL_STYLE` as the provider documents.
+
+Notes:
+
+- **Start new lakes on object storage.** The data path is recorded in the catalog (`ducklake_metadata`, key `data_path`) when the lake is created, and changing `DUCKLAKE_DATA_PATH` later does not move existing files. Migrating an existing lake (copy `docker/data/ducklake/` to the bucket prefix with the gateway stopped, then repoint the catalog's `data_path`) is a manual operation that has not been verified with this release; take a Postgres backup first and test on a copy.
+- The console's own catalog (`ichibi_console`) keeps every row in Postgres; its data path is `<prefix>_console/`, which stays empty.
+- **BLOB files** (`USE_FILESYSTEM_BLOBS=1`) stay on the local `BLOBS_PATH` directory ([§3.4](#34-blob-storage)).
+- All gateway instances must use the same `DUCKLAKE_DATA_PATH` and catalog. Object storage removes the shared-filesystem requirement of multi-instance deployments.
+- **Manual check** (what the integration run against the minio profile does): `docker compose --profile minio up -d --build`, then `npm test`, and confirm that new files appear under `docker/data/minio/<bucket>/lake/main/<table>/` and that the gateway log shows `data: s3://... on http://minio:9000`.
+
+### 4.7 Lake Maintenance (Small Files)
+
+Many small writes (one row per REST request or Kafka message) would otherwise create one tiny Parquet file each, and query speed drops as file counts grow. ichibi-lake prevents this in two layers:
+
+1. **Data inlining.** A write of fewer than `DATA_INLINING_ROW_LIMIT` (default 1000) rows is stored in the Postgres catalog. It is immediately visible to every query, but creates no file.
+2. **Scheduled maintenance** (console: **Retention & Pruning → Lake maintenance**; default hourly, `0 * * * *` UTC). Each run:
+   - **flushes** inlined rows to Parquet,
+   - **merges** adjacent small files per table,
+   - **rewrites** files with many deleted rows (threshold configurable; DuckLake's default when empty),
+   - **expires** snapshots older than `SNAPSHOT_RETENTION_DAYS` (only if set),
+   - **deletes** files no snapshot references, and orphaned files, after a 5-minute grace period (so running queries and in-flight writes on other instances are not affected).
+
+   Each step can be switched off. A run also happens at gateway start, unless one finished in the last hour (this replaces the old unconditional startup compaction).
+
+Runs are coordinated across gateway instances. A due run is claimed with a write-token-and-verify step and a lease (6 hours, released when the run ends, or when the instance that held it restarts), so exactly one instance runs it and runs never overlap. **Run now** is refused (HTTP 409) while a run is in progress anywhere. Every run is logged on the card with before/after data-file counts and sizes, and in the **Audit Log** (`maintenance.run`; settings changes as `maintenance.update`). Merge and rewrite use a fresh connection per table to avoid the DuckLake schema-cache issue duckdb/ducklake#1108 (see `package.json` `_comments`). `DISABLE_DUCKLAKE_COMPACTION=1` stops all runs.
+
+Console API (admin session): `GET /console/api/maintenance` (settings, recent runs, current file counts), `PUT /console/api/maintenance` (`{ enabled, schedule, steps: { flush, merge, rewrite, expire, cleanup }, deleteThreshold, runAtStartup }`) and `POST /console/api/maintenance/run`.
 
 ## 5. Authentication & Authorization
 
@@ -1041,7 +1119,7 @@ The side menu groups pages by area. **Admins** can change everything; **viewers*
 | **RBAC Users** | Create role-based API users (superuser / writer / reader), change roles, activate or deactivate. Users defined by `RBAC_SUPERUSERS` / `RBAC_USERS` in `docker/.env`, or by the `API_KEYS` list, are re-applied on every restart, so they are shown read-only with where to change them |
 | **Console Logins** | Add console users, change roles, reset passwords, delete logins (at least one admin always remains) |
 | **Tables & Data** | Browse every user table with paging, sorting, per-column filters and full-text search; edit cells inline; add and delete rows; view and edit schemas; create, rename and drop tables (see below) |
-| **Retention & Pruning** | Per-table rules that delete rows older than a given age, beyond the newest *N* rows, and/or matching simple conditions, each on its own schedule; preview, **Run now**, **Clone**, and a run log (see below) |
+| **Retention & Pruning** | Per-table rules that delete rows older than a given age, beyond the newest *N* rows, and/or matching simple conditions, each on its own schedule; preview, **Run now**, **Clone**, and a run log (see below). Also the **Lake maintenance** schedule and log ([§4.7](#47-lake-maintenance-small-files)) |
 | **Security / Ingestion / Query Engine / Storage / Kafka** | Effective configuration, showing each value's source (default, `docker/.env`, or console override) |
 | **Audit Log** | Who changed what, from which IP, across all instances |
 | **My Account** | Change your own password |
@@ -1137,7 +1215,7 @@ Build DOM with `h()`, never `innerHTML`: the CSP and the XSS model rely on it.
 | Endpoint | Auth | Description |
 | :--- | :--- | :--- |
 | `GET /health` | none | **Liveness.** `200 {"status":"ok","uptimeSeconds":...}` while the Node process is responsive. Touches no database, so it stays up when Postgres is down. The compose healthcheck uses it. |
-| `GET /health/ready` | none | **Readiness.** `200 {"status":"ready","checks":{...}}` only when the startup sequence (RBAC/ACL bootstrap, console, startup compaction) has finished, the DuckLake catalog is attached, and the metadata Postgres answers a query through DuckLake's own connection. Otherwise `503` with the failing check, e.g. `{"startup":"ready","ducklake":"ok","postgres":"error: ..."}`. Each check times out after 5 s. |
+| `GET /health/ready` | none | **Readiness.** `200 {"status":"ready","checks":{...}}` only when the startup sequence (RBAC/ACL bootstrap, migrations, admin console and maintenance scheduler) has finished, the DuckLake catalog is attached, and the metadata Postgres answers a query through DuckLake's own connection. Otherwise `503` with the failing check, e.g. `{"startup":"ready","ducklake":"ok","postgres":"error: ..."}`. Each check times out after 5 s. |
 
 Use `/health` for restart decisions and `/health/ready` for routing traffic (load balancer, Kubernetes readiness probe). Neither reveals data or configuration.
 
@@ -1191,11 +1269,13 @@ Every cap reports truncation (`truncated` / trailer line / `X-Export-Truncated`)
 
 ```sh
 npm test                       # Run all suites, including RBAC and console (requires Docker: app, db, kafka)
-npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console, SQL guard)
+npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console, SQL guard, storage)
 npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
 npm run test:pgq-grammar       # DuckDB 2.0 SQL/PGQ grammar opt-in tests (no Docker needed)
 npm run test:console-unit      # Admin console auth, settings, data browser, pruning and cron unit tests (no Docker needed)
 npm run test:sql-guard         # Read-only / introspection guard for user-supplied SQL (no Docker needed)
+npm run test:storage           # Object-storage config, S3 secret SQL and maintenance settings (no Docker needed)
+npm run test:maintenance       # Data inlining and scheduled lake maintenance (file counts drop), against the running stack
 npm run test:orderby           # DuckLake ORDER BY corruption regression (no Docker needed)
 npm run test:kafka-topic-filter # Kafka topic subscription filter (no Docker needed)
 npm run test:console           # Admin console integration tests (uses docker exec for a temporary admin)

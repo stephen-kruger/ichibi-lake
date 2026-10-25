@@ -89,7 +89,11 @@
     }
 
     let pollTimer = null;
-    function stopPolling() { if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; } }
+    let maintTimer = null;
+    function stopPolling() {
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+        if (maintTimer) { clearTimeout(maintTimer); maintTimer = null; }
+    }
 
     registerView('retention', async (ctx) => {
         stopPolling();
@@ -160,7 +164,7 @@
                 h('span', { class: `badge ${days === null ? 'console' : 'ok'}` }, days === null ? 'snapshots kept forever' : `snapshots kept ${days} day(s)`)),
             h('div', { class: 'card-body' }, h('div', { class: 'help' },
                 'Deleting rows does not free disk space by itself: DuckLake keeps old snapshots for time travel, and they still reference the deleted rows. ' +
-                'Rules with "Reclaim storage" rewrite the affected tables after pruning, and expire snapshots older than the retention below. ' +
+                'Lake maintenance (above) and rules with "Reclaim storage" rewrite files with deleted rows, and expire snapshots older than the retention below. ' +
                 'Leave it empty to keep unlimited history (storage is then never reclaimed).')),
             h('div', { class: 'card-body flush' }, settingRows([data.storage.setting], ctx.isAdmin, ctx.reload)));
 
@@ -223,11 +227,122 @@
             activityBody);
         await loadRuns();
 
+        const maintCard = h('div', { class: 'card' });
+        await loadMaintenance(ctx, data, maintCard, route);
+
         return [
             pageHeader('Retention & Pruning', 'Delete old, excess or matching rows automatically. Each rule prunes one table on its own schedule; use Clone to reuse a rule for another table. System tables are never pruned.', newRule),
-            rulesCard, activityCard, storageCard,
+            rulesCard, activityCard, maintCard, storageCard,
         ];
     });
+
+    // =========================================================================
+    // Lake maintenance (small-file compaction, snapshot expiry, cleanup)
+    // =========================================================================
+
+    const mb = (b) => `${(Number(b || 0) / 1048576).toFixed(1)} MB`;
+
+    async function loadMaintenance(ctx, data, card, route) {
+        if (maintTimer) { clearTimeout(maintTimer); maintTimer = null; }
+        if (location.hash !== route) return;
+        let m;
+        try { m = await api('GET', '/maintenance'); }
+        catch (err) { card.replaceChildren(h('div', { class: 'card-body' }, h('div', { class: 'callout error' }, err.message))); return; }
+        const cfg = m.config;
+        const reload = () => loadMaintenance(ctx, data, card, route);
+        const running = m.runs.some(r => r.status === 'running');
+        const presetLabel = data.presets.find(p => p.cron === cfg.schedule)?.label;
+
+        const runBtn = h('button', { class: 'btn small', type: 'button', disabled: !ctx.isAdmin || running || m.disabledByEnv }, 'Run now');
+        runBtn.addEventListener('click', () => withBusy(runBtn, async () => {
+            await api('POST', '/maintenance/run');
+            toast('Maintenance started; progress appears below.', 'success');
+            reload();
+        }));
+        const editBtn = h('button', { class: 'btn small', type: 'button', disabled: !ctx.isAdmin, onclick: () => editMaintenance(data, m).then(saved => { if (saved) reload(); }) }, 'Edit');
+
+        const status = m.disabledByEnv ? h('span', { class: 'badge off' }, 'disabled by DISABLE_DUCKLAKE_COMPACTION')
+            : cfg.enabled ? h('span', { class: 'badge ok' }, 'scheduled') : h('span', { class: 'badge console' }, 'paused');
+        const steps = Object.entries(m.steps).filter(([k]) => cfg.steps[k]).map(([, label]) => label);
+        const files = m.files;
+
+        const runs = m.runs.length ? h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Started'), h('th', {}, 'Trigger'), h('th', {}, 'Status'), h('th', {}, 'Duration'), h('th', {}, 'Summary'))),
+            h('tbody', {}, m.runs.map(r => h('tr', {},
+                h('td', { class: 'small' }, fmtMs(r.startedMs)),
+                h('td', { class: 'small' }, r.trigger === 'manual' ? `manual · ${r.username || ''}` : r.trigger),
+                h('td', {}, badge(r.status)),
+                h('td', { class: 'small' }, r.status === 'running' ? 'running…' : fmtDuration(r.startedMs, r.finishedMs)),
+                h('td', { class: 'small muted' }, r.message)))))
+            : h('div', { class: 'empty' }, 'Maintenance has not run yet.');
+
+        card.replaceChildren(
+            h('div', { class: 'card-header' }, h('h2', {}, 'Lake maintenance'), status, h('span', { class: 'spacer' }),
+                h('div', { class: 'grid-toolbar-row' }, runBtn, editBtn, h('button', { class: 'btn small', type: 'button', title: 'Refresh', onclick: reload }, icon('refresh')))),
+            h('div', { class: 'card-body' },
+                h('div', { class: 'help' },
+                    'Small writes are kept in the metadata catalog and written out to Parquet by maintenance, which also merges small files, ' +
+                    'rewrites files with many deleted rows, expires old snapshots (per the retention below) and deletes unreferenced files. ' +
+                    'With several gateway instances, each run happens on exactly one of them.'),
+                h('dl', { class: 'kv' },
+                    h('dt', {}, 'Schedule (UTC)'), h('dd', {}, presetLabel || h('span', { class: 'mono' }, cfg.schedule), cfg.enabled ? ` · next ${fmtMs(cfg.nextRunMs)}` : ' · paused'),
+                    h('dt', {}, 'Steps'), h('dd', {}, steps.length ? steps.join(' · ') : 'none'),
+                    h('dt', {}, 'Rewrite threshold'), h('dd', {}, cfg.deleteThreshold === null ? 'DuckLake default' : `files with ≥ ${Math.round(cfg.deleteThreshold * 100)}% of rows deleted`),
+                    h('dt', {}, 'At gateway start'), h('dd', {}, cfg.runAtStartup ? 'runs (unless a run finished in the last hour)' : 'does not run'),
+                    h('dt', {}, 'Data files now'), h('dd', {}, files ? `${n(files.files)} file(s), ${mb(files.bytes)} across ${n(files.tables)} table(s); ${n(files.deleteFiles)} delete file(s)` : '—'),
+                    h('dt', {}, 'Last run'), h('dd', {}, cfg.lastRunMs ? [badge(cfg.lastStatus), ` ${fmtMs(cfg.lastRunMs)}`] : 'never'))),
+            h('div', { class: 'card-body flush table-wrap' }, runs));
+
+        if (running) maintTimer = setTimeout(reload, 3000);
+    }
+
+    async function editMaintenance(data, m) {
+        const cfg = m.config;
+        const enabled = h('input', { type: 'checkbox', checked: cfg.enabled });
+        const preset = h('select', {}, data.presets.map(p => h('option', { value: p.cron, selected: p.cron === cfg.schedule }, p.label)),
+            h('option', { value: '__custom__', selected: !data.presets.some(p => p.cron === cfg.schedule) }, 'Custom (cron)'));
+        const cron = h('input', { type: 'text', value: cfg.schedule, class: 'mono narrow' });
+        const cronOut = h('div', { class: 'help' });
+        let cronTimer = null;
+        const syncCron = () => {
+            clearTimeout(cronTimer);
+            cronTimer = setTimeout(async () => {
+                try {
+                    const r = await api('POST', '/retention/schedule', { schedule: cron.value });
+                    cronOut.className = r.valid ? 'help' : 'help error-text';
+                    cronOut.textContent = r.valid ? `Next runs (shown in your time zone): ${r.next.map(fmtMs).join(' · ')}` : r.error;
+                } catch (err) { cronOut.textContent = err.message; }
+            }, 250);
+        };
+        preset.addEventListener('change', () => { if (preset.value !== '__custom__') cron.value = preset.value; syncCron(); });
+        cron.addEventListener('input', () => { preset.value = data.presets.some(p => p.cron === cron.value) ? cron.value : '__custom__'; syncCron(); });
+        syncCron();
+        const stepBoxes = Object.fromEntries(Object.keys(m.steps).map(k => [k, h('input', { type: 'checkbox', checked: !!cfg.steps[k] })]));
+        const threshold = h('input', { type: 'number', min: 1, max: 100, value: cfg.deleteThreshold === null ? '' : Math.round(cfg.deleteThreshold * 100), placeholder: 'default', class: 'narrow' });
+        const startup = h('input', { type: 'checkbox', checked: cfg.runAtStartup });
+        const body = h('div', { class: 'rule-form' },
+            h('label', { class: 'checkbox' }, enabled, 'Run on a schedule'),
+            h('fieldset', {}, h('legend', {}, 'Schedule (UTC)'), h('div', { class: 'criterion' }, preset, cron), cronOut),
+            h('fieldset', {}, h('legend', {}, 'Steps'),
+                Object.entries(m.steps).map(([k, label]) => h('label', { class: 'checkbox' }, stepBoxes[k], label)),
+                h('div', { class: 'criterion' }, h('span', {}, 'Rewrite a file when at least'), threshold, h('span', {}, '% of its rows are deleted')),
+                h('div', { class: 'help' }, 'Snapshot expiry uses the snapshot retention below; with no retention set it does nothing.')),
+            h('label', { class: 'checkbox' }, startup, 'Also run when a gateway starts (skipped if a run finished in the last hour)'));
+        for (;;) {
+            const choice = await modal({ title: 'Lake maintenance', body, actions: [{ label: 'Cancel', value: null }, { label: 'Save', value: 'save', primary: true }], wide: true });
+            if (choice !== 'save') return false;
+            try {
+                await api('PUT', '/maintenance', {
+                    enabled: enabled.checked, schedule: cron.value.trim(),
+                    steps: Object.fromEntries(Object.entries(stepBoxes).map(([k, el]) => [k, el.checked])),
+                    deleteThreshold: threshold.value === '' ? null : Number(threshold.value) / 100,
+                    runAtStartup: startup.checked,
+                });
+                toast('Maintenance settings saved', 'success');
+                return true;
+            } catch (err) { toast(err.message, 'error'); }
+        }
+    }
 
     // =========================================================================
     // Preview (dry run)
