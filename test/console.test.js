@@ -15,6 +15,7 @@ import { containedBlobPath, isSystemTable, matchTables, normaliseRule, buildPred
 import { parseCron, nextRun, nextRuns, validateCron } from '../src/console/cron.js';
 import { intervalToCron } from '../src/console/store.js';
 import { normaliseType, quoteIdent, quoteLiteral, buildWhere, wideningTargets, isEditableType, cleanDuckDbError, detectImportFormat } from '../src/console/data.js';
+import { compareVersions, checkForUpdate, resetUpdateCheckCache } from '../src/console/version.js';
 
 let passed = 0, failed = 0;
 
@@ -386,6 +387,52 @@ async function run() {
         assert.equal(detectImportFormat('parquet', 'misnamed.csv'), 'parquet');
         assert.throws(() => detectImportFormat('', 'x.xlsx'), /format/);
         assert.throws(() => detectImportFormat('xlsx', 'x.csv'), /Unsupported/);
+    });
+
+    console.log('\n▸ console: update check');
+    await test('dotted versions compare numerically, missing parts count as 0', () => {
+        assert.equal(compareVersions('1.6.25.1', '1.6.25'), 1);
+        assert.equal(compareVersions('1.6.10', '1.6.9'), 1);
+        assert.equal(compareVersions('v1.6.25', '1.6.25.0'), 0);
+        assert.equal(compareVersions('1.6.24.9', '1.6.25'), -1);
+        assert.equal(compareVersions('1.6.x', '1.6.25'), null);
+        assert.equal(compareVersions(undefined, '1.0'), null);
+    });
+    const fakeFetch = (version, calls) => async () => { calls.n++; return { ok: true, json: async () => ({ version }) }; };
+    await test('newer remote version reports an update and the update command', async () => {
+        resetUpdateCheckCache();
+        const info = await checkForUpdate('1.6.25.1', { fetchImpl: fakeFetch('1.7.0', { n: 0 }), now: 1000 });
+        assert.equal(info.latest, '1.7.0');
+        assert.equal(info.updateAvailable, true);
+        assert.equal(info.updateCommand, 'git pull && docker compose up -d --build');
+        assert.match(info.repoUrl, /github\.com\/stephen-kruger\/ichibi-lake$/);
+    });
+    await test('same or older remote version reports no update', async () => {
+        resetUpdateCheckCache();
+        assert.equal((await checkForUpdate('1.6.25.1', { fetchImpl: fakeFetch('1.6.25.1', { n: 0 }), now: 1000 })).updateAvailable, false);
+        resetUpdateCheckCache();
+        assert.equal((await checkForUpdate('1.6.25.1', { fetchImpl: fakeFetch('1.6.24', { n: 0 }), now: 1000 })).updateAvailable, false);
+    });
+    await test('GitHub is contacted at most once per cache period', async () => {
+        resetUpdateCheckCache();
+        const calls = { n: 0 };
+        const f = fakeFetch('1.7.0', calls);
+        await Promise.all([checkForUpdate('1.0', { fetchImpl: f, now: 0 }), checkForUpdate('1.0', { fetchImpl: f, now: 0 })]);
+        await checkForUpdate('1.0', { fetchImpl: f, now: 60 * 60 * 1000 });
+        assert.equal(calls.n, 1);
+        await checkForUpdate('1.0', { fetchImpl: f, now: 7 * 60 * 60 * 1000 });
+        assert.equal(calls.n, 2);
+    });
+    await test('network errors and bad responses report latest = null, not an error', async () => {
+        resetUpdateCheckCache();
+        const down = await checkForUpdate('1.0', { fetchImpl: async () => { throw new Error('offline'); }, now: 0 });
+        assert.deepEqual([down.latest, down.updateAvailable], [null, false]);
+        resetUpdateCheckCache();
+        const notFound = await checkForUpdate('1.0', { fetchImpl: async () => ({ ok: false }), now: 0 });
+        assert.equal(notFound.latest, null);
+        resetUpdateCheckCache();
+        const garbage = await checkForUpdate('1.0', { fetchImpl: fakeFetch('<html>', { n: 0 }), now: 0 });
+        assert.equal(garbage.latest, null);
     });
 }
 

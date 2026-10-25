@@ -21,6 +21,7 @@ import {
     sessionCookie, LoginThrottle, safeEqual, generateSetupCode, generateApiKey,
 } from './auth.js';
 import { startMaintenanceScheduler, saveMaintenanceConfig, startMaintenance, maintenanceOverview, describeSteps } from './maintenance.js';
+import { checkForUpdate } from './version.js';
 import { isSystemTable, normaliseRule, computeNextRun, matchTables, previewRule, startJob, startPruneScheduler, storageInfo, isDateType, isEpochType, describeConditions, CONDITION_OPS, isLegacyMultiTable } from './retention.js';
 import { nextRuns, validateCron, SCHEDULE_PRESETS } from './cron.js';
 import * as data from './data.js';
@@ -334,6 +335,10 @@ export function createConsoleRouter() {
     api.use(requireSession);
 
     api.get('/me', (req, res) => res.json({ user: req.consoleUser }));
+
+    api.get('/version', wrap(async (req, res) => {
+        res.json(await checkForUpdate(PACKAGE.version));
+    }));
 
     api.post('/me/password', wrap(async (req, res) => {
         const { currentPassword, newPassword } = req.body || {};

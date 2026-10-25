@@ -312,18 +312,50 @@ function renderShell() {
     mainEl = h('main', { class: 'main', onclick: (e) => {
         if (shellEl.classList.contains('menu-open') && !e.target.closest('.menu-toggle')) shellEl.classList.remove('menu-open');
     } });
+    const versionTag = h('div', { class: 'tag' }, 'Admin console · ',
+        h('a', { class: 'version-link', href: REPO_URL, target: '_blank', rel: 'noopener', title: 'Open the ichibi-lake GitHub repository' }, `v${state.version}`));
     shellEl = h('div', { class: 'shell' },
         h('aside', { class: 'sidebar' },
             h('div', { class: 'brand' },
                 h('img', { src: 'logo-320.png', alt: '' }),
-                h('div', {}, h('div', { class: 'name' }, 'ichibi-lake'), h('div', { class: 'tag' }, `Admin console · v${state.version}`))),
+                h('div', {}, h('div', { class: 'name' }, 'ichibi-lake'), versionTag)),
             nav,
             h('div', { class: 'sidebar-footer' },
                 h('div', { class: 'avatar' }, state.user.username.slice(0, 1)),
                 h('div', { class: 'who' }, h('div', {}, state.user.username), h('div', {}, state.user.role)),
                 logout)),
         mainEl);
+    addUpdateBadge(versionTag);
     return shellEl;
+}
+
+const REPO_URL = 'https://github.com/stephen-kruger/ichibi-lake';
+
+/** Ask the gateway whether GitHub has a newer version; append a badge if so. */
+async function addUpdateBadge(container) {
+    let info;
+    try { info = await api('GET', '/version'); } catch { return; }
+    if (!info.updateAvailable || !container.isConnected) return;
+    container.appendChild(h('button', {
+        class: 'badge update', type: 'button', title: `Version ${info.latest} is available`,
+        onclick: () => showUpdateDialog(info),
+    }, 'Update available'));
+}
+
+function showUpdateDialog(info) {
+    const copyBtn = h('button', { class: 'btn small', type: 'button', onclick: async () => {
+        try { await navigator.clipboard.writeText(info.updateCommand); toast('Copied to clipboard', 'success'); }
+        catch { toast('Copy failed; select the text manually', 'error'); }
+    } }, 'Copy');
+    return modal({
+        title: 'Update available',
+        body: h('div', { class: 'row-gap' },
+            h('p', {}, `You are running v${info.current}. Version v${info.latest} is available on `,
+                h('a', { href: info.repoUrl, target: '_blank', rel: 'noopener' }, 'GitHub'), '.'),
+            h('p', {}, 'To update, run this in the repository on the gateway host:'),
+            h('div', { class: 'secret-box' }, info.updateCommand),
+            h('div', { class: 'right' }, copyBtn)),
+    });
 }
 
 function pageHeader(title, description, ...actions) {
