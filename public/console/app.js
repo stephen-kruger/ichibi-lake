@@ -50,6 +50,7 @@ const ICONS = {
     calendar: 'M19 4h-1V2h-2v2H8V2H6v2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2zm0 16H5V9h14v11zM7 11h5v5H7z',
     shield: 'M12 1 3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z',
     upload: 'M5 20h14v-2H5v2zm0-10h4v6h6v-6h4l-7-7-7 7z',
+    download: 'M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z',
     search: 'M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z',
     database: 'M12 2C7.58 2 4 3.79 4 6v12c0 2.21 3.58 4 8 4s8-1.79 8-4V6c0-2.21-3.58-4-8-4zm0 2c3.87 0 6 1.5 6 2s-2.13 2-6 2-6-1.5-6-2 2.13-2 6-2zm6 14c0 .5-2.13 2-6 2s-6-1.5-6-2v-2.23C7.61 16.55 9.72 17 12 17s4.39-.45 6-1.23V18zm0-5c0 .5-2.13 2-6 2s-6-1.5-6-2v-2.23C7.61 11.55 9.72 12 12 12s4.39-.45 6-1.23V13z',
     stream: 'M3 6h18v2H3V6zm0 5h12v2H3v-2zm0 5h18v2H3v-2z',
@@ -461,6 +462,55 @@ function stat(label, value, sub, tone = 'accent') {
     return h('div', { class: `stat ${tone}` }, h('div', { class: 'label' }, label), h('div', { class: 'value' }, value), sub ? h('div', { class: 'sub' }, sub) : null);
 }
 
+function fmtBytes(n) {
+    if (!Number.isFinite(n)) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+function checkBadge(value) {
+    const ok = value === 'ok' || value === 'ready';
+    return h('span', { class: `badge ${ok ? 'ok' : value === 'starting' ? 'warn' : 'off'}`, title: ok ? '' : value }, ok ? value : value.split(':')[0]);
+}
+
+function healthCard(hl) {
+    const uq = hl.userQuery;
+    const exportCounts = Object.entries(hl.exports.counters || {});
+    const exportsDone = exportCounts.filter(([k]) => k.endsWith(':succeeded')).reduce((n, [, v]) => n + v, 0);
+    const exportsFailed = exportCounts.filter(([k]) => /:(failed|timeout)$/.test(k)).reduce((n, [, v]) => n + v, 0);
+    const exportsRejected = exportCounts.filter(([k]) => k.endsWith(':rejected')).reduce((n, [, v]) => n + v, 0);
+    const lag = [...(hl.kafkaLag || [])].sort((a, b) => b.lag - a.lag);
+    const totalLag = lag.reduce((n, p) => n + p.lag, 0);
+    const warn = (cond, text) => (cond ? h('span', { class: 'badge warn' }, text) : null);
+    const problems = Object.entries(hl.checks).filter(([, v]) => v !== 'ok' && v !== 'ready');
+    return h('div', { class: 'card' },
+        h('div', { class: 'card-header' }, h('h2', {}, 'Health & load'),
+            h('span', { class: `badge ${hl.ready ? 'ok' : 'off'}` }, hl.ready ? 'ready' : 'not ready')),
+        h('div', { class: 'card-body' },
+            problems.length ? h('div', { class: 'callout error' }, problems.map(([k, v]) => h('div', {}, `${k}: ${v}`))) : null,
+            h('dl', { class: 'kv' },
+                h('dt', {}, 'Readiness checks'), h('dd', { class: 'badges' },
+                    ...Object.entries(hl.checks).map(([k, v]) => h('span', { class: 'check' }, `${k} `, checkBadge(v)))),
+                h('dt', {}, 'User SQL queries'), h('dd', {},
+                    `${uq.active} running · ${uq.queued} queued (limit ${uq.concurrency}) `,
+                    warn(uq.queued > 0, 'queueing'),
+                    h('div', { class: 'muted' }, `since start: ${uq.succeeded} ok · ${uq.failed} failed · ${uq.timedOut} timed out · ${uq.cancelled} cancelled `,
+                        warn(uq.timedOut > 0, 'timeouts'))),
+                h('dt', {}, 'Table exports'), h('dd', {},
+                    `${hl.exports.active} running (limit ${hl.exports.concurrency})`,
+                    h('div', { class: 'muted' }, `since start: ${exportsDone} completed · ${exportsFailed} failed · ${exportsRejected} rejected (busy)`)),
+                h('dt', {}, 'Lake storage'), h('dd', {}, hl.lake
+                    ? `${hl.lake.files.toLocaleString()} Parquet data file(s) · ${fmtBytes(hl.lake.bytes)}`
+                    : h('span', { class: 'badge off' }, 'catalog query failed')),
+                h('dt', {}, 'Kafka consumer lag'), h('dd', {}, lag.length
+                    ? [`${totalLag.toLocaleString()} message(s) behind `, warn(totalLag > 0, 'lagging'),
+                        h('div', { class: 'muted' }, lag.slice(0, 5).map(p => `${p.topic}[${p.partition}]: ${p.lag.toLocaleString()}`).join(' · ') + (lag.length > 5 ? ` · +${lag.length - 5} more` : ''))]
+                    : h('span', { class: 'muted' }, 'no batches consumed since start')),
+            )));
+}
+
 registerView('overview', async () => {
     const o = await api('GET', '/overview');
     const refresh = h('button', { class: 'btn', type: 'button', onclick: () => renderSection() }, icon('refresh'), 'Refresh');
@@ -472,6 +522,7 @@ registerView('overview', async () => {
             stat('Retention rules', o.retention.rules, `${o.retention.enabled} enabled`, 'olive'),
             stat('Console logins', o.access.consoleLogins, `${o.settings.overridden} setting override(s)`),
         ),
+        healthCard(o.health),
         h('div', { class: 'card' },
             h('div', { class: 'card-header' }, h('h2', {}, 'Gateway')),
             h('div', { class: 'card-body' },

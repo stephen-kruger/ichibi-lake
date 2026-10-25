@@ -76,6 +76,11 @@ export const SETTINGS = [
         help: 'Requests to /upload with more rows than this are rejected with HTTP 400.',
     },
     {
+        key: 'IMPORT_MAX_MB', section: 'ingestion', type: 'number', default: '1024',
+        min: 1, max: 102400, editable: true, live: true, label: 'Max console import size (MB)',
+        help: 'Largest file an admin can import on the Tables & Data page.',
+    },
+    {
         key: 'DEFAULT_PARTITION_KEY', section: 'ingestion', type: 'string', default: 'created',
         editable: true, live: true, label: 'Default partition key',
         help: 'Column(s) new tables are partitioned by (comma-separated), or "none".',

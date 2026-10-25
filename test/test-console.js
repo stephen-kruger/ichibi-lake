@@ -23,16 +23,16 @@ function assert(cond, msg) { if (!cond) throw new Error(msg); }
 /** Minimal cookie-aware client for the console API. */
 function client() {
     let cookie = '';
-    return async function call(method, path, body, { headers = {}, raw = false } = {}) {
+    return async function call(method, path, body, { headers = {}, raw = false, rawBody } = {}) {
         const res = await fetch(`${BASE_URL}/console/api${path}`, {
             method,
             headers: {
-                'Content-Type': 'application/json',
+                'Content-Type': rawBody !== undefined ? 'application/octet-stream' : 'application/json',
                 'X-Console-Request': '1',
                 ...(cookie ? { Cookie: cookie } : {}),
                 ...headers,
             },
-            body: body === undefined ? undefined : JSON.stringify(body),
+            body: rawBody !== undefined ? rawBody : body === undefined ? undefined : JSON.stringify(body),
         });
         const set = res.headers.get('set-cookie');
         if (set) cookie = set.split(';')[0].endsWith('=') ? '' : set.split(';')[0];
@@ -690,6 +690,96 @@ async function run() {
             assert((await asReader('GET', `/tables/console_batch_${TS}`)).status === 401, 'deactivated key');
         });
 
+        console.log('\n▸ Health, export & import');
+        const IMP = `console_import_${TS}`;
+        const csv = 'id,name,score,note\r\n1,alpha,10,plain\r\n2,beta,20,"has, comma"\r\n3,gamma,30,"say ""hi"""\r\n';
+        await test('overview includes readiness, query gate, exports and lake size', async () => {
+            const r = await admin('GET', '/overview');
+            const hl = r.data.health;
+            assert(hl && hl.ready === true, `health: ${JSON.stringify(hl)}`);
+            assert(hl.checks.ducklake === 'ok' && hl.checks.postgres === 'ok' && hl.checks.startup === 'ready', JSON.stringify(hl.checks));
+            assert(typeof hl.userQuery.active === 'number' && typeof hl.userQuery.queued === 'number', JSON.stringify(hl.userQuery));
+            assert(typeof hl.exports.active === 'number' && hl.exports.counters, JSON.stringify(hl.exports));
+            assert(hl.lake && hl.lake.tables >= 0 && hl.lake.files >= 0, JSON.stringify(hl.lake));
+            assert(Array.isArray(hl.kafkaLag), 'kafkaLag array');
+        });
+        await test('import dry run previews a CSV without writing', async () => {
+            const r = await admin('POST', `/data/import?filename=people.csv&table=${IMP}&mode=create&dryRun=1`, undefined, { rawBody: csv });
+            assert(r.status === 200, `status ${r.status} ${JSON.stringify(r.data)}`);
+            assert(r.data.totalRows === 3 && r.data.format === 'csv', JSON.stringify(r.data));
+            assert(r.data.columns.map(c => c.name).join(',') === 'id,name,score,note', JSON.stringify(r.data.columns));
+            assert(r.data.preview[1][3] === 'has, comma' && r.data.preview[2][3] === 'say "hi"', JSON.stringify(r.data.preview));
+            assert((await admin('GET', `/data/tables/${IMP}/schema`)).status === 404, 'dry run must not create the table');
+        });
+        await test('import creates a new table from CSV', async () => {
+            const r = await admin('POST', `/data/import?filename=people.csv&table=${IMP}&mode=create`, undefined, { rawBody: csv });
+            assert(r.status === 200 && r.data.inserted === 3, `status ${r.status} ${JSON.stringify(r.data)}`);
+            const rows = await admin('POST', `/data/tables/${IMP}/rows/query`, { sort: { column: 'id', dir: 'asc' } });
+            assert(rows.data.total === 3 && rows.data.rows[2].values[1] === 'gamma', JSON.stringify(rows.data));
+        });
+        await test('import into an existing name in create mode is 409', async () => {
+            const r = await admin('POST', `/data/import?filename=people.csv&table=${IMP}&mode=create&dryRun=1`, undefined, { rawBody: csv });
+            assert(r.status === 409, `status ${r.status}`);
+        });
+        await test('append dry run reports new columns; append adds them', async () => {
+            const nd = '{"id": 4, "name": "delta", "score": 40, "extra": "x"}\n{"id": 5, "name": "epsilon", "score": 50, "extra": "y"}\n';
+            const dry = await admin('POST', `/data/import?filename=more.ndjson&table=${IMP}&mode=append&dryRun=1`, undefined, { rawBody: nd });
+            assert(dry.status === 200, `status ${dry.status} ${JSON.stringify(dry.data)}`);
+            const extra = dry.data.plan.columns.find(c => c.name === 'extra');
+            assert(extra?.action === 'add', JSON.stringify(dry.data.plan));
+            assert(dry.data.plan.missing.includes('note'), 'note reported missing');
+            const r = await admin('POST', `/data/import?filename=more.ndjson&table=${IMP}&mode=append`, undefined, { rawBody: nd });
+            assert(r.status === 200 && r.data.inserted === 2 && r.data.added.includes('extra'), JSON.stringify(r.data));
+            const schema = await admin('GET', `/data/tables/${IMP}/schema`);
+            assert(schema.data.rows === 5 && schema.data.columns.some(c => c.name === 'extra'), JSON.stringify(schema.data));
+        });
+        await test('import round-trips a Parquet export', async () => {
+            const res = await admin('GET', `/data/tables/${IMP}/export?format=parquet`, undefined, { raw: true });
+            assert(res.status === 200 && res.headers.get('x-total-rows') === '5', `status ${res.status}`);
+            const buf = Buffer.from(await res.arrayBuffer());
+            assert(buf.subarray(0, 4).toString() === 'PAR1', 'parquet magic');
+            const copy = `${IMP}_copy`;
+            const r = await admin('POST', `/data/import?filename=x.parquet&table=${copy}&mode=create`, undefined, { rawBody: buf });
+            assert(r.status === 200 && r.data.inserted === 5, JSON.stringify(r.data));
+            await admin('DELETE', `/data/tables/${copy}`, { confirm: copy });
+        });
+        await test('export honours grid filters, sort and limit', async () => {
+            const filters = encodeURIComponent(JSON.stringify([{ column: 'score', op: 'gte', value: '20' }]));
+            const sort = encodeURIComponent(JSON.stringify({ column: 'score', dir: 'desc' }));
+            const res = await admin('GET', `/data/tables/${IMP}/export?format=ndjson&filters=${filters}&sort=${sort}&limit=3`, undefined, { raw: true });
+            assert(res.status === 200, `status ${res.status}`);
+            assert(res.headers.get('x-total-rows') === '4' && res.headers.get('x-export-truncated') === 'true', 'headers');
+            const lines = (await res.text()).trim().split('\n').map(l => JSON.parse(l));
+            assert(lines.map(l => l.name).join(',') === 'epsilon,delta,gamma', JSON.stringify(lines));
+        });
+        await test('csv export has a header row and quotes values', async () => {
+            const res = await admin('GET', `/data/tables/${IMP}/export?format=csv&sort=${encodeURIComponent('{"column":"id","dir":"asc"}')}`, undefined, { raw: true });
+            const text = await res.text();
+            assert(res.headers.get('content-disposition').includes(`${IMP}.csv`), 'filename');
+            assert(text.startsWith('id,name,score,note,extra\r\n') && text.includes('"has, comma"') && text.includes('"say ""hi"""'), text);
+        });
+        await test('export and import refuse system tables and bad input', async () => {
+            assert((await admin('GET', '/data/tables/_rbac_users/export?format=csv')).status === 404, 'system table export');
+            assert((await admin('GET', `/data/tables/${IMP}/export?format=xlsx`)).status === 400, 'bad format');
+            assert((await admin('POST', '/data/import?filename=x.csv&table=_evil&mode=create', undefined, { rawBody: csv })).status === 400, 'system table import');
+            assert((await admin('POST', '/data/import?filename=x.csv&table=_rbac_users&mode=append', undefined, { rawBody: csv })).status === 404, 'append to system table');
+            assert((await admin('POST', '/data/import?filename=x.bin&table=t1&mode=create', undefined, { rawBody: csv })).status === 400, 'unknown extension');
+            assert((await admin('POST', `/data/import?filename=x.parquet&table=${IMP}_bad&mode=create`, undefined, { rawBody: 'not parquet' })).status === 400, 'unreadable file');
+        });
+        await test('viewers can export but not import', async () => {
+            const name = `ci_viewer2_${TS}`, pass = `viewer2-pass-${TS}`;
+            await admin('POST', '/logins', { username: name, password: pass, role: 'viewer' });
+            try {
+                const v = client();
+                await v('POST', '/login', { username: name, password: pass });
+                assert((await v('GET', `/data/tables/${IMP}/export?format=csv`, undefined, { raw: true })).status === 200, 'viewer export');
+                assert((await v('POST', `/data/import?filename=x.csv&table=${IMP}&mode=append&dryRun=1`, undefined, { rawBody: csv })).status === 403, 'viewer import');
+            } finally {
+                await admin('DELETE', `/logins/${name}`);
+            }
+        });
+        await admin('DELETE', `/data/tables/${IMP}`, { confirm: IMP });
+
         console.log('\n▸ Overview & audit');
         await test('overview reports gateway and DuckDB details', async () => {
             const r = await admin('GET', '/overview');
@@ -699,7 +789,8 @@ async function run() {
             const r = await admin('GET', '/audit?limit=100');
             const actions = new Set(r.data.entries.map(e => e.action));
             for (const a of ['console.login', 'setting.update', 'api_key.revoke', 'login.create', 'prune.rule_create', 'prune.job',
-                'row.update', 'row.insert', 'row.delete', 'schema.add_column', 'schema.alter_column', 'table.rename', 'table.drop', 'table.create']) {
+                'row.update', 'row.insert', 'row.delete', 'schema.add_column', 'schema.alter_column', 'table.rename', 'table.drop', 'table.create',
+                'table.export', 'table.import']) {
                 assert(actions.has(a), `missing audit action ${a}`);
             }
         });

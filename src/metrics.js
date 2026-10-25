@@ -62,6 +62,11 @@ export function recordKafkaLag(topic, partition, lag) {
     kafkaLag.set(`${topic}:${partition}`, { labels: { topic, partition: String(partition) }, value: Number(lag) || 0 });
 }
 
+/** Current Kafka consumer lag per topic partition (for the console Overview). */
+export function kafkaLagSnapshot() {
+    return [...kafkaLag.values()].map(({ labels, value }) => ({ topic: labels.topic, partition: Number(labels.partition), lag: value }));
+}
+
 // --- Text exposition ------------------------------------------------------------
 
 function escapeLabel(v) {

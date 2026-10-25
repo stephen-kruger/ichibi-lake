@@ -7,9 +7,15 @@
 import express, { Router } from 'express';
 import os from 'os';
 import fs from 'fs';
-import { createHash, randomBytes } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
+import path from 'path';
+import { pipeline } from 'stream/promises';
+import { Transform } from 'stream';
 import { fileURLToPath } from 'url';
-import { execute } from '../db.js';
+import { execute, userQueryStats } from '../db.js';
+import { checkReadiness, lakeStats } from '../health.js';
+import { exportStats } from '../export.js';
+import { kafkaLagSnapshot } from '../metrics.js';
 import { SECTIONS, SETTINGS, getSettingDef, normaliseSettingValue, maskSecret } from './registry.js';
 import * as store from './store.js';
 import {
@@ -59,6 +65,30 @@ function describeRule(rule) {
 
 function httpError(statusCode, message) {
     return Object.assign(new Error(message), { statusCode });
+}
+
+// Upper bound for one console import upload (IMPORT_MAX_MB, editable live).
+const importMaxBytes = () => Math.max(1, parseInt(process.env.IMPORT_MAX_MB || '1024', 10) || 1024) * 1024 * 1024;
+const IMPORT_TMP_DIR = () => process.env.IMPORT_TMP_DIR || path.join(os.tmpdir(), 'ichibi-import');
+
+/**
+ * Stream a raw request body to `file`, failing with 413 once it exceeds
+ * `maxBytes` (checked against Content-Length up front and while streaming),
+ * so an upload never sits in memory.
+ */
+async function receiveUpload(req, file, maxBytes) {
+    const declared = Number(req.headers['content-length']);
+    if (declared > maxBytes) throw httpError(413, `File too large (limit ${Math.round(maxBytes / 1048576)} MB, IMPORT_MAX_MB)`);
+    let seen = 0;
+    const limit = new Transform({
+        transform(chunk, enc, cb) {
+            seen += chunk.length;
+            if (seen > maxBytes) return cb(httpError(413, `File too large (limit ${Math.round(maxBytes / 1048576)} MB, IMPORT_MAX_MB)`));
+            cb(null, chunk);
+        },
+    });
+    await pipeline(req, limit, fs.createWriteStream(file));
+    if (seen === 0) throw httpError(400, 'The uploaded file is empty');
 }
 
 function clientIp(req) {
@@ -399,6 +429,13 @@ export function createConsoleRouter() {
             retention: { rules: rules.length, enabled: rules.filter(r => r.enabled).length },
             settings: { overridden },
             kafka: { brokers: process.env.KAFKA_BROKERS || '' },
+            health: {
+                ...(await checkReadiness()),
+                userQuery: userQueryStats(),
+                exports: exportStats(),
+                lake: await lakeStats(),
+                kafkaLag: kafkaLagSnapshot(),
+            },
         });
     }));
 
@@ -699,6 +736,51 @@ export function createConsoleRouter() {
         res.json(await data.readRows(req.params.table, { page, pageSize, sort, filters, search }));
     }));
 
+    // Download a table (or the rows matching the grid's filters/search/sort).
+    // Read-only, so open to every console role; audited like other data access
+    // that leaves the console.
+    api.get('/data/tables/:table/export', wrap(async (req, res) => {
+        const { format = 'parquet', search = '', limit } = req.query;
+        let filters = [];
+        let sort = null;
+        try {
+            if (req.query.filters) filters = JSON.parse(String(req.query.filters));
+            if (req.query.sort) sort = JSON.parse(String(req.query.sort));
+        } catch { return res.status(400).json({ error: 'filters and sort must be JSON' }); }
+        await audit(req, 'table.export', `${req.params.table} as ${format}` +
+            (filters.length || search ? ` (filtered: ${filters.length} filter(s)${search ? ', search' : ''})` : ''));
+        await data.exportTable(req.params.table, { format: String(format), filters, search: String(search), sort, limit }, res);
+    }));
+
+    // Import a CSV / Parquet / JSON file uploaded as the raw request body.
+    // ?dryRun=1 only reads it and returns a preview and the schema plan; the
+    // console then sends the same file again without dryRun to write it.
+    api.post('/data/import', requireAdmin, wrap(async (req, res) => {
+        const filename = String(req.query.filename || '');
+        const format = data.detectImportFormat(req.query.format ? String(req.query.format) : '', filename);
+        const options = {
+            format,
+            table: String(req.query.table || ''),
+            mode: String(req.query.mode || 'create'),
+            dryRun: req.query.dryRun === '1' || req.query.dryRun === 'true',
+            addColumns: req.query.addColumns !== '0' && req.query.addColumns !== 'false',
+        };
+        const dir = IMPORT_TMP_DIR();
+        await fs.promises.mkdir(dir, { recursive: true });
+        const file = path.join(dir, `${randomUUID()}.${format}`);
+        try {
+            await receiveUpload(req, file, importMaxBytes());
+            const result = await data.importFile(file, options);
+            if (!options.dryRun) {
+                await audit(req, 'table.import', `${result.table}: ${result.inserted} row(s) from ${filename || 'upload'} (${format}, ${options.mode})` +
+                    (result.added?.length ? `; added column(s) ${result.added.join(', ')}` : ''));
+            }
+            res.json({ success: true, ...result });
+        } finally {
+            fs.promises.unlink(file).catch(() => {});
+        }
+    }));
+
     api.post('/data/tables/:table/rows', requireAdmin, wrap(async (req, res) => {
         const result = await data.insertRow(req.params.table, req.body?.values);
         await audit(req, 'row.insert', req.params.table);
@@ -764,6 +846,7 @@ export function createConsoleRouter() {
     api.use((err, req, res, next) => {
         const status = err.statusCode || err.status || 500;
         if (status >= 500) console.error('[Console] API error:', err);
+        if (res.headersSent) return res.destroy(err);
         res.status(status).json({ error: status >= 500 ? 'Internal error' : err.message });
     });
 
