@@ -1,5 +1,6 @@
 /**
- * Table exports (GET /tables/:tableName/export).
+ * Table exports (GET /tables/:tableName/export, and the console's single and
+ * multi-table downloads; runMultiExport() packs several tables into one ZIP).
  *
  * Exports run on the primary DuckDB instance, on a dedicated (unpooled)
  * connection, because the locked-down user-query instance cannot write files
@@ -35,6 +36,7 @@ import { randomUUID } from 'crypto';
 import { once } from 'events';
 import { pipeline } from 'stream/promises';
 import { openDedicatedConnection } from './db.js';
+import { ZipWriter } from './zip.js';
 
 export const EXPORT_FORMATS = {
     parquet: { contentType: 'application/vnd.apache.parquet', ext: 'parquet' },
@@ -74,6 +76,30 @@ function csvField(value) {
     if (value === null || value === undefined) return '';
     const text = typeof value === 'string' ? value : String(value);
     return /[",\r\n]|^\s|\s$/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+/** COPY the rows to a new temp Parquet file and return its path. */
+async function copyToParquet(conn, sql, params, types) {
+    const dir = exportTmpDir();
+    await fsp.mkdir(dir, { recursive: true });
+    const file = path.join(dir, `${randomUUID()}.parquet`);
+    await conn.run(`COPY (${sql}) TO '${file.replace(/'/g, "''")}' (FORMAT parquet, COMPRESSION zstd)`, params, types);
+    return file;
+}
+
+/** Stream rows as CSV (with header) or NDJSON text to `emit`, chunk by chunk. */
+async function streamText(conn, format, sql, params, types, emit) {
+    const query = format === 'ndjson' ? `SELECT to_json(_r)::VARCHAR FROM (${sql}) _r` : sql;
+    const result = await conn.stream(query, params, types);
+    if (format === 'csv') await emit(result.columnNames().map(csvField).join(',') + '\r\n');
+    for (;;) {
+        const chunk = await result.fetchChunk();
+        if (!chunk || chunk.rowCount === 0) break;
+        const rows = chunk.getRows();
+        await emit(format === 'ndjson'
+            ? rows.map(r => r[0]).join('\n') + '\n'
+            : rows.map(r => r.map(csvField).join(',')).join('\r\n') + '\r\n');
+    }
 }
 
 /**
@@ -118,12 +144,7 @@ export async function runExport({ format, selectSql, countSql, params, types, li
         const rowCount = Math.min(total, cap);
         const limitedSql = `${selectSql} LIMIT ${cap}`;
 
-        if (format === 'parquet') {
-            const dir = exportTmpDir();
-            await fsp.mkdir(dir, { recursive: true });
-            tmpFile = path.join(dir, `${randomUUID()}.parquet`);
-            await conn.run(`COPY (${limitedSql}) TO '${tmpFile.replace(/'/g, "''")}' (FORMAT parquet, COMPRESSION zstd)`, params, types);
-        }
+        if (format === 'parquet') tmpFile = await copyToParquet(conn, limitedSql, params, types);
 
         res.status(200);
         res.setHeader('Content-Type', spec.contentType);
@@ -144,18 +165,7 @@ export async function runExport({ format, selectSql, countSql, params, types, li
             }
             await conn.run('COMMIT');
         } else {
-            const sql = format === 'ndjson' ? `SELECT to_json(_r)::VARCHAR FROM (${limitedSql}) _r` : limitedSql;
-            const result = await conn.stream(sql, params, types);
-            if (format === 'csv') await write(res, result.columnNames().map(csvField).join(',') + '\r\n');
-            for (;;) {
-                const chunk = await result.fetchChunk();
-                if (!chunk || chunk.rowCount === 0) break;
-                const rows = chunk.getRows();
-                const text = format === 'ndjson'
-                    ? rows.map(r => r[0]).join('\n') + '\n'
-                    : rows.map(r => r.map(csvField).join(',')).join('\r\n') + '\r\n';
-                await write(res, text);
-            }
+            await streamText(conn, format, limitedSql, params, types, text => write(res, text));
             await conn.run('COMMIT');
             res.end();
         }
@@ -167,6 +177,119 @@ export async function runExport({ format, selectSql, countSql, params, types, li
         } else {
             count(format, err.cancelled || res.destroyed ? 'cancelled' : 'failed');
         }
+        if (res.headersSent) {
+            res.destroy(err);
+            return;
+        }
+        throw err;
+    } finally {
+        clearTimeout(timer);
+        res.off('close', onClose);
+        if (conn) { try { conn.closeSync(); } catch (_) { /* ignore */ } }
+        if (tmpFile) fsp.unlink(tmpFile).catch(() => {});
+        active--;
+    }
+}
+
+/**
+ * Export several tables as one ZIP archive written to `res`: one file per table
+ * (`<file>.<ext>`) plus manifest.json with each table's row counts and whether
+ * it hit the row cap (a multi-file response cannot say that in headers).
+ *
+ *   tables   [{ name, file, selectSql, countSql }]  (no parameters: whole tables)
+ *
+ * Every table is read in ONE transaction, so the archive is a consistent
+ * snapshot of the lake. It takes one EXPORT_CONCURRENCY slot; EXPORT_MAX_ROWS
+ * applies per table, and EXPORT_TIMEOUT_MS per table (a whole-lake archive can
+ * legitimately take much longer than any single export). Parquet files are
+ * staged one at a time and stored as is (already compressed); CSV / NDJSON are
+ * deflated. Errors before the first byte are thrown (with statusCode); later
+ * errors abort the response, so the client sees a failed download rather than
+ * a silently incomplete archive.
+ */
+export async function runMultiExport({ format, tables, filename, res }) {
+    const spec = EXPORT_FORMATS[format];
+    const metric = `zip-${format}`;
+    if (active >= exportConcurrency()) {
+        count(metric, 'rejected');
+        res.setHeader('Retry-After', '10');
+        throw Object.assign(new Error(`Too many concurrent exports (EXPORT_CONCURRENCY=${exportConcurrency()}); retry later`), { statusCode: 429 });
+    }
+    active++;
+    const cap = exportMaxRows();
+    let conn;
+    let tmpFile = null;
+    let timer;
+    let timedOut = false;
+    let entry = null;
+    const armTimer = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+            timedOut = true;
+            try { conn.interrupt(); } catch (_) { /* ignore */ }
+            if (res.headersSent) res.destroy(new Error('export timed out'));
+        }, exportTimeoutMs());
+    };
+    const onClose = () => { if (!res.writableFinished) conn?.interrupt?.(); };
+    res.on('close', onClose);
+    try {
+        conn = await openDedicatedConnection();
+        armTimer();
+        await conn.run('BEGIN TRANSACTION');
+        // Count first (cheap, from DuckLake metadata) so a broken table fails
+        // the request with a JSON error before any byte is sent.
+        const plan = [];
+        for (const t of tables) {
+            const total = Number((await (await conn.run(t.countSql)).getRows())[0][0]);
+            plan.push({ ...t, total, rows: Math.min(total, cap) });
+        }
+
+        res.status(200);
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}.zip"`);
+        res.setHeader('X-Table-Count', String(plan.length));
+        res.setHeader('X-Row-Cap', String(cap));
+
+        const zip = new ZipWriter(chunk => write(res, chunk));
+        const startedAt = new Date();
+        for (const t of plan) {
+            armTimer();
+            const sql = `${t.selectSql} LIMIT ${cap}`;
+            const name = `${t.file}.${spec.ext}`;
+            if (format === 'parquet') {
+                tmpFile = await copyToParquet(conn, sql);
+                entry = await zip.entry(name, { compress: false, date: startedAt });
+                for await (const chunk of fs.createReadStream(tmpFile, { highWaterMark: 1 << 20 })) await entry.write(chunk);
+                await entry.close();
+                await fsp.unlink(tmpFile).catch(() => {});
+                tmpFile = null;
+            } else {
+                entry = await zip.entry(name, { compress: true, date: startedAt });
+                await streamText(conn, format, sql, undefined, undefined, text => entry.write(text));
+                await entry.close();
+            }
+            entry = null;
+        }
+        await conn.run('COMMIT');
+        const manifest = {
+            exportedAt: startedAt.toISOString(),
+            format,
+            rowCap: cap,
+            consistentSnapshot: true,
+            tables: plan.map(t => ({ table: t.name, file: `${t.file}.${spec.ext}`, rows: t.rows, totalRows: t.total, truncated: t.total > t.rows })),
+        };
+        await zip.add('manifest.json', JSON.stringify(manifest, null, 2) + '\n', { date: startedAt });
+        await zip.finish();
+        res.end();
+        count(metric, 'succeeded');
+    } catch (err) {
+        if (timedOut) {
+            count(metric, 'timeout');
+            err = Object.assign(new Error(`Export of one table exceeded the ${exportTimeoutMs()}ms timeout`), { statusCode: 504 });
+        } else {
+            count(metric, err.cancelled || res.destroyed ? 'cancelled' : 'failed');
+        }
+        if (entry) entry.abort();
         if (res.headersSent) {
             res.destroy(err);
             return;

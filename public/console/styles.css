@@ -330,6 +330,9 @@ select.compact { width: auto; padding: 5px 8px; font-size: 13px; }
 .picker-row:hover { background: var(--surface-2); }
 .picker-row.on { background: rgba(62, 109, 134, 0.07); }
 .picker-row .picker-cols { margin-left: auto; text-align: right; }
+.picker-empty { padding: 6px 12px; }
+.label-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.label-row .label { margin: 0; }
 tr.job-row td { vertical-align: top; }
 tr.job-detail > td { background: var(--surface-2); padding: 8px 20px 14px; }
 table.inner { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }

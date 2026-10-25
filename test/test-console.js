@@ -9,6 +9,7 @@
  */
 import { execFileSync } from 'child_process';
 import { API_KEY, BASE_URL } from './_env.js';
+import { readZip } from './zip-reader.js';
 
 const CONTAINER = process.env.CONSOLE_CONTAINER || 'ichibi-lake';
 const TS = Date.now();
@@ -789,11 +790,54 @@ async function run() {
                 const v = client();
                 await v('POST', '/login', { username: name, password: pass });
                 assert((await v('GET', `/data/tables/${IMP}/export?format=csv`, undefined, { raw: true })).status === 200, 'viewer export');
+                const zipRes = await v('GET', `/data/export?format=csv&tables=${IMP}`, undefined, { raw: true });
+                assert(zipRes.status === 200 && readZip(Buffer.from(await zipRes.arrayBuffer())).length === 2, 'viewer multi-table export');
                 assert((await v('POST', `/data/import?filename=x.csv&table=${IMP}&mode=append&dryRun=1`, undefined, { rawBody: csv })).status === 403, 'viewer import');
             } finally {
                 await admin('DELETE', `/logins/${name}`);
             }
         });
+        const IMP2 = `${IMP}_b`;
+        await test('multi-table export: CSV ZIP with one file per table and a manifest', async () => {
+            const r = await admin('POST', `/data/import?filename=b.csv&table=${IMP2}&mode=create`, undefined, { rawBody: 'k,v\n1,one\n2,two\n' });
+            assert(r.status === 200 && r.data.inserted === 2, JSON.stringify(r.data));
+            const res = await admin('GET', `/data/export?format=csv&tables=${IMP},${IMP2}`, undefined, { raw: true });
+            assert(res.status === 200, `status ${res.status}`);
+            assert(res.headers.get('content-type') === 'application/zip', res.headers.get('content-type'));
+            assert(/filename="lake-export-[0-9TZ-]+\.zip"/.test(res.headers.get('content-disposition')), res.headers.get('content-disposition'));
+            const entries = readZip(Buffer.from(await res.arrayBuffer()));
+            assert(entries.map(e => e.name).join(',') === `${IMP}.csv,${IMP2}.csv,manifest.json`, entries.map(e => e.name).join(','));
+            assert(entries[0].data.toString().startsWith('id,name,score,note,extra\r\n'), 'csv header');
+            const b = entries[1].data.toString();
+            assert(b.startsWith('k,v') && b.includes('1,one') && b.includes('2,two') && b.trim().split('\r\n').length === 3, b);
+            const manifest = JSON.parse(entries[2].data);
+            assert(manifest.format === 'csv' && manifest.consistentSnapshot === true, JSON.stringify(manifest));
+            assert(manifest.tables.map(t => `${t.table}:${t.rows}:${t.truncated}`).join(',') === `${IMP}:5:false,${IMP2}:2:false`, JSON.stringify(manifest.tables));
+        });
+        await test('multi-table export: Parquet files are stored and re-importable', async () => {
+            const res = await admin('GET', `/data/export?format=parquet&tables=${IMP2}`, undefined, { raw: true });
+            assert(res.status === 200, `status ${res.status}`);
+            const [pq, manifest] = readZip(Buffer.from(await res.arrayBuffer()));
+            assert(pq.name === `${IMP2}.parquet` && pq.method === 0 && pq.data.subarray(0, 4).toString() === 'PAR1', `${pq.name} ${pq.method}`);
+            assert(manifest.name === 'manifest.json', manifest.name);
+            const copy = `${IMP2}_copy`;
+            const r = await admin('POST', `/data/import?filename=x.parquet&table=${copy}&mode=create`, undefined, { rawBody: pq.data });
+            assert(r.status === 200 && r.data.inserted === 2, JSON.stringify(r.data));
+            await admin('DELETE', `/data/tables/${copy}`, { confirm: copy });
+        });
+        await test('multi-table export: no list exports every user table, never system tables', async () => {
+            const res = await admin('GET', '/data/export?format=ndjson', undefined, { raw: true });
+            assert(res.status === 200, `status ${res.status}`);
+            const names = readZip(Buffer.from(await res.arrayBuffer())).map(e => e.name);
+            assert(names.includes(`${IMP}.ndjson`) && names.includes(`${IMP2}.ndjson`) && names.at(-1) === 'manifest.json', names.join(','));
+            assert(!names.some(n => n.startsWith('_')), `system table exported: ${names.join(',')}`);
+        });
+        await test('multi-table export: refuses system tables, unknown tables and bad formats', async () => {
+            assert((await admin('GET', `/data/export?format=csv&tables=${IMP},_rbac_users`)).status === 404, 'system table');
+            assert((await admin('GET', `/data/export?format=csv&tables=no_such_table_${TS}`)).status === 404, 'unknown table');
+            assert((await admin('GET', `/data/export?format=xlsx&tables=${IMP}`)).status === 400, 'bad format');
+        });
+        await admin('DELETE', `/data/tables/${IMP2}`, { confirm: IMP2 });
         await admin('DELETE', `/data/tables/${IMP}`, { confirm: IMP });
 
         console.log('\n▸ Overview & audit');
@@ -806,7 +850,7 @@ async function run() {
             const actions = new Set(r.data.entries.map(e => e.action));
             for (const a of ['console.login', 'setting.update', 'api_key.revoke', 'login.create', 'prune.rule_create', 'prune.job',
                 'row.update', 'row.insert', 'row.delete', 'schema.add_column', 'schema.alter_column', 'table.rename', 'table.drop', 'table.create',
-                'table.export', 'table.import']) {
+                'table.export', 'tables.export', 'table.import']) {
                 assert(actions.has(a), `missing audit action ${a}`);
             }
         });
