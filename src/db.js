@@ -453,6 +453,32 @@ export async function executeWithParams(sql, params, types) {
 }
 
 /**
+ * Parse `sql` with DuckDB's own parser and return the statement tree as JSON
+ * (json_serialize_sql). Runs on the primary instance: parsing executes
+ * nothing, and the user-query instance stays reserved for running queries.
+ * Used by the table-aware authorization of user-supplied SQL
+ * (src/sql-tables.js).
+ */
+export async function serializeSql(sql) {
+    const rows = await executeWithParams('SELECT json_serialize_sql(?) AS ast', [String(sql)], [VARCHAR]);
+    const ast = rows[0]?.ast;
+    return typeof ast === 'string' ? JSON.parse(ast) : ast;
+}
+
+/**
+ * Look up a table in the lake's main schema, case-insensitively (as DuckDB
+ * resolves identifiers). Returns { name, type } with the catalog spelling of
+ * the name and its table_type ('BASE TABLE' or 'VIEW'), or null.
+ */
+export async function findLakeTable(name) {
+    const rows = await executeWithParams(
+        `SELECT table_name, table_type FROM information_schema.tables
+         WHERE table_catalog = 'ducklake' AND table_schema = 'main' AND lower(table_name) = lower(?)`,
+        [String(name)], [VARCHAR]);
+    return rows.length ? { name: rows[0].table_name, type: rows[0].table_type } : null;
+}
+
+/**
  * Managed connection wrapper for complex transactions.
  */
 export async function withConnection(fn) {
