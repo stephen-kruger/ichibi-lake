@@ -144,5 +144,7 @@ vite.config.ts.timestamp-*
 
 # data directory
 docker/data/
+# Storage settings saved from the admin console (native runs; may hold S3 keys)
+/config/
 
 .continue

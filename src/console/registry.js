@@ -42,7 +42,7 @@ export const SECTIONS = [
     { id: 'security',   group: 'Settings', title: 'Security',         icon: 'shield',    kind: 'settings' },
     { id: 'ingestion',  group: 'Settings', title: 'Ingestion',        icon: 'upload',    kind: 'settings' },
     { id: 'query',      group: 'Settings', title: 'Query Engine',     icon: 'search',    kind: 'settings' },
-    { id: 'storage',    group: 'Settings', title: 'Storage',          icon: 'database',  kind: 'settings' },
+    { id: 'storage',    group: 'Settings', title: 'Storage',          icon: 'database',  kind: 'custom' },
     { id: 'kafka',      group: 'Settings', title: 'Kafka',            icon: 'stream',    kind: 'settings' },
     { id: 'audit',      group: 'System',  title: 'Audit Log',         icon: 'list',      kind: 'custom' },
     { id: 'account',    group: 'System',  title: 'My Account',        icon: 'user',      kind: 'custom' },

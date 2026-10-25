@@ -99,6 +99,10 @@ services:
       - ./data/ducklake:/app/data_files
       # Persist BLOB files across container rebuilds when USE_FILESYSTEM_BLOBS=1.
       - ./data/blobs:/app/blobs
+      # Storage settings saved on the console's Storage page (storage.json,
+      # mode 0600: it can hold S3 credentials). Applied at startup and takes
+      # precedence over the DUCKLAKE_DATA_PATH / S3_* / BLOB values above.
+      - ./data/config:/app/config
     extra_hosts:
       # Allows the container to reach the Docker host for Kafka brokers etc.
       - "host.docker.internal:host-gateway"

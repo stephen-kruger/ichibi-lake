@@ -9,6 +9,10 @@
 # "error from sender: ... permission denied". It is never a build input.
 docker/data/
 
+# Storage settings saved from the admin console by a native run (may hold
+# S3 credentials); in Docker they live in the docker/data/config bind mount.
+config/
+
 # Dependencies are reinstalled inside the image via `npm ci` in the Dockerfile.
 node_modules/
 

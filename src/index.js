@@ -1,3 +1,6 @@
+// First: applies storage settings saved in the admin console to process.env
+// before any module below reads them (see src/storage-config.js).
+import './storage-config.js';
 import express from 'express';
 import cors from 'cors';
 import compression from 'compression';
