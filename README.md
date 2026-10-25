@@ -45,6 +45,8 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
 - [9. Event Ingestion](#9-event-ingestion)
   - [9.1 JSON Upload](#91-json-upload)
   - [9.2 Raw SQL Query](#92-raw-sql-query)
+  - [9.3 Bulk Import (Files & Object Storage)](#93-bulk-import-files--object-storage)
+  - [9.4 Idempotent Retries](#94-idempotent-retries)
 - [10. Kafka Integration](#10-kafka-integration)
   - [10.1 HTTP Sink](#101-http-sink-post-kafka-sink)
   - [10.2 Internal Background Consumer](#102-internal-background-consumer)
@@ -128,6 +130,10 @@ The gateway runs two DuckDB instances: a **primary** instance (connection pool) 
 | `PORT` | `3000` | Port the Node gateway listens on |
 | `JSON_BODY_LIMIT` | `50mb` | Max JSON request body size (e.g. `2gb`, `50mb`) |
 | `MAX_BATCH_SIZE` | `10000` | Max rows per `/upload` request; prevents OOM. Also editable live in the console. |
+| `IMPORT_MAX_MB` | `1024` | Largest file accepted by `POST /tables/:tableName/import` and the console import (HTTP 413 above it). Also editable live in the console. |
+| `IMPORT_TMP_DIR` | *OS temp dir*`/ichibi-import` | Where uploaded import files are staged (deleted after each request) |
+| `IMPORT_ALLOWED_SOURCES` | *(empty)* | Comma-separated `s3://bucket/prefix/` entries any writer may import from ([§9.3](#93-bulk-import-files--object-storage)). Other `s3://` sources need a superuser key. |
+| `IDEMPOTENCY_TTL_HOURS` | `24` | How long an `Idempotency-Key` result is replayed ([§9.4](#94-idempotent-retries)). Also editable live in the console. |
 | `NODE_ENV` | `production` | Node environment |
 
 ### 3.2 DuckLake (Postgres Metadata)
@@ -199,7 +205,7 @@ User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endp
 3. **Locked-down engine.** The SQL runs on a separate DuckDB instance that has dropped its DuckLake secret, can read only the lake's data directory (no `read_text('/etc/...')`, no BLOB directory, no network), and does not attach the admin console's catalog. With object storage, the only remote location it can read is the lake's own `s3://bucket/prefix/` (other prefixes, other buckets and `http(s)://` are refused). It keeps the S3 secret, because reading the lake needs it, but DuckDB only ever shows it redacted and refuses to display it unredacted once external access is disabled.
 4. **No connection-string introspection.** `duckdb_databases()`, `pragma_database_list`, `duckdb_settings()`, `current_setting()`, `duckdb_secrets()` and `which_secret()` are rejected, because DuckDB would reveal the metadata Postgres password through them.
 
-**System tables** (names starting with `_`: RBAC users and their API keys, ACLs, the graph registry) are never reachable through the table REST endpoints, for any key, and cannot be targets of `/upload`, `/kafka-sink` or the Kafka consumer. They are managed through the superuser-only admin API and the console.
+**System tables** (names starting with `_`: RBAC users and their API keys, ACLs, the graph registry) are never reachable through the table REST endpoints, for any key, and cannot be targets of `/upload`, `/kafka-sink`, `/tables/:tableName/import` or the Kafka consumer. They are managed through the superuser-only admin API and the console.
 
 ### 3.6 Performance & Caching
 
@@ -747,7 +753,7 @@ curl -H "x-api-key: YOUR_KEY" -OJ \
 | `POST` | `/upload` | Upload JSON array to `ichibi_table` |
 | `POST` | `/upload/:tableName` | Upload JSON array to a specific table |
 
-New tables are created automatically with type inference; the caller is registered as an ACL owner. New columns in later uploads are added automatically (schema evolution). Batches larger than `MAX_BATCH_SIZE` are rejected, and table names starting with `_` (reserved for system tables) return 404.
+New tables are created automatically with type inference; the caller is registered as an ACL owner. New columns in later uploads are added automatically (schema evolution). Batches larger than `MAX_BATCH_SIZE` are rejected, and table names starting with `_` (reserved for system tables) return 404. Send an `Idempotency-Key` header to make retries safe ([§9.4](#94-idempotent-retries)). For files and large loads use the bulk import endpoint ([§9.3](#93-bulk-import-files--object-storage)).
 
 ```sh
 curl -X POST "http://ichibi-lake:3333/upload/user_stats" \
@@ -788,6 +794,77 @@ curl -N -X POST "http://ichibi-lake:3333/query?format=ndjson" \
 At most `QUERY_STREAM_MAX_ROWS` rows (`X-Row-Cap` header), within `USER_QUERY_STREAM_TIMEOUT_MS` for the whole transfer. Errors before the first row (bad SQL, unknown table) still return a JSON error with the usual status code; an error after streaming started (for example the timeout) ends the body with `{"_ichibi":{"error":"...","status":504}}` instead of the normal trailer, so a response without a trailer line was cut off. The gateway applies backpressure: it fetches the next chunk only when the client has read the previous one, and a client disconnect interrupts the query and frees its slot.
 
 Both formats accept `"maxRows": <n>` in the body to lower (never raise) the cap. Values serialise identically in both: BIGINTs as strings, BLOBs as base64, other DuckDB types (timestamps, lists, structs) as DuckDB's JSON value objects, as before. Arrow IPC output is not offered yet; use the Parquet table export for typed bulk data. Memory note: blocking operators (`ORDER BY`, `GROUP BY`, `DISTINCT`) still need DuckDB working memory for their input before the first row is produced; streaming bounds the gateway's memory, not DuckDB's.
+
+### 9.3 Bulk Import (Files & Object Storage)
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/tables/:tableName/import` | Load a CSV, Parquet, NDJSON or JSON-array file (raw request body), or objects from S3 |
+
+**Uploading a file.** Send the file itself as the request body (not multipart). The gateway streams it to a temp file (`IMPORT_TMP_DIR`), so the size is bounded by `IMPORT_MAX_MB` (HTTP 413 above it), not by memory or `JSON_BODY_LIMIT`, then loads it with DuckDB: `read_csv` (header, delimiter and types auto-detected), `read_parquet` or `read_json_auto` (a JSON array or one object per line). The format comes from `?format=csv|parquet|json|ndjson`, or else from the `Content-Type` (`text/csv`, `application/vnd.apache.parquet`, `application/json`, `application/x-ndjson`).
+
+```sh
+curl -X POST "http://ichibi-lake:3333/tables/sales/import" \
+  -H "x-api-key: YOUR_KEY" -H "Content-Type: text/csv" \
+  --data-binary @sales-2026-10.csv
+
+curl -X POST "http://ichibi-lake:3333/tables/events/import?mode=append" \
+  -H "x-api-key: YOUR_KEY" -H "Content-Type: application/vnd.apache.parquet" \
+  --data-binary @events.parquet
+```
+
+Use `--data-binary` (not `-d`, which strips newlines).
+
+**Modes** (`?mode=`):
+
+| Mode | Table missing | Table exists |
+| :--- | :--- | :--- |
+| `auto` (default) | create | append |
+| `create` | create | 409 |
+| `append` | 404 | append |
+| `replace` | create | delete all rows and insert the new ones, in one transaction |
+
+A table created by an import gets the caller as its ACL owner and the default partitioning (`DEFAULT_PARTITION_KEY`), as with `/upload`. `append` and `replace` follow `/upload`'s schema-evolution rules (`src/schema-evolution.js`): new columns are added (or skipped with `?addColumns=false`), STRUCT columns are widened, values are cast to the table's column types, and columns that cannot be evolved are skipped and listed in `skipped`. `created`/`updated` timestamp columns missing from the file are filled with the import time. `replace` keeps the table's columns, ACL and partitioning. The insert is one statement, so a row that cannot be converted fails the whole import and nothing is written. `?dryRun=true` only reads the data and returns the detected columns, row count, a 20-row preview and the per-column plan.
+
+```json
+{ "success": true, "table": "events", "mode": "append", "format": "parquet", "inserted": 120000,
+  "added": ["region"], "widened": [], "skipped": [] }
+```
+
+**Loading from object storage.** Send a small JSON object with a `source` instead of data:
+
+```sh
+curl -X POST "http://ichibi-lake:3333/tables/events/import" \
+  -H "x-api-key: YOUR_KEY" -H "Content-Type: application/json" \
+  -d '{"source": "s3://landing/events/2026-10/*.parquet", "mode": "append"}'
+```
+
+The body may also carry `format`, `mode`, `addColumns` and `dryRun` (taking precedence over the query string). The format defaults to the source's file extension. Globs over several files are combined by column name. Objects are read on the primary DuckDB instance with the gateway's own S3 settings (`S3_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY`/`S3_SECRET_KEY` or the AWS credential chain, `S3_URL_STYLE`, `S3_USE_SSL`; see [§4.6](#46-object-storage-s3--minio)), also when the lake itself is on local disk.
+
+Source rules:
+- Only `s3://bucket/key` URLs (a file or a glob) are accepted. Local paths, `file://`, `http(s)://` and other schemes, `.`/`..` segments, quotes and control characters are rejected with 400, for every key, so the endpoint cannot be used to read the gateway's files or to make it fetch arbitrary URLs.
+- Writers may import only from prefixes in `IMPORT_ALLOWED_SOURCES` (e.g. `s3://landing/events/,s3://partner-drop/`); everything a glob can match must lie under an entry. Any other `s3://` source needs a superuser key (403 otherwise).
+- The lake's own data path (`DUCKLAKE_DATA_PATH`) never counts as allow-listed: reading its Parquet files directly would bypass table ACLs.
+
+Requires write access to the target table (readers get 403); `_`-prefixed system tables return 404. The admin console's **Import** ([§13.2](#132-features)) uses the same import code. Supports `Idempotency-Key` ([§9.4](#94-idempotent-retries)).
+
+### 9.4 Idempotent Retries
+
+`POST /upload`, `POST /kafka-sink` and `POST /tables/:tableName/import` accept an `Idempotency-Key` header (1-255 printable ASCII characters, e.g. a UUID per batch). Retry a failed or timed-out request with the same key:
+
+- The first request with a key runs normally. When it succeeds (2xx), its status and response are stored.
+- A later request with the same key and the same request (method, path, query, body, and for `/kafka-sink` the `X-Kafka-Topic` header) returns the stored response with `Idempotent-Replayed: true` and writes nothing.
+- The same key with a different request is 409. While the first request is still running, a retry gets 409 with `Retry-After`.
+- A request that fails (non-2xx, or the client disconnects) releases its key, so a retry runs normally.
+
+Keys are scoped to the API key that sends them and kept for `IDEMPOTENCY_TTL_HOURS` (default 24). They are stored in the console catalog (`_console_idempotency`), so every gateway instance on the same catalog sees them; when two instances receive the same key at the same moment, only the first claim runs. A claim whose process died mid-request stops blocking its key after one hour.
+
+```sh
+curl -X POST "http://ichibi-lake:3333/upload/user_stats" \
+  -H "x-api-key: YOUR_KEY" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 7d1c0a52-batch-0042" \
+  -d '[{"user": "duck", "points": 100}]'
+```
 
 ---
 
@@ -1271,7 +1348,7 @@ Every cap reports truncation (`truncated` / trailer line / `X-Export-Truncated`)
 
 ```sh
 npm test                       # Run all suites, including RBAC and console (requires Docker: app, db, kafka)
-npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console, SQL guard, storage)
+npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console, SQL guard, storage, import)
 npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
 npm run test:pgq-grammar       # DuckDB 2.0 SQL/PGQ grammar opt-in tests (no Docker needed)
 npm run test:console-unit      # Admin console auth, settings, data browser, pruning and cron unit tests (no Docker needed)
@@ -1282,6 +1359,8 @@ npm run test:orderby           # DuckLake ORDER BY corruption regression (no Doc
 npm run test:kafka-topic-filter # Kafka topic subscription filter (no Docker needed)
 npm run test:console           # Admin console integration tests (uses docker exec for a temporary admin)
 npm run test:ops               # Health, metrics, NDJSON streaming (4M rows, bounded memory), row caps, table export round trips and RBAC
+npm run test:import            # Bulk import (formats, modes, schema evolution, RBAC, size limit, S3 sources, allow-list) and Idempotency-Key
+npm run test:ingest-unit       # Import source validation, allow-list and format detection (no Docker needed)
 npm run test:rbac              # RBAC: superuser / writer / reader permissions, per-table overrides, superuser-only SQL and graphs, system tables
 npm run test:api               # Integration tests
 npm run test:rest              # REST API tests
@@ -1294,3 +1373,5 @@ npm run test:stress            # Stress test (customize via env vars)
 ```
 
 Integration tests expect the Docker stack to be running, and read the API keys and port from `docker/.env`. To target another deployment, set `BASE_URL`, `API_KEY` (a superuser key) and optionally `ALT_API_KEY`. The console suite creates a temporary admin with `docker exec` in the container named by `CONSOLE_CONTAINER` (default `ichibi-lake`) and deletes it afterwards; alternatively set `CONSOLE_ADMIN_USER` / `CONSOLE_ADMIN_PASSWORD` to use an existing login.
+
+The import suite (`test/test-import.js`) runs its object-storage cases only when it can upload test files itself: set `TEST_S3_ENDPOINT` (host-reachable, e.g. `http://localhost:9000` for the bundled MinIO), `TEST_S3_ACCESS_KEY`, `TEST_S3_SECRET_KEY` and optionally `TEST_S3_BUCKET` (default `ichibi-lake`), and run the gateway with `IMPORT_ALLOWED_SOURCES` containing `s3://<bucket>/import-allowed/` (or set `TEST_S3_ALLOWED` to your allow-listed prefix). Set `IMPORT_MAX_MB` to the gateway's value (at most 64) to also test the streamed size limit.

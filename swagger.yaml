@@ -904,6 +904,197 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /tables/{tableName}/import:
+    post:
+      summary: Bulk import a file (CSV, Parquet, NDJSON, JSON array) or objects from S3
+      description: |
+        Loads data into a table in one request, on the primary DuckDB instance.
+
+        **File upload.** Send the file as the raw request body (not multipart). The body is streamed to a temp file
+        (never held in memory) and read with DuckDB's `read_csv` (header, delimiter and types auto-detected),
+        `read_parquet` or `read_json_auto` (a JSON array or one object per line). The format comes from `?format=`
+        or, failing that, the `Content-Type` (`text/csv`, `application/vnd.apache.parquet`, `application/json`,
+        `application/x-ndjson`). Bodies larger than `IMPORT_MAX_MB` (default 1024) are refused with 413.
+
+        **Load from object storage.** Send `Content-Type: application/json` and a JSON object with a `source` key,
+        e.g. `{"source": "s3://bucket/prefix/*.parquet"}`. Only `s3://bucket/key` URLs (files or globs) are
+        accepted; local paths, `file://`, `http(s)://` and other schemes are rejected with 400. Objects are read with
+        the gateway's own S3 settings (`S3_ENDPOINT`, `S3_ACCESS_KEY`, ...). Writers may only import from prefixes
+        listed in `IMPORT_ALLOWED_SOURCES`; any other `s3://` source needs a superuser key, and the lake's own data
+        path never counts as allow-listed. Globs over several files are combined by column name. The format comes
+        from `format` or the file extension.
+
+        **Modes** (`mode`): `auto` (default; create when the table is missing, otherwise append), `create` (409 if
+        the table exists), `append` (404 if it does not), `replace` (deletes the existing rows and inserts the new
+        ones in one transaction; creates the table when missing). A table created here gets the caller as its ACL
+        owner and the default partitioning (`DEFAULT_PARTITION_KEY`). `append` and `replace` follow the same
+        schema-evolution rules as `/upload`: new columns are added (unless `addColumns=false`), STRUCT columns are
+        widened, values are cast to the table's types, and incompatible columns are skipped (listed in `skipped`).
+        The insert is one statement, so a row that cannot be converted fails the whole import and nothing is added.
+
+        Requires write access to the table (readers get 403). `_`-prefixed system tables are 404.
+        Supports `Idempotency-Key`.
+      parameters:
+        - in: path
+          name: tableName
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z_][A-Za-z0-9_]{0,62}$'
+          example: events
+        - in: query
+          name: format
+          schema:
+            type: string
+            enum: [csv, parquet, json, ndjson]
+          description: File format of an uploaded body. Overrides the Content-Type. When set, the body is always treated as data, never as a `source` request.
+        - in: query
+          name: mode
+          schema:
+            type: string
+            enum: [auto, create, append, replace]
+            default: auto
+        - in: query
+          name: addColumns
+          schema:
+            type: boolean
+            default: true
+          description: On append/replace, add columns that the table does not have yet (otherwise they are skipped).
+        - in: query
+          name: dryRun
+          schema:
+            type: boolean
+            default: false
+          description: Only read the data and return the detected columns, row count, a 20-row preview and, for append/replace, the per-column plan. Nothing is written.
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          text/csv:
+            schema:
+              type: string
+              format: binary
+            example: "id,name\n1,duck\n2,lake\n"
+          application/vnd.apache.parquet:
+            schema:
+              type: string
+              format: binary
+          application/x-ndjson:
+            schema:
+              type: string
+              format: binary
+            example: "{\"id\":1,\"name\":\"duck\"}\n{\"id\":2,\"name\":\"lake\"}\n"
+          application/json:
+            schema:
+              oneOf:
+                - type: array
+                  description: Rows to import (a JSON array file).
+                  items:
+                    type: object
+                - type: object
+                  description: Load from object storage.
+                  required: [source]
+                  properties:
+                    source:
+                      type: string
+                      example: s3://landing/events/2026-10/*.parquet
+                    format:
+                      type: string
+                      enum: [csv, parquet, json, ndjson]
+                    mode:
+                      type: string
+                      enum: [auto, create, append, replace]
+                    addColumns:
+                      type: boolean
+                    dryRun:
+                      type: boolean
+            examples:
+              rows:
+                summary: JSON array of rows
+                value: [{"id": 1, "name": "duck"}, {"id": 2, "name": "lake"}]
+              s3:
+                summary: Load from object storage
+                value: {"source": "s3://landing/events/*.parquet", "mode": "append"}
+      responses:
+        '200':
+          description: Imported (or, with dryRun, previewed)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  table:
+                    type: string
+                    example: events
+                  mode:
+                    type: string
+                    description: The mode that was applied (auto resolves to create or append).
+                    example: append
+                  format:
+                    type: string
+                    example: csv
+                  inserted:
+                    type: integer
+                    example: 1200
+                  created:
+                    type: boolean
+                    description: Present and true when this request created the table.
+                  deleted:
+                    type: integer
+                    description: Rows removed by mode=replace.
+                  added:
+                    type: array
+                    items:
+                      type: string
+                    description: Columns added to the table (append/replace).
+                  widened:
+                    type: array
+                    items:
+                      type: string
+                    description: STRUCT columns widened (append/replace).
+                  skipped:
+                    type: array
+                    items:
+                      type: string
+                    description: Incoming columns that were not imported (append/replace).
+                  source:
+                    type: string
+                    description: The object-storage source, for source imports.
+        '400':
+          description: Unknown or missing format, unreadable data, invalid table name or mode, or a source that is not an s3:// URL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid API key
+        '403':
+          description: No write access to the table, or a non-superuser importing from a source outside IMPORT_ALLOWED_SOURCES
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: System table, or mode=append on a missing table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: mode=create on an existing table, or an Idempotency-Key conflict (different request, or the first one still running)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: The body is larger than IMPORT_MAX_MB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /health:
     get:
       summary: Liveness check
@@ -1006,6 +1197,7 @@ paths:
           required: false
           description: An alternative to passing the topic via header. Ignored when `X-Kafka-Topic` is also provided and non-empty.
           example: user_events
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -1035,6 +1227,12 @@ paths:
                     description: Epoch timestamp when the records were last updated
         '400':
           description: Bad request (body is not a JSON array, or topic name fails identifier validation)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Idempotency-Key conflict (used for a different request, or the first request is still running)
           content:
             application/json:
               schema:
@@ -1308,6 +1506,10 @@ paths:
       summary: Upload JSON data to the default table (ichibi_table)
       description: |
         Uploads an array of JSON objects. If the table does not exist, it will be created dynamically.
+        Supports `Idempotency-Key`. For files (CSV, Parquet, NDJSON) and loads from object storage use
+        `POST /tables/{tableName}/import`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -1348,6 +1550,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '409':
+          description: Idempotency-Key conflict (used for a different request, or the first request is still running)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error or DuckDB catalog error
           content:
@@ -1361,7 +1569,10 @@ paths:
       description: |
         Uploads an array of JSON objects. If the table does not exist, it will be created dynamically
         using DuckDB's automatic schema inference. If it exists, records will be appended.
+        Supports `Idempotency-Key`. For files (CSV, Parquet, NDJSON) and loads from object storage use
+        `POST /tables/{tableName}/import`.
       parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
         - in: path
           name: tableName
           schema:
@@ -1405,6 +1616,12 @@ paths:
                     description: Epoch timestamp when the records were last updated
         '400':
           description: Bad request (e.g. payload is not an array)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Idempotency-Key conflict (used for a different request, or the first request is still running)
           content:
             application/json:
               schema:
@@ -1681,6 +1898,22 @@ paths:
                 $ref: '#/components/schemas/Error'
 
 components:
+  parameters:
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: false
+      schema:
+        type: string
+        maxLength: 255
+      description: |
+        Makes a retry safe. The first request with a key runs normally and, when it succeeds (2xx), its response is
+        stored for `IDEMPOTENCY_TTL_HOURS` (default 24). A later request with the same key and the same method, path,
+        query and body gets that response back with header `Idempotent-Replayed: true`, without writing anything
+        again. The same key with a different request is 409; while the first request is still running, 409 with
+        `Retry-After`. A request that fails releases its key. Keys are scoped to the API key that sends them;
+        1-255 printable ASCII characters.
+      example: 3f2a6c1e-batch-0001
   securitySchemes:
     ApiKeyAuth:
       type: apiKey

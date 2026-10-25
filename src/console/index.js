@@ -7,10 +7,7 @@
 import express, { Router } from 'express';
 import os from 'os';
 import fs from 'fs';
-import { createHash, randomBytes, randomUUID } from 'crypto';
-import path from 'path';
-import { pipeline } from 'stream/promises';
-import { Transform } from 'stream';
+import { createHash, randomBytes } from 'crypto';
 import { fileURLToPath } from 'url';
 import { execute, userQueryStats } from '../db.js';
 import { checkReadiness, lakeStats } from '../health.js';
@@ -27,6 +24,7 @@ import { startMaintenanceScheduler, saveMaintenanceConfig, startMaintenance, mai
 import { isSystemTable, normaliseRule, computeNextRun, matchTables, previewRule, startJob, startPruneScheduler, storageInfo, isDateType, isEpochType, describeConditions, CONDITION_OPS, isLegacyMultiTable } from './retention.js';
 import { nextRuns, validateCron, SCHEDULE_PRESETS } from './cron.js';
 import * as data from './data.js';
+import { importTempFile, receiveUpload } from '../ingest.js';
 import {
     listUsers as listRbacUsers, getUserRoles, createUser as createRbacUser, updateUser as updateRbacUser,
     setUserRoles, isRbacConfigured, syncLegacyApiKeys,
@@ -65,30 +63,6 @@ function describeRule(rule) {
 
 function httpError(statusCode, message) {
     return Object.assign(new Error(message), { statusCode });
-}
-
-// Upper bound for one console import upload (IMPORT_MAX_MB, editable live).
-const importMaxBytes = () => Math.max(1, parseInt(process.env.IMPORT_MAX_MB || '1024', 10) || 1024) * 1024 * 1024;
-const IMPORT_TMP_DIR = () => process.env.IMPORT_TMP_DIR || path.join(os.tmpdir(), 'ichibi-import');
-
-/**
- * Stream a raw request body to `file`, failing with 413 once it exceeds
- * `maxBytes` (checked against Content-Length up front and while streaming),
- * so an upload never sits in memory.
- */
-async function receiveUpload(req, file, maxBytes) {
-    const declared = Number(req.headers['content-length']);
-    if (declared > maxBytes) throw httpError(413, `File too large (limit ${Math.round(maxBytes / 1048576)} MB, IMPORT_MAX_MB)`);
-    let seen = 0;
-    const limit = new Transform({
-        transform(chunk, enc, cb) {
-            seen += chunk.length;
-            if (seen > maxBytes) return cb(httpError(413, `File too large (limit ${Math.round(maxBytes / 1048576)} MB, IMPORT_MAX_MB)`));
-            cb(null, chunk);
-        },
-    });
-    await pipeline(req, limit, fs.createWriteStream(file));
-    if (seen === 0) throw httpError(400, 'The uploaded file is empty');
 }
 
 function clientIp(req) {
@@ -765,11 +739,9 @@ export function createConsoleRouter() {
             dryRun: req.query.dryRun === '1' || req.query.dryRun === 'true',
             addColumns: req.query.addColumns !== '0' && req.query.addColumns !== 'false',
         };
-        const dir = IMPORT_TMP_DIR();
-        await fs.promises.mkdir(dir, { recursive: true });
-        const file = path.join(dir, `${randomUUID()}.${format}`);
+        const file = await importTempFile(format);
         try {
-            await receiveUpload(req, file, importMaxBytes());
+            await receiveUpload(req, file);
             const result = await data.importFile(file, options);
             if (!options.dryRun) {
                 await audit(req, 'table.import', `${result.table}: ${result.inserted} row(s) from ${filename || 'upload'} (${format}, ${options.mode})` +
