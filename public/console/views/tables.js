@@ -457,25 +457,69 @@
     // =========================================================================
 
     function renderSchema(ctx, table, schema) {
+        const keys = schema.keys || [];
         const rows = schema.columns.map((c, i) => h('tr', {},
             h('td', { class: 'rownum' }, i + 1),
-            h('td', { class: 'mono' }, c.name),
+            h('td', { class: 'mono' }, c.name, keys.includes(c.name) ? h('span', { class: 'badge env', style: 'margin-left:8px', title: 'Key column (upsert / dedupe ingestion)' }, keys.length > 1 ? `key ${keys.indexOf(c.name) + 1}` : 'key') : null),
             h('td', { class: 'mono' }, c.type),
             h('td', {}, c.nullable ? h('span', { class: 'muted' }, 'nullable') : h('span', { class: 'badge' }, 'NOT NULL')),
             h('td', { class: 'mono' }, c.default === null ? h('span', { class: 'muted' }, '—') : c.default),
             h('td', {}, c.editable ? h('span', { class: 'muted' }, 'yes') : h('span', { class: 'muted', title: 'Complex and binary types are shown read-only in the grid' }, 'read-only')),
             h('td', { class: 'actions' },
                 h('button', { class: 'btn small', type: 'button', disabled: !ctx.isAdmin, onclick: () => editColumnDialog(ctx, table, c) }, 'Edit'),
-                h('button', { class: 'btn small danger', type: 'button', disabled: !ctx.isAdmin || schema.columns.length === 1, onclick: () => dropColumnDialog(ctx, table, c) }, 'Drop'))));
+                h('button', { class: 'btn small danger', type: 'button', disabled: !ctx.isAdmin || schema.columns.length === 1 || keys.includes(c.name), title: keys.includes(c.name) ? 'Key columns cannot be dropped; change the keys first' : '', onclick: () => dropColumnDialog(ctx, table, c) }, 'Drop'))));
 
         const add = h('button', { class: 'btn primary small', type: 'button', disabled: !ctx.isAdmin, onclick: () => addColumnDialog(ctx, table) }, icon('plus'), 'Add column');
-        return h('div', { class: 'card' },
-            h('div', { class: 'card-header' }, h('h2', {}, 'Columns'), add),
-            h('div', { class: 'card-body flush table-wrap' },
-                h('table', {}, h('thead', {}, h('tr', {}, h('th', { class: 'rownum' }, '#'), h('th', {}, 'Name'), h('th', {}, 'Type'), h('th', {}, 'Null'), h('th', {}, 'Default'), h('th', {}, 'Inline edit'), h('th', {}, ''))),
-                    h('tbody', {}, rows))),
-            h('div', { class: 'card-body' }, h('div', { class: 'help' },
-                'Type changes: widening changes (e.g. INTEGER → BIGINT, FLOAT → DOUBLE) apply in place. Any other change converts the column\'s values in one transaction and moves the column to the end of the table.')));
+        const editKeys = h('button', { class: 'btn small', type: 'button', disabled: !ctx.isAdmin, onclick: () => keysDialog(ctx, table, schema) }, icon('edit'), 'Edit keys');
+        return h('div', {},
+            h('div', { class: 'card' },
+                h('div', { class: 'card-header' }, h('h2', {}, 'Columns'), add),
+                h('div', { class: 'card-body flush table-wrap' },
+                    h('table', {}, h('thead', {}, h('tr', {}, h('th', { class: 'rownum' }, '#'), h('th', {}, 'Name'), h('th', {}, 'Type'), h('th', {}, 'Null'), h('th', {}, 'Default'), h('th', {}, 'Inline edit'), h('th', {}, ''))),
+                        h('tbody', {}, rows))),
+                h('div', { class: 'card-body' }, h('div', { class: 'help' },
+                    'Type changes: widening changes (e.g. INTEGER → BIGINT, FLOAT → DOUBLE) apply in place. Any other change converts the column\'s values in one transaction and moves the column to the end of the table.'))),
+            h('div', { class: 'card' },
+                h('div', { class: 'card-header' }, h('h2', {}, 'Key columns'), editKeys),
+                h('div', { class: 'card-body' },
+                    h('p', {}, keys.length
+                        ? h('span', {}, 'Keyed on ', h('strong', { class: 'mono' }, `(${keys.join(', ')})`), '.')
+                        : h('span', { class: 'muted' }, 'No key columns declared.')),
+                    h('div', { class: 'help' },
+                        'Key columns identify a row for key-based ingestion: POST /upload/', table, '?mode=upsert replaces rows whose key matches and inserts the rest; ',
+                        'mode=dedupe only inserts rows whose key does not exist yet. DuckLake does not enforce keys: appends, Add row and imports can still add a duplicate key.'))));
+    }
+
+    async function keysDialog(ctx, table, schema) {
+        const current = schema.keys || [];
+        // Selection order is the key order.
+        const order = [...current];
+        const summary = h('div', { class: 'help' });
+        const sync = () => { summary.textContent = order.length ? `Key: (${order.join(', ')})` : 'No key columns: upsert and dedupe ingestion are disabled for this table.'; };
+        const boxes = schema.columns.map(c => {
+            const keyable = !/^(BLOB|STRUCT|MAP|UNION|JSON)|\[/.test(c.type);
+            const box = h('input', { type: 'checkbox', checked: current.includes(c.name), disabled: !keyable });
+            box.addEventListener('change', () => {
+                const i = order.indexOf(c.name);
+                if (box.checked && i < 0) order.push(c.name);
+                if (!box.checked && i >= 0) order.splice(i, 1);
+                sync();
+            });
+            return h('div', {}, h('label', { class: 'checkbox', title: keyable ? '' : 'Nested, JSON and BLOB columns cannot be keys' }, box, h('span', { class: 'mono' }, c.name), h('span', { class: 'muted' }, c.type)));
+        });
+        sync();
+        const ok = await modal({
+            title: `Key columns of ${table}`,
+            body: h('div', {}, h('div', { class: 'help' }, 'Tick the column(s) that identify a row. For a composite key, the order you tick them in is the key order.'), ...boxes, summary),
+            actions: [{ label: 'Cancel', value: false }, { label: 'Save keys', value: true, primary: true }],
+        });
+        if (!ok) return;
+        await withBusy(null, async () => {
+            const res = await api('PUT', `/data/tables/${enc(table)}/keys`, { keys: order });
+            toast(res.keys.length ? `Keyed on (${res.keys.join(', ')})` : 'Key columns cleared', 'success');
+            if (res.duplicateKeys) toast(`${res.duplicateKeys.toLocaleString()} key value(s) already occur more than once. Upserts replace all rows with a matching key.`);
+            ctx.reload();
+        });
     }
 
     async function addColumnDialog(ctx, table) {
