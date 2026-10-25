@@ -840,6 +840,64 @@ async function run() {
         await admin('DELETE', `/data/tables/${IMP2}`, { confirm: IMP2 });
         await admin('DELETE', `/data/tables/${IMP}`, { confirm: IMP });
 
+        // Storage page. Never sends a valid changed configuration: that would
+        // save it and restart the gateway in the middle of the suite.
+        console.log('\n▸ Storage settings');
+        const STO = `ci_storage_${TS}`;
+        let storage;
+        await test('storage overview describes backend, catalog and lock state without secrets', async () => {
+            const r = await admin('GET', '/storage');
+            assert(r.status === 200, `status ${r.status}`);
+            storage = r.data;
+            assert(['local', 's3'].includes(storage.form.backend) && storage.form.blobs && Number.isInteger(storage.form.inliningLimit), JSON.stringify(storage.form));
+            assert(storage.status.file && typeof storage.status.writable === 'boolean', JSON.stringify(storage.status));
+            assert(storage.catalog.user && typeof storage.catalog.passwordSet === 'boolean' && !('password' in storage.catalog), JSON.stringify(storage.catalog));
+            assert(!('secretKey' in storage.form.s3) && typeof storage.form.s3.hasSecretKey === 'boolean', 'secret key must not be returned');
+            assert(typeof storage.lake.canMove === 'boolean' && Array.isArray(storage.lake.tablesWithFiles), JSON.stringify(storage.lake));
+        });
+        await test('connection test of the current settings passes', async () => {
+            const r = await admin('POST', '/storage/test', storage.form);
+            assert(r.status === 200 && r.data.ok === true, JSON.stringify(r.data));
+            assert(r.data.results[0].label === 'Data files', JSON.stringify(r.data.results));
+        });
+        await test('saving unchanged or invalid settings is refused', async () => {
+            assert((await admin('PUT', '/storage', storage.form)).status === 400, 'unchanged');
+            assert((await admin('PUT', '/storage', { ...storage.form, backend: 'ftp' })).status === 400, 'bad backend');
+            assert((await admin('PUT', '/storage', { ...storage.form, backend: 's3', s3: { ...storage.form.s3, path: 'no-scheme/lake' } })).status === 400, 'bad bucket path');
+            assert((await admin('PUT', '/storage', { ...storage.form, inliningLimit: -5 })).status === 400, 'bad inlining limit');
+        });
+        await test('a BLOB storage change needs explicit confirmation', async () => {
+            const flipped = { ...storage.form, blobs: { mode: storage.form.blobs.mode === 'inline' ? 'filesystem' : 'inline', path: storage.form.blobs.path || '/app/blobs' } };
+            const r = await admin('PUT', '/storage', flipped);
+            assert(r.status === 400 && /Confirm the BLOB storage change/.test(r.data.error), JSON.stringify(r.data));
+        });
+        await test('the data location cannot move while a table has data files', async () => {
+            const rows = ['n,label', ...Array.from({ length: 1500 }, (_, i) => `${i},row ${i}`)].join('\n');
+            const imp = await admin('POST', `/data/import?filename=s.csv&table=${STO}&mode=create`, undefined, { rawBody: rows });
+            assert(imp.status === 200 && imp.data.inserted === 1500, JSON.stringify(imp.data));
+            const after = (await admin('GET', '/storage')).data;
+            assert(after.lake.canMove === false && after.lake.tablesWithFiles.some(t => t.table === STO), JSON.stringify(after.lake));
+            const moved = storage.form.backend === 'local'
+                ? { ...storage.form, localPath: `${storage.form.localPath.replace(/\/+$/, '')}_moved_${TS}` }
+                : { ...storage.form, s3: { ...storage.form.s3, path: `${storage.form.s3.path.replace(/\/+$/, '')}_moved_${TS}/` } };
+            const r = await admin('PUT', '/storage', moved);
+            assert(r.status === 409 && r.data.error.includes(STO), `status ${r.status} ${JSON.stringify(r.data)}`);
+        });
+        await test('viewers can see storage settings but not test or change them', async () => {
+            const name = `ci_viewer3_${TS}`, pass = `viewer3-pass-${TS}`;
+            await admin('POST', '/logins', { username: name, password: pass, role: 'viewer' });
+            try {
+                const v = client();
+                await v('POST', '/login', { username: name, password: pass });
+                assert((await v('GET', '/storage')).status === 200, 'viewer GET');
+                assert((await v('POST', '/storage/test', storage.form)).status === 403, 'viewer test');
+                assert((await v('PUT', '/storage', storage.form)).status === 403, 'viewer save');
+            } finally {
+                await admin('DELETE', `/logins/${name}`);
+            }
+        });
+        await admin('DELETE', `/data/tables/${STO}`, { confirm: STO });
+
         console.log('\n▸ Overview & audit');
         await test('overview reports gateway and DuckDB details', async () => {
             const r = await admin('GET', '/overview');

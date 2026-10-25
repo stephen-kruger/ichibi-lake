@@ -3,7 +3,10 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { buildCreatePropertyGraphSql } from './graphs.js';
-import { storageConfig, describeStorage, buildS3SecretSql, joinDataPath, dataInliningRowLimit } from './storage.js';
+import { storageConfig, describeStorage, buildS3SecretSql, joinDataPath, withTrailingSlash, dataInliningRowLimit } from './storage.js';
+// Applies storage settings saved in the console to process.env on import, so
+// it must stay ahead of anything that reads them.
+import { pendingSwitch, confirmStorageConfig, noteAttachFailure } from './storage-config.js';
 
 export { VARCHAR, BIGINT, BOOLEAN, BLOB, blobValue, TIMESTAMP, TIMESTAMPTZ, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS, DATE };
 
@@ -107,6 +110,137 @@ async function loadDuckPgq(conn) {
 // the primary instance attaches it; the user-query instance, which runs
 // user-supplied SQL, cannot see it.
 export const CONSOLE_CATALOG = 'ichibi_console';
+const CONSOLE_INLINING_ROW_LIMIT = 1000000;
+
+/** The DuckLake secret with the Postgres catalog connection (DUCKLAKE_PG_*). */
+function ducklakeSecretSql() {
+    const pgHost = process.env.DUCKLAKE_PG_HOST || '0.0.0.0';
+    const pgPort = process.env.DUCKLAKE_PG_PORT || '5432';
+    const pgUser = process.env.DUCKLAKE_PG_USER || 'postgres';
+    const pgPass = process.env.DUCKLAKE_PG_PASSWORD || 'postgres';
+    const pgDb = process.env.DUCKLAKE_PG_DB || 'ducklake';
+    const metadataPath = `postgres:host=${pgHost} port=${pgPort} user=${pgUser} password=${pgPass} dbname=${pgDb}`;
+    return `CREATE SECRET (TYPE ducklake, METADATA_PATH '${metadataPath.replace(/'/g, "''")}');`;
+}
+
+const sqlLit = (v) => `'${String(v).replace(/'/g, "''")}'`;
+const sqlIdent = (v) => `"${String(v).replace(/"/g, '""')}"`;
+
+/**
+ * Move the lake to a new data location, once, before the primary instance
+ * attaches (console Storage page: pending settings with a changed data path).
+ *
+ * DuckLake records the data path in the catalog and stores every file path
+ * relative to it, so a lake can only move when no file has to: the console
+ * allows a switch only while no user table has data files, and this re-checks
+ * it against the OLD location before changing anything. User tables whose rows
+ * are all inlined in the catalog move as they are. The gateway's own system
+ * tables (and console tables) that do have files are copied into memory,
+ * dropped and recreated from their DDL at the new location (DROP never reads
+ * files; DELETE would). Then the catalog's recorded data path is updated, old
+ * snapshots are expired and the deletion queue (paths at the old location) is
+ * cleared, so nothing refers to the old location any more. Its files stay
+ * where they are for the operator to remove.
+ *
+ * Throws (with `storageSwitchRefused` when the lake is not empty); the caller
+ * reverts to the previous settings.
+ */
+async function runPendingStorageSwitch(sw) {
+    const from = storageConfig({ ...process.env, ...sw.settings });
+    const to = storageConfig(process.env);
+    if (from.dataPath === to.dataPath) return null;
+    // metaSchemas: where the catalog's own tables live in the metadata
+    // database (hidden from duckdb_tables(), but addressable): "public" in
+    // Postgres for the default schema, "main" for a DuckDB-file catalog.
+    const catalogs = [
+        { name: 'ducklake', from: from.dataPath, to: to.dataPath, metaSchemas: ['public', 'main'], opts: `DATA_INLINING_ROW_LIMIT ${dataInliningRowLimit()}` },
+        { name: CONSOLE_CATALOG, from: joinDataPath(from.dataPath, '_console'), to: joinDataPath(to.dataPath, '_console'), metaSchemas: [CONSOLE_CATALOG], opts: `METADATA_SCHEMA '${CONSOLE_CATALOG}', DATA_INLINING_ROW_LIMIT ${CONSOLE_INLINING_ROW_LIMIT}` },
+    ];
+    console.log(`[Storage] Moving the lake from ${describeStorage(from)} to ${describeStorage(to)}...`);
+    const inst = await DuckDBInstance.create(':memory:', { allow_unsigned_extensions: 'true' });
+    const conn = await inst.connect();
+    const rowsOf = async (sql) => (await conn.runAndReadAll(sql)).getRowObjectsJS();
+    try {
+        await conn.run('INSTALL ducklake; LOAD ducklake; INSTALL postgres; LOAD postgres;');
+        if (from.kind === 's3' || to.kind === 's3') await conn.run('INSTALL httpfs; LOAD httpfs;');
+        if (from.provider === 'credential_chain' || to.provider === 'credential_chain') await conn.run('INSTALL aws; LOAD aws;');
+        // Each secret is scoped to its own data path, so both can coexist.
+        if (from.kind === 's3') await conn.run(buildS3SecretSql(from, { name: 'ichibi_s3_from' }));
+        if (to.kind === 's3') await conn.run(buildS3SecretSql(to, { name: 'ichibi_s3_to' }));
+        await conn.run(ducklakeSecretSql());
+        if (to.kind === 'local') for (const c of catalogs) await fs.mkdir(c.to, { recursive: true });
+
+        // 1. Inventory at the old location.
+        for (const c of catalogs) await conn.run(`ATTACH 'ducklake:' AS ${c.name} (DATA_PATH ${sqlLit(c.from)}, AUTOMATIC_MIGRATION true, ${c.opts})`);
+        const blocking = [];
+        const move = [];
+        for (const c of catalogs) {
+            const tables = await rowsOf(`SELECT schema_name, table_name, sql FROM duckdb_tables() WHERE database_name = ${sqlLit(c.name)}`);
+            for (const t of tables) {
+                const [f] = await rowsOf(`SELECT count(*)::BIGINT AS files, count(delete_file)::BIGINT AS deletes FROM ducklake_list_files(${sqlLit(c.name)}, ${sqlLit(t.table_name)}, schema => ${sqlLit(t.schema_name)})`);
+                if (Number(f.files) + Number(f.deletes) === 0) continue;
+                const system = c.name === CONSOLE_CATALOG || t.table_name.startsWith('_');
+                if (!system) blocking.push(`${t.table_name} (${f.files} file(s))`);
+                else move.push({ catalog: c.name, schema: t.schema_name, table: t.table_name, sql: t.sql, stash: `stash_${move.length}` });
+            }
+        }
+        if (blocking.length) {
+            const listed = blocking.slice(0, 10).join(', ') + (blocking.length > 10 ? ` and ${blocking.length - 10} more` : '');
+            throw Object.assign(new Error(`The lake is not empty, so it cannot move to ${to.dataPath}: ${blocking.length} table(s) have data files (${listed}). ` +
+                'Export and drop these tables, switch, then import them again.'), { storageSwitchRefused: true });
+        }
+        for (const m of move) {
+            await conn.run(`CREATE TABLE memory.main.${m.stash} AS SELECT * FROM ${m.catalog}.${sqlIdent(m.schema)}.${sqlIdent(m.table)}`);
+        }
+        for (const c of catalogs) await conn.run(`DETACH ${c.name}`);
+
+        // 2. Re-attach at the new location and record it in the catalog.
+        for (const c of catalogs) {
+            await conn.run(`ATTACH 'ducklake:' AS ${c.name} (DATA_PATH ${sqlLit(c.to)}, OVERRIDE_DATA_PATH true, AUTOMATIC_MIGRATION true, ${c.opts})`);
+            for (const schema of c.metaSchemas) {
+                const candidate = `${sqlIdent(`__ducklake_metadata_${c.name}`)}.${sqlIdent(schema)}`;
+                try {
+                    await conn.run(`SELECT value FROM ${candidate}.ducklake_metadata WHERE key = 'data_path'`);
+                    c.meta = candidate;
+                    break;
+                } catch (_) { /* try the next schema */ }
+            }
+            if (!c.meta) throw new Error(`Cannot find the DuckLake metadata tables of ${c.name}`);
+            // DuckLake records the path with a trailing separator.
+            await conn.run(`UPDATE ${c.meta}.ducklake_metadata SET value = ${sqlLit(withTrailingSlash(c.to))} WHERE key = 'data_path'`);
+        }
+
+        // 3. Rewrite system tables that had files, each in its own transaction.
+        for (const m of move) {
+            await conn.run(`USE ${m.catalog}.${sqlIdent(m.schema)}`);
+            await conn.run('BEGIN TRANSACTION');
+            try {
+                await conn.run(`DROP TABLE ${sqlIdent(m.table)}`);
+                await conn.run(m.sql);
+                await conn.run(`INSERT INTO ${sqlIdent(m.table)} SELECT * FROM memory.main.${m.stash}`);
+                await conn.run('COMMIT');
+            } catch (err) {
+                await conn.run('ROLLBACK').catch(() => {});
+                throw err;
+            }
+        }
+        await conn.run('USE memory');
+
+        // 4. Forget the old location: expire older snapshots (they reference
+        // files there) and clear the deletion queue (paths there).
+        for (const c of catalogs) {
+            await conn.run(`CALL ducklake_expire_snapshots(${sqlLit(c.name)}, older_than => now())`);
+            await conn.run(`DELETE FROM ${c.meta}.ducklake_files_scheduled_for_deletion`);
+        }
+        for (const c of catalogs) await conn.run(`DETACH ${c.name}`);
+        const summary = { from: from.dataPath, to: to.dataPath, at: new Date().toISOString(), movedTables: move.map(m => `${m.catalog}.${m.table}`) };
+        console.log(`[Storage] Lake moved to ${describeStorage(to)}` + (move.length ? `; rewrote ${move.map(m => m.table).join(', ')}` : '') +
+            `. Files at the old location (${from.dataPath}) are no longer used and can be removed.`);
+        return summary;
+    } finally {
+        try { conn.closeSync(); } catch (_) { /* ignore */ }
+    }
+}
 
 // Configure a fresh in-memory DuckDB instance to act as a DuckLake gateway.
 // Used for both the primary instance (writes + reads) and the isolated user-
@@ -114,8 +248,6 @@ export const CONSOLE_CATALOG = 'ichibi_console';
 async function _attachDuckLake(label) {
     const pgHost = process.env.DUCKLAKE_PG_HOST || '0.0.0.0';
     const pgPort = process.env.DUCKLAKE_PG_PORT || '5432';
-    const pgUser = process.env.DUCKLAKE_PG_USER || 'postgres';
-    const pgPass = process.env.DUCKLAKE_PG_PASSWORD || 'postgres';
     const pgDb = process.env.DUCKLAKE_PG_DB || 'ducklake';
     // Local directory or s3:// URL (see src/storage.js).
     const storage = storageConfig();
@@ -163,13 +295,7 @@ async function _attachDuckLake(label) {
         }
     }
 
-    const metadataPath = `postgres:host=${pgHost} port=${pgPort} user=${pgUser} password=${pgPass} dbname=${pgDb}`;
-    await conn.run(`
-        CREATE SECRET (
-            TYPE ducklake,
-            METADATA_PATH '${metadataPath}'
-        );
-    `);
+    await conn.run(ducklakeSecretSql());
 
     const escapedDataPath = dataPath.replace(/'/g, "''");
     // Small writes are inlined: an INSERT of fewer than DATA_INLINING_ROW_LIMIT
@@ -223,7 +349,7 @@ async function _attachDuckLake(label) {
         if (!remote) {
             try { await fs.mkdir(consolePath, { recursive: true }); } catch (e) { /* attach reports problems */ }
         }
-        await conn.run(`ATTACH 'ducklake:' AS ${CONSOLE_CATALOG} (DATA_PATH '${consolePath.replace(/'/g, "''")}', METADATA_SCHEMA '${CONSOLE_CATALOG}', AUTOMATIC_MIGRATION true, DATA_INLINING_ROW_LIMIT 1000000);`);
+        await conn.run(`ATTACH 'ducklake:' AS ${CONSOLE_CATALOG} (DATA_PATH '${consolePath.replace(/'/g, "''")}', METADATA_SCHEMA '${CONSOLE_CATALOG}', AUTOMATIC_MIGRATION true, DATA_INLINING_ROW_LIMIT ${CONSOLE_INLINING_ROW_LIMIT});`);
     }
 
     console.log(`[DB:${label}] Successfully attached to remote DuckLake database '${pgDb}'.`);
@@ -264,12 +390,21 @@ async function getDbInstance() {
 
     initPromise = (async () => {
         try {
+            const sw = pendingSwitch();
+            const lastSwitch = sw ? await runPendingStorageSwitch(sw) : null;
             instance = await _attachDuckLake('primary');
+            confirmStorageConfig(lastSwitch ? { lastSwitch } : {});
             return instance;
         } catch (err) {
             initPromise = null;
             instance = null;
             console.error('[DB] Failed to connect to DuckLake instance:', err);
+            // New storage settings from the console that do not work: restore
+            // the previous ones and restart on them (Docker restart policy).
+            if (noteAttachFailure(err, { fatal: !!err.storageSwitchRefused })) {
+                console.error('[Storage] Exiting to restart on the previous storage settings.');
+                setTimeout(() => process.exit(1), 200);
+            }
             throw err;
         }
     })();

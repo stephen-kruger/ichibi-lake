@@ -157,7 +157,7 @@ The DuckDB extensions the gateway needs (`ducklake`, `postgres`, `duckpgq`, and 
 
 #### 3.2.1 Object Storage (S3 / MinIO)
 
-Used when `DUCKLAKE_DATA_PATH` is an `s3://` URL. S3-compatible stores (MinIO, Cloudflare R2, Ceph, GCS interoperability) use `s3://` with `S3_ENDPOINT`. See [§4.6](#46-object-storage-s3--minio).
+Used when `DUCKLAKE_DATA_PATH` is an `s3://` URL. S3-compatible stores (MinIO, Cloudflare R2, Ceph, GCS interoperability) use `s3://` with `S3_ENDPOINT`. See [§4.6](#46-object-storage-s3--minio). These settings, `DUCKLAKE_DATA_PATH`, `DATA_INLINING_ROW_LIMIT` and the BLOB settings can also be set on the console's **Storage** page ([§13.2](#132-features)); values saved there take precedence over `docker/.env`.
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
@@ -279,6 +279,8 @@ Layers 2 to 4 apply to every key, superusers included, on top of layer 1.
 | `CONSOLE_SETUP_TOKEN` | *(generated)* | One-time code required to create the first console admin. When unset, a random code is printed to the gateway log on startup while no console login exists. |
 | `CONSOLE_SESSION_SECRET` | *(generated)* | HMAC key for console session cookies. When unset, one is generated and stored in the console catalog (shared by all instances). |
 | `CONSOLE_SESSION_TTL_HOURS` | `12` | Console session lifetime. Also editable in the console. |
+| `STORAGE_CONFIG_FILE` | `./config/storage.json` | Where the **Storage** page saves its settings (in Docker `/app/config/storage.json`, bind-mounted to `docker/data/config`). Written with mode 0600 because it can hold S3 credentials. |
+| `STORAGE_AUTO_RESTART` | *(detected)* | Whether **Save & restart** on the Storage page restarts the gateway. Default: on in a container (Docker restarts it) or under PM2, off otherwise (save, then restart yourself). `1`/`0` forces it. |
 | `METRICS_TOKEN` | *(unset)* | Bearer token for `GET /metrics`. When unset, `/metrics` requires a superuser API key. See [§14.2](#142-prometheus-metrics). |
 | `PUBLIC_URL` | `http://localhost:<port>` | Externally reachable base URL, used in startup log messages (Swagger UI and admin console links). Docker Compose defaults it to the published host port (`http://localhost:3333`); set it to your real address (e.g. `https://lake.example.com`) when deployed. |
 | `SNAPSHOT_RETENTION_DAYS` | *(unset)* | Days of DuckLake snapshot history (time travel) to keep. When set, [lake maintenance](#47-lake-maintenance-small-files) and pruning rules with *reclaim storage* expire older snapshots and delete unreferenced files, freeing the space used by deleted rows. Unset: snapshots are never expired. Also editable in the console. |
@@ -416,6 +418,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 - **Stop every old instance first.** Do not run old and new gateways against the same catalog (e.g. a rolling deploy) — old instances fail once the catalog is migrated.
 - **First start may be slower** on large catalogs, since migration runs during startup before requests are served.
 - **Admin console data moves to its own catalog.** Console logins, settings and the audit log from earlier releases are moved from the main catalog to `ichibi_console` on first start, and old single-table retention rules are converted into pruning rules (`RETENTION_INTERVAL_MINUTES` becomes each rule's schedule; the setting is gone). Console logins and passwords keep working.
+- **Storage settings from the console need a new mount.** `docker/compose.yaml` now maps `./data/config` to `/app/config`, where the Storage page saves its settings. If you keep your own compose file, add that volume; without it the page reports that settings cannot be saved (or would not survive re-creating the container).
 - **The bundled DuckDB web UI was removed** (it had no authentication). Use the console's **Tables & Data** page instead.
 - **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (since then, `/query` and GraphQL `sql` accept non-superusers again, scoped to the tables they can read) (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
 - **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
@@ -423,7 +426,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 
 ### 4.6 Object Storage (S3 / MinIO)
 
-Set `DUCKLAKE_DATA_PATH` to an `s3://bucket/prefix/` URL and the gateway writes all Parquet files there. Postgres stays the catalog. Both DuckDB instances (primary and user-query) get a temporary DuckDB S3 secret **scoped to that prefix**, created from the `S3_*` variables ([§3.2.1](#321-object-storage-s3--minio)). Nothing is written to disk.
+Set `DUCKLAKE_DATA_PATH` to an `s3://bucket/prefix/` URL (or choose **S3-compatible** on the console's Storage page, [§13.2](#132-features)) and the gateway writes all Parquet files there. Postgres stays the catalog. Both DuckDB instances (primary and user-query) get a temporary DuckDB S3 secret **scoped to that prefix**, created from the `S3_*` variables ([§3.2.1](#321-object-storage-s3--minio)). Nothing is written to disk.
 
 **Bundled MinIO (single host / trying it out).** In `docker/.env`:
 
@@ -1286,7 +1289,8 @@ The side menu groups pages by area. **Admins** can change everything; **viewers*
 | **Console Logins** | Add console users, change roles, reset passwords, delete logins (at least one admin always remains) |
 | **Tables & Data** | Browse every user table with paging, sorting, per-column filters and full-text search; edit cells inline; add and delete rows; view and edit schemas; create, rename and drop tables; **export** one table or several at once (one ZIP) and **import** CSV / Parquet / JSON files (see below) |
 | **Retention & Pruning** | Per-table rules that delete rows older than a given age, beyond the newest *N* rows, and/or matching simple conditions, each on its own schedule; preview, **Run now**, **Clone**, and a run log (see below). Also the **Lake maintenance** schedule and log ([§4.7](#47-lake-maintenance-small-files)) |
-| **Security / Ingestion / Query Engine / Storage / Kafka** | Effective configuration, showing each value's source (default, `docker/.env`, or console override) |
+| **Storage** | Where the data files (local disk or S3-compatible) and BLOBs are kept, editable, plus the read-only Postgres catalog and snapshot retention (see below) |
+| **Security / Ingestion / Query Engine / Kafka** | Effective configuration, showing each value's source (default, `docker/.env`, or console override) |
 | **Audit Log** | Who changed what, from which IP, across all instances |
 | **My Account** | Change your own password |
 | **API Reference** | Opens the Swagger UI (the gateway root, `/`) in a new tab |
@@ -1295,7 +1299,9 @@ The side menu groups pages by area. **Admins** can change everything; **viewers*
 
 | Editable live | Read-only (set in `docker/.env`, restart required) |
 | :--- | :--- |
-| `API_KEYS` (via the API Keys page), `MAX_BATCH_SIZE`, `DEFAULT_PARTITION_KEY`, `USER_QUERY_TIMEOUT_MS`, `USER_QUERY_CONCURRENCY`, `CONSOLE_SESSION_TTL_HOURS`, `SNAPSHOT_RETENTION_DAYS` | Database connection, storage paths, Kafka, `JSON_BODY_LIMIT`, pool sizes, RBAC bootstrap variables |
+| `API_KEYS` (via the API Keys page), `MAX_BATCH_SIZE`, `DEFAULT_PARTITION_KEY`, `USER_QUERY_TIMEOUT_MS`, `USER_QUERY_CONCURRENCY`, `CONSOLE_SESSION_TTL_HOURS`, `SNAPSHOT_RETENTION_DAYS` | Database connection, Kafka, `JSON_BODY_LIMIT`, pool sizes, RBAC bootstrap variables |
+
+Storage settings are the exception: they are needed to open the lake, so the **Storage** page saves them to a file and applies them with a restart (below).
 
 Resetting a setting removes the override and returns to the `docker/.env` value or the default. Overrides are loaded at startup before the RBAC bootstrap, so an API key list edited in the console (including revoked keys) survives restarts. Revoking an API key also deactivates the RBAC user that the legacy bootstrap created for it; otherwise the key would keep working.
 
@@ -1314,6 +1320,21 @@ Resetting a setting removes the override and returns to the `docker/.env` value 
 - **Not shown**: system tables (prefixed `_`, e.g. RBAC users, ACLs, console logins and settings) never appear here; they are managed on their own pages. Tables created from the console have no ACL row, so only RBAC superusers can reach them through the REST API until an ACL is set (`PATCH /tables/:name/acl`).
 
 Every change (cell edits, inserts, deletes, schema and table changes) is recorded in the audit log with the table, row and column, but not the cell values.
+
+**Storage.** The page has one card per part of the storage, and each shows only the settings of the option in use:
+
+- **Data files**: **Local disk** (a directory; in Docker use a mounted one, `/app/data_files` is persisted to `docker/data/ducklake`) or **S3-compatible** (bucket path `s3://bucket/prefix/`, endpoint, region, access and secret key, URL style, TLS). With local disk, the S3 connection settings are still available under *S3 credentials for bulk imports*, because imports from `s3://` use them. Also the **inlining row limit**.
+- **BLOB storage**: **Inside tables** or **Local directory**. Existing BLOBs are not moved or converted, so changing this needs an explicit confirmation: BLOBs stored before can no longer be read through the API afterwards.
+- **Metadata catalog (Postgres)**: read-only. The catalog *is* the lake (tables, schemas, snapshots, console logins and settings), so pointing the gateway at another Postgres is a deployment decision made in `docker/.env` (`DUCKLAKE_PG_*`, `POSTGRES_PASSWORD`).
+- **Snapshots & maintenance**: `SNAPSHOT_RETENTION_DAYS` (applies immediately) and the maintenance kill switch.
+
+**Test connection** writes and reads back a probe file at the data location (S3: under `_ichibi_probe/`, removed by lake maintenance; local: deleted straight away) and checks the BLOB directory. In Docker it also warns when a directory is not on a mounted volume. **Save & restart** runs the same test, saves the settings to `STORAGE_CONFIG_FILE` (mode 0600; secrets left empty keep their saved value and are never sent back to the browser), restarts the gateway, and reloads the page when it is back. Saved values take precedence over `docker/.env`; **Use docker/.env values** fills the form with those values. Changes are recorded in the audit log (`storage.update`, secrets masked).
+
+- **Safe apply.** New settings are first saved as *pending* next to the settings in effect. If the gateway cannot open the lake with them (three attempts, or at once for a refused move), it restores the previous settings, restarts on them, and the page shows what failed. A successful start confirms the new settings.
+- **Moving the data files** (to another directory, bucket or prefix, or between disk and S3) is only allowed **while no user table has data files**. DuckLake records the data location in the catalog and stores every file path relative to it, so a lake with files would have to be copied. The page shows which tables block a move; to move anyway, export them (Tables & Data → Export), drop them, switch, and import them again. Rows that are still inlined in the catalog move with the lake. The new location must be empty. At the next start the gateway re-checks this against the old location, rewrites the gateway's own system tables at the new location, records the new path in the catalog and expires older snapshots, which refer to the old location. Files at the old location are left in place for you to delete.
+- **Connection details** (credentials, endpoint, region, URL style, TLS) can be changed at any time, with the same test and restart. Because the catalog keeps listing the lake's files at the same `s3://` location, the test also reads the footers of a few existing data files (from the largest tables) through the new connection, and refuses the change if they cannot be read, e.g. when the endpoint now points to a different server or account that happens to have a bucket of the same name.
+- **Several gateway instances** sharing one catalog each read their own `STORAGE_CONFIG_FILE`. Configure storage in `docker/.env` for such deployments: after a move, instances still on the old path refuse to start (DuckLake rejects a data path that does not match the catalog) until they are given the new one.
+- **Without Docker or PM2** the gateway cannot restart itself: **Save** stores the settings and you restart the process (set `STORAGE_AUTO_RESTART=1` if a supervisor restarts it).
 
 **Retention & Pruning.** A rule deletes rows that meet **any** of its ticked criteria (age, row count, match conditions), like Kafka's time- and size-based retention:
 
@@ -1449,6 +1470,7 @@ npm run test:sql-guard         # Read-only / introspection guard for user-suppli
 npm run test:sql-tables        # Table extraction for table-scoped SQL, against DuckDB's parser (no Docker needed)
 npm run test:storage           # Object-storage config, S3 secret SQL and maintenance settings (no Docker needed)
 npm run test:zip               # Streaming ZIP writer used by multi-table exports (no Docker needed)
+npm run test:storage-config    # Storage page: saved settings, confirm/revert after failed starts, form validation (no Docker needed)
 npm run test:maintenance       # Data inlining and scheduled lake maintenance (file counts drop), against the running stack
 npm run test:orderby           # DuckLake ORDER BY corruption regression (no Docker needed)
 npm run test:kafka-topic-filter # Kafka topic subscription filter (no Docker needed)

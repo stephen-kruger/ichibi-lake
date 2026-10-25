@@ -25,6 +25,7 @@ import { checkForUpdate } from './version.js';
 import { isSystemTable, normaliseRule, computeNextRun, matchTables, previewRule, startJob, startPruneScheduler, storageInfo, isDateType, isEpochType, describeConditions, CONDITION_OPS, isLegacyMultiTable } from './retention.js';
 import { nextRuns, validateCron, SCHEDULE_PRESETS } from './cron.js';
 import * as data from './data.js';
+import { storageOverview, testStorageForm, saveStorage, autoRestart } from './storage-admin.js';
 import { importTempFile, receiveUpload } from '../import.js';
 import {
     listUsers as listRbacUsers, getUserRoles, createUser as createRbacUser, updateUser as updateRbacUser,
@@ -384,6 +385,29 @@ export function createConsoleRouter() {
         SETTING_HOOKS[def.key]?.();
         await store.audit(req.consoleUser.username, 'setting.reset', `${def.key} reset to environment/default`, clientIp(req));
         res.json({ success: true, setting: settingPayload(def) });
+    }));
+
+    // ---- Storage (settings file + restart; see src/console/storage-admin.js) ---------
+    api.get('/storage', wrap(async (req, res) => {
+        res.json(await storageOverview());
+    }));
+
+    api.post('/storage/test', requireAdmin, wrap(async (req, res) => {
+        res.json(await testStorageForm(req.body));
+    }));
+
+    // Saves the settings as pending and, when a supervisor will start the
+    // process again (Docker restart policy, PM2), restarts the gateway.
+    api.put('/storage', requireAdmin, wrap(async (req, res) => {
+        const result = await saveStorage(req.body, { by: req.consoleUser.username });
+        const restart = autoRestart() && req.body?.restart !== false;
+        await store.audit(req.consoleUser.username, 'storage.update',
+            `${result.summary}${result.moving ? ' (data files move at restart)' : ''}${restart ? '; restarting' : '; restart required'}`, clientIp(req));
+        if (restart) {
+            console.log(`[Storage] Settings saved by ${req.consoleUser.username}; restarting to apply them.`);
+            res.on('finish', () => setTimeout(() => process.exit(0), 300));
+        }
+        res.json({ success: true, ...result, restarting: restart });
     }));
 
     // ---- Overview -----------------------------------------------------------------
