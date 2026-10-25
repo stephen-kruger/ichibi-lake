@@ -4,8 +4,9 @@
  * logins, settings overrides, retention rules and audit trail.
  */
 import { randomBytes } from 'crypto';
-import { execute, executeWithParams, VARCHAR, BIGINT, CONSOLE_CATALOG } from '../db.js';
+import { execute, executeWithParams, VARCHAR, BIGINT, BOOLEAN, CONSOLE_CATALOG } from '../db.js';
 import { SETTINGS, getSettingDef } from './registry.js';
+import { isTransactionConflict, retryOnConflict } from '../conflict.js';
 
 // Console tables live in their own catalog (see CONSOLE_CATALOG in src/db.js),
 // which the user-query instance never attaches.
@@ -16,6 +17,8 @@ const SETTINGS_T = table('_console_settings');
 const LEGACY_RETENTION = table('_console_retention');
 export const PRUNE_RULES = table('_console_prune_rules');
 export const PRUNE_RUNS = table('_console_prune_runs');
+export const MAINTENANCE = table('_console_maintenance');
+const MAINTENANCE_ID = 'lake';
 const AUDIT = table('_console_audit');
 const CONSOLE_TABLES = ['_console_users', '_console_settings', '_console_audit'];
 
@@ -110,6 +113,24 @@ export async function initConsoleTables() {
         ip VARCHAR
     )`);
     await execute(`ALTER TABLE ${PRUNE_RUNS} ADD COLUMN IF NOT EXISTS rows_by_match BIGINT`);
+    // Scheduled lake maintenance (src/console/maintenance.js): one row. Its runs
+    // go to PRUNE_RUNS with kind 'maintenance'.
+    await execute(`CREATE TABLE IF NOT EXISTS ${MAINTENANCE} (
+        id VARCHAR,
+        enabled VARCHAR,
+        schedule VARCHAR,
+        steps VARCHAR,
+        delete_threshold VARCHAR,
+        run_at_startup VARCHAR,
+        next_run_ms BIGINT,
+        claim_token VARCHAR,
+        lease_until_ms BIGINT,
+        last_run_ms BIGINT,
+        last_status VARCHAR,
+        last_summary VARCHAR,
+        updated_ms BIGINT,
+        updated_by VARCHAR
+    )`);
     await migrateFromMainCatalog();
     await migrateLegacyRetention();
 }
@@ -422,13 +443,20 @@ export async function dueRuleIds(nowMs) {
  * Claim a due rule for this instance. DuckLake does not make concurrent
  * conditional UPDATEs exclusive (both transactions can commit), so the claim
  * writes a unique token and re-reads it: only the instance whose token
- * survived runs the job. Returns true when this instance owns the run.
+ * survived runs the job. When DuckLake does detect the race, the losing
+ * UPDATE fails to commit, which also means "not claimed". Returns true when
+ * this instance owns the run.
  */
 export async function claimRule(id, token, nowMs, nextRunMs) {
-    await executeWithParams(
-        `UPDATE ${PRUNE_RULES} SET claim_token = ?, next_run_ms = ?
-         WHERE id = ? AND enabled = 'true' AND (next_run_ms IS NULL OR next_run_ms <= ?)`,
-        [token, big(nextRunMs), id, BigInt(nowMs)], [VARCHAR, BIGINT, VARCHAR, BIGINT]);
+    try {
+        await executeWithParams(
+            `UPDATE ${PRUNE_RULES} SET claim_token = ?, next_run_ms = ?
+             WHERE id = ? AND enabled = 'true' AND (next_run_ms IS NULL OR next_run_ms <= ?)`,
+            [token, big(nextRunMs), id, BigInt(nowMs)], [VARCHAR, BIGINT, VARCHAR, BIGINT]);
+    } catch (err) {
+        if (isTransactionConflict(err)) return false;
+        throw err;
+    }
     const rows = await executeWithParams(`SELECT claim_token FROM ${PRUNE_RULES} WHERE id = ?`, [id], [VARCHAR]);
     return rows[0]?.claim_token === token;
 }
@@ -515,6 +543,111 @@ export async function renameColumnInRules(tableName, oldName, newName) {
 
 export async function trimRuns(olderThanMs) {
     await executeWithParams(`DELETE FROM ${PRUNE_RUNS} WHERE started_ms < ? AND status <> 'running'`, [BigInt(olderThanMs)], [BIGINT]);
+}
+
+// --- Lake maintenance -----------------------------------------------------------
+
+function maintenanceFromRow(r) {
+    let steps = null;
+    try { steps = JSON.parse(r.steps || 'null'); } catch { steps = null; }
+    return {
+        enabled: r.enabled === 'true', schedule: r.schedule, steps,
+        deleteThreshold: r.delete_threshold === null || r.delete_threshold === undefined || r.delete_threshold === '' ? null : Number(r.delete_threshold),
+        runAtStartup: r.run_at_startup !== 'false',
+        nextRunMs: num(r.next_run_ms), leaseUntilMs: num(r.lease_until_ms), lastRunMs: num(r.last_run_ms),
+        lastStatus: r.last_status || null, lastSummary: r.last_summary || '', updatedMs: num(r.updated_ms), updatedBy: r.updated_by || null,
+    };
+}
+
+/**
+ * Create the maintenance row with `defaults` unless it exists. Instances that
+ * start together may both insert; the duplicates are removed again so every
+ * instance claims the same single row.
+ */
+export async function ensureMaintenanceRow(defaults) {
+    const count = async () => Number((await executeWithParams(`SELECT count(*) AS n FROM ${MAINTENANCE} WHERE id = ?`, [MAINTENANCE_ID], [VARCHAR]))[0]?.n || 0);
+    if (await count() === 0) {
+        await executeWithParams(
+            `INSERT INTO ${MAINTENANCE} (id, enabled, schedule, steps, delete_threshold, run_at_startup, next_run_ms, updated_ms, updated_by)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [MAINTENANCE_ID, defaults.enabled ? 'true' : 'false', defaults.schedule, JSON.stringify(defaults.steps),
+                defaults.deleteThreshold === null ? null : String(defaults.deleteThreshold), defaults.runAtStartup ? 'true' : 'false',
+                big(defaults.nextRunMs), BigInt(Date.now()), 'system'],
+            [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, BIGINT, VARCHAR]);
+    }
+    if (await count() > 1) {
+        await executeWithParams(`DELETE FROM ${MAINTENANCE} WHERE id = ? AND rowid <> (SELECT min(rowid) FROM ${MAINTENANCE} WHERE id = ?)`,
+            [MAINTENANCE_ID, MAINTENANCE_ID], [VARCHAR, VARCHAR]);
+    }
+}
+
+export async function getMaintenance() {
+    const rows = await executeWithParams(`SELECT * FROM ${MAINTENANCE} WHERE id = ? LIMIT 1`, [MAINTENANCE_ID], [VARCHAR]);
+    return rows.length ? maintenanceFromRow(rows[0]) : null;
+}
+
+export async function updateMaintenance(cfg, user) {
+    await retryOnConflict(() => executeWithParams(
+        `UPDATE ${MAINTENANCE} SET enabled = ?, schedule = ?, steps = ?, delete_threshold = ?, run_at_startup = ?, next_run_ms = ?,
+            updated_ms = ?, updated_by = ? WHERE id = ?`,
+        [cfg.enabled ? 'true' : 'false', cfg.schedule, JSON.stringify(cfg.steps), cfg.deleteThreshold === null ? null : String(cfg.deleteThreshold),
+            cfg.runAtStartup ? 'true' : 'false', big(cfg.nextRunMs), BigInt(Date.now()), user, MAINTENANCE_ID],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, BIGINT, VARCHAR, VARCHAR]));
+}
+
+export async function setMaintenanceNextRun(nextRunMs) {
+    await executeWithParams(`UPDATE ${MAINTENANCE} SET next_run_ms = ? WHERE id = ?`, [big(nextRunMs), MAINTENANCE_ID], [BIGINT, VARCHAR]);
+}
+
+/**
+ * Claim the maintenance run for this instance, with the same write-token-
+ * and-re-read pattern as claimRule() (DuckLake does not make concurrent
+ * conditional UPDATEs exclusive). A lease additionally stops any instance
+ * from claiming while a run is in progress, however long it takes. Scheduled
+ * claims need the job to be enabled and due; `force` (manual or startup runs)
+ * only needs the lease to be free. A claim that fails to commit because
+ * another instance's claim won (isTransactionConflict) is not an error.
+ * Returns true when this instance owns it.
+ */
+export async function claimMaintenance(token, { nowMs, nextRunMs, leaseUntilMs, force = false }) {
+    try {
+        await executeWithParams(
+            `UPDATE ${MAINTENANCE} SET claim_token = ?, next_run_ms = ?, lease_until_ms = ?
+             WHERE id = ? AND (lease_until_ms IS NULL OR lease_until_ms <= ?)
+               AND (? OR (enabled = 'true' AND (next_run_ms IS NULL OR next_run_ms <= ?)))`,
+            [token, big(nextRunMs), big(leaseUntilMs), MAINTENANCE_ID, BigInt(nowMs), force, BigInt(nowMs)],
+            [VARCHAR, BIGINT, BIGINT, VARCHAR, BIGINT, BOOLEAN, BIGINT]);
+    } catch (err) {
+        if (isTransactionConflict(err)) return false;
+        throw err;
+    }
+    const rows = await executeWithParams(`SELECT claim_token FROM ${MAINTENANCE} WHERE id = ?`, [MAINTENANCE_ID], [VARCHAR]);
+    return rows.length > 0 && rows.every(r => r.claim_token === token);
+}
+
+/** Release the lease and record the outcome (only if this instance holds the claim). */
+export async function finishMaintenance(token, status, summary) {
+    await retryOnConflict(() => executeWithParams(
+        `UPDATE ${MAINTENANCE} SET lease_until_ms = NULL, last_run_ms = ?, last_status = ?, last_summary = ? WHERE id = ? AND claim_token = ?`,
+        [BigInt(Date.now()), status, String(summary || '').slice(0, 2000), MAINTENANCE_ID, token], [BIGINT, VARCHAR, VARCHAR, VARCHAR, VARCHAR]));
+}
+
+/** Release a lease left by an earlier process on this host (crash/restart), as abandonRunsOfHost() does for runs. */
+export async function releaseMaintenanceLeaseOfHost(hostPrefix) {
+    await executeWithParams(
+        `UPDATE ${MAINTENANCE} SET lease_until_ms = NULL, last_status = 'abandoned', last_summary = 'The gateway restarted before this run finished.'
+         WHERE id = ? AND lease_until_ms IS NOT NULL AND starts_with(claim_token, ?)`,
+        [MAINTENANCE_ID, hostPrefix], [VARCHAR, VARCHAR]);
+}
+
+/** Recent maintenance runs, newest first. */
+export async function listMaintenanceRuns(limit = 20) {
+    const n = Math.max(1, Math.min(200, Number(limit) || 20));
+    const rows = await execute(`SELECT * FROM ${PRUNE_RUNS} WHERE kind = 'maintenance' ORDER BY started_ms DESC LIMIT ${n}`);
+    return rows.map(r => ({
+        runId: r.run_id, trigger: r.trigger, status: r.status, startedMs: num(r.started_ms), finishedMs: num(r.finished_ms),
+        message: r.message || '', instance: r.instance, username: r.username,
+    }));
 }
 
 // --- Audit log -----------------------------------------------------------------

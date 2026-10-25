@@ -150,7 +150,7 @@ export function renderMetrics({ userQuery, exports, lake, ready }) {
         w.gauge('ichibi_ducklake_data_files', 'Parquet data files referenced by the current DuckLake snapshot.', lake.files);
         w.gauge('ichibi_ducklake_data_bytes', 'Total size of those data files in bytes.', lake.bytes);
     }
-    w.gauge('ichibi_startup_complete', 'Whether the gateway startup sequence (RBAC/ACL bootstrap, console, compaction) has finished.', ready ? 1 : 0);
+    w.gauge('ichibi_startup_complete', 'Whether the gateway startup sequence (RBAC/ACL bootstrap, migrations, admin console) has finished.', ready ? 1 : 0);
 
     const mem = process.memoryUsage();
     w.gauge('process_resident_memory_bytes', 'Resident memory size in bytes.', mem.rss);

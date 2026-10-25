@@ -14,7 +14,6 @@ import {
     userQueryStats,
     getTableColumns,
     invalidateColumnCache,
-    compactDuckLake,
     initGraphRegistry,
     saveGraphDefinition,
     loadGraphDefinition,
@@ -33,6 +32,7 @@ import { migrateTimestamps } from './migrate-timestamps.js';
 import { initAclTable, ensureTableAcl, checkReadAccess, checkWriteAccess, getTableAcl, updateTableAcl, invalidateAclCache, migrateToAcl } from './acl.js';
 import { initRbacTables, bootstrapRbac, isValidApiKey, checkAccess, isRbacConfigured, legacyBootstrap, isSuperuserKey } from './rbac.js';
 import { assertReadOnlySql } from './sql-guard.js';
+import { retryOnConflict } from './conflict.js';
 import adminRouter from './rbac-api.js';
 import { createConsoleRouter, initConsole, loadSettingOverrides, publicBaseUrl } from './console/index.js';
 import { EXPORT_FORMATS, runExport, exportStats } from './export.js';
@@ -230,7 +230,7 @@ app.get('/swagger.yaml', (req, res) => {
 // --- Operations: health checks and metrics ---
 
 // Set once the startup sequence in app.listen() below has finished (RBAC/ACL
-// bootstrap, console, compaction). Until then the gateway is live but not ready.
+// bootstrap, migrations, admin console). Until then the gateway is live but not ready.
 let startupState = 'starting';
 
 function withTimeout(promise, ms, what) {
@@ -1949,36 +1949,60 @@ app.use('/', swaggerUi.serve);
 app.get('/', swaggerUi.setup(swaggerDocument));
 
 // --- Start Server ---
+/**
+ * Startup steps, in order. Each is idempotent (CREATE ... IF NOT EXISTS,
+ * check-then-insert bootstraps, migrations guarded by _gateway_meta), so a
+ * step that loses a DuckLake commit race with another instance starting
+ * against the same catalog is simply run again.
+ */
+const STARTUP_STEPS = [
+    ['RBAC tables', initRbacTables],
+    // Console overrides (e.g. an API_KEYS list edited in the console) must
+    // be in effect before the bootstrap below promotes/re-activates keys.
+    ['setting overrides', loadSettingOverrides],
+    ['RBAC bootstrap', () => (isRbacConfigured() ? bootstrapRbac() : legacyBootstrap())],
+    ['ACL table', initAclTable],
+    ['graph registry', initGraphRegistry],
+    ['table migration', migrateExistingTables],
+    ['ACL migration', migrateToAcl],
+    ['timestamp migration', migrateTimestamps],
+    // Admin console: loads setting overrides (applied to process.env) and
+    // starts the retention scheduler. Runs after RBAC/ACL bootstrap so an
+    // API_KEYS override can reconcile against the bootstrapped users.
+    // Also starts scheduled lake maintenance, which compacts small files
+    // at startup and on its schedule (src/console/maintenance.js).
+    ['admin console', initConsole],
+];
+const STARTUP_ATTEMPTS = parseInt(process.env.STARTUP_ATTEMPTS || '5', 10);
+
+async function runStartupSteps() {
+    for (const [name, step] of STARTUP_STEPS) {
+        await retryOnConflict(step, { attempts: 8, label: `Startup: ${name}` });
+    }
+}
+
 app.listen(port, '0.0.0.0', async () => {
     console.log(`ichibi-lake server listening on 0.0.0.0:${port}`);
     console.log(`[Server] Swagger UI:    ${publicBaseUrl()}/`);
     console.log(`[Server] Admin console: ${publicBaseUrl()}/console`);
-    try {
-        await initRbacTables();
-        // Console overrides (e.g. an API_KEYS list edited in the console) must
-        // be in effect before the bootstrap below promotes/re-activates keys.
-        await loadSettingOverrides();
-        if (isRbacConfigured()) {
-            await bootstrapRbac();
-        } else {
-            await legacyBootstrap();
+    // A failed step would otherwise leave the gateway half-initialised (the
+    // console answering 503 for good), so retry the whole sequence and, if it
+    // still fails, exit and let the supervisor (Docker restart policy, PM2)
+    // start a fresh process.
+    for (let attempt = 1; ; attempt++) {
+        try {
+            await runStartupSteps();
+            startupState = 'ready';
+            break;
+        } catch (err) {
+            console.error(`Startup Error (attempt ${attempt}/${STARTUP_ATTEMPTS}):`, err);
+            if (attempt >= STARTUP_ATTEMPTS) {
+                startupState = 'failed';
+                console.error('[Server] Startup failed; exiting so the process can be restarted.');
+                process.exit(1);
+            }
+            await new Promise(r => setTimeout(r, 2000 * attempt));
         }
-        await initAclTable();
-        await initGraphRegistry();
-        await migrateExistingTables();
-        await migrateToAcl();
-        await migrateTimestamps();
-        // Admin console: loads setting overrides (applied to process.env) and
-        // starts the retention scheduler. Runs after RBAC/ACL bootstrap so an
-        // API_KEYS override can reconcile against the bootstrapped users.
-        await initConsole();
-        // Compact tiny Parquet files left over from high-frequency one-row
-        // ingestion. This is often the single biggest win for scan speed.
-        await compactDuckLake();
-        startupState = 'ready';
-        startKafkaConsumer().catch(err => console.error('Kafka Consumer Error:', err));
-    } catch (err) {
-        startupState = 'failed';
-        console.error('Startup Error:', err);
     }
+    startKafkaConsumer().catch(err => console.error('Kafka Consumer Error:', err));
 });

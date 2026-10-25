@@ -25,8 +25,9 @@ COPY scripts/console-admin.js ./scripts/console-admin.js
 COPY scripts/install-extensions.js ./scripts/install-extensions.js
 
 # Pre-install the DuckDB extensions the gateway loads (ducklake, postgres,
-# duckpgq) so containers never download them at startup; the gateway's runtime
-# INSTALL is then a no-op. Without this, every fresh container fetched them
+# duckpgq, plus httpfs and aws for s3:// data paths) so containers never
+# download them at startup; the gateway's runtime INSTALL is then a no-op.
+# Without this, every fresh container fetched them
 # during _attachDuckLake(); DuckDB's built-in HTTP client has no read timeout,
 # so an occasional stalled connection (observed with the community-extensions
 # download for duckpgq) hung startup indefinitely with every request queued

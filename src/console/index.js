@@ -17,6 +17,7 @@ import {
     getDummyHash, passwordFingerprint, createSessionToken, verifySessionToken, parseCookies,
     sessionCookie, LoginThrottle, safeEqual, generateSetupCode, generateApiKey,
 } from './auth.js';
+import { startMaintenanceScheduler, saveMaintenanceConfig, startMaintenance, maintenanceOverview, describeSteps } from './maintenance.js';
 import { isSystemTable, normaliseRule, computeNextRun, matchTables, previewRule, startJob, startPruneScheduler, storageInfo, isDateType, isEpochType, describeConditions, CONDITION_OPS, isLegacyMultiTable } from './retention.js';
 import { nextRuns, validateCron, SCHEDULE_PRESETS } from './cron.js';
 import * as data from './data.js';
@@ -104,6 +105,8 @@ function ensureSetupCode() {
  * Initialise console tables, load setting overrides and start background
  * jobs. Called from the gateway's startup sequence once DuckLake is attached.
  */
+let refreshTimer = null;
+
 export async function initConsole() {
     await store.initConsoleTables();
     await store.refreshOverrides();
@@ -111,12 +114,19 @@ export async function initConsole() {
 
     if (await store.countUsers() === 0) ensureSetupCode();
 
-    const refresh = setInterval(() => {
-        store.refreshOverrides().catch(err => console.warn('[Console] Settings refresh failed:', err.message || err));
-    }, SETTINGS_REFRESH_MS);
-    refresh.unref?.();
+    // initConsole() is re-run when a later startup step fails (src/index.js),
+    // so start the refresh interval only once.
+    if (!refreshTimer) {
+        refreshTimer = setInterval(() => {
+            store.refreshOverrides().catch(err => console.warn('[Console] Settings refresh failed:', err.message || err));
+        }, SETTINGS_REFRESH_MS);
+        refreshTimer.unref?.();
+    }
 
     await startPruneScheduler();
+    // Lake maintenance (flush/merge/rewrite/expire/cleanup); also performs the
+    // startup compaction run, claimed so only one instance does it.
+    await startMaintenanceScheduler();
     ready = true;
     console.log(`[Console] Admin console ready at ${publicBaseUrl()}/console`);
 }
@@ -644,6 +654,24 @@ export function createConsoleRouter() {
 
     api.get('/retention/runs', wrap(async (req, res) => {
         res.json({ jobs: await store.listRuns({ ruleId: req.query.rule || null, limit: req.query.limit }) });
+    }));
+
+    // ---- Lake maintenance -------------------------------------------------------------------
+    api.get('/maintenance', wrap(async (req, res) => {
+        res.json(await maintenanceOverview());
+    }));
+
+    api.put('/maintenance', requireAdmin, wrap(async (req, res) => {
+        const cfg = await saveMaintenanceConfig(req.body || {}, req.consoleUser.username);
+        await store.audit(req.consoleUser.username, 'maintenance.update',
+            `${cfg.enabled ? `enabled, ${cfg.schedule}` : 'disabled'}; steps: ${describeSteps(cfg.steps)}` +
+            `${cfg.deleteThreshold !== null ? `; rewrite threshold ${cfg.deleteThreshold}` : ''}; at startup: ${cfg.runAtStartup ? 'yes' : 'no'}`, clientIp(req));
+        res.json({ success: true });
+    }));
+
+    api.post('/maintenance/run', requireAdmin, wrap(async (req, res) => {
+        const runId = await startMaintenance({ trigger: 'manual', username: req.consoleUser.username });
+        res.status(202).json({ success: true, runId });
     }));
 
     // ---- Tables & data ------------------------------------------------------------------------
