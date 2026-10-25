@@ -181,6 +181,15 @@ input[readonly] { background: var(--surface-2); color: var(--text-muted); }
 .badge.env { background: rgba(62, 109, 134, 0.12); color: var(--accent); border-color: transparent; }
 .badge.ok { background: var(--success-soft); color: var(--success); border-color: transparent; }
 .badge.off { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
+.badge.warn { background: var(--warn-soft); color: var(--ochre); border-color: transparent; margin-left: 4px; }
+.badges { display: flex; flex-wrap: wrap; gap: 12px; }
+.badges .check { white-space: nowrap; }
+.import-preview { max-height: 320px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+.import-preview table { font-size: 12.5px; }
+.import-preview td { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.field[hidden], .checkbox[hidden] { display: none; }
+.radio-row { display: flex; gap: 18px; flex-wrap: wrap; }
+.radio-row label { display: flex; align-items: center; gap: 6px; font-weight: normal; }
 .badge.live { background: var(--success-soft); color: var(--success); border-color: transparent; }
 
 .callout { padding: 12px 16px; border-radius: 8px; background: var(--warn-soft); border: 1px solid var(--border); margin-bottom: 16px; font-size: 13px; }

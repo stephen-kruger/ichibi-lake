@@ -24,6 +24,8 @@ import { invalidateRbacCache } from '../rbac.js';
 import { listGraphDefinitions } from '../db.js';
 import * as consoleStore from './store.js';
 import { matchTables, isDateType, isEpochType } from './retention.js';
+import { EXPORT_FORMATS, runExport } from '../export.js';
+import { resolveTypeConflict } from '../schema-evolution.js';
 
 export const SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 export const PAGE_SIZES = [25, 50, 100, 250, 500];
@@ -647,5 +649,173 @@ export async function dropTable(tableName) {
         invalidateColumnCache(tableName);
         invalidateAclCache(); invalidateRbacCache();
         return { dropped: tableName };
+    });
+}
+
+// --- Export ----------------------------------------------------------------------------
+
+/**
+ * Stream a table to `res` as parquet, csv or ndjson, optionally limited to the
+ * rows the data browser currently shows (same filters/search/sort as
+ * readRows). Uses runExport() from src/export.js, so the gateway's export
+ * limits (EXPORT_MAX_ROWS / EXPORT_CONCURRENCY / EXPORT_TIMEOUT_MS) and
+ * truncation headers apply exactly as for GET /tables/:tableName/export.
+ */
+export async function exportTable(tableName, { format = 'parquet', filters, search, sort, limit } = {}, res) {
+    if (!Object.hasOwn(EXPORT_FORMATS, format)) {
+        throw httpError(400, `Unsupported export format "${format}". Use one of: ${Object.keys(EXPORT_FORMATS).join(', ')}`);
+    }
+    let rowLimit = null;
+    if (limit !== undefined && limit !== null && limit !== '') {
+        rowLimit = Number(limit);
+        if (!Number.isInteger(rowLimit) || rowLimit < 0) throw httpError(400, 'limit must be a non-negative integer');
+    }
+    const cols = await withConnection(conn => requireTable(conn, tableName));
+    const types = columnMap(cols);
+    const where = buildWhere(filters, search, types);
+    let orderBy = '';
+    if (sort && sort.column) {
+        if (!types.has(sort.column)) throw httpError(400, `Unknown sort column: ${sort.column}`);
+        orderBy = ` ORDER BY ${quoteIdent(sort.column)} ${sort.dir === 'desc' ? 'DESC' : 'ASC'} NULLS LAST`;
+    }
+    // BLOBs travel base64-encoded in the text formats, like the JSON API.
+    const select = cols.map(({ column_name: c, data_type: t }) =>
+        format !== 'parquet' && /^BLOB/i.test(String(t)) ? `base64(${quoteIdent(c)}) AS ${quoteIdent(c)}` : quoteIdent(c)).join(', ');
+    const table = quoteIdent(tableName);
+    await runExport({
+        format,
+        selectSql: `SELECT ${select} FROM ${table} ${where.sql}${orderBy}`,
+        countSql: `SELECT count(*) FROM ${table} ${where.sql}`,
+        params: where.params, types: where.types,
+        limit: rowLimit,
+        filename: tableName,
+        res,
+    });
+}
+
+// --- Import ----------------------------------------------------------------------------
+
+export const IMPORT_FORMATS = ['csv', 'parquet', 'json'];
+const IMPORT_PREVIEW_ROWS = 20;
+const IMPORT_PREVIEW_CHARS = 200;
+
+/** Format from an explicit choice, else from the file name's extension. */
+export function detectImportFormat(format, filename = '') {
+    if (format) {
+        if (!IMPORT_FORMATS.includes(format)) throw httpError(400, `Unsupported import format "${format}". Use one of: ${IMPORT_FORMATS.join(', ')}`);
+        return format;
+    }
+    const ext = String(filename).toLowerCase().split('.').pop();
+    if (ext === 'csv' || ext === 'tsv' || ext === 'txt') return 'csv';
+    if (ext === 'parquet' || ext === 'pq') return 'parquet';
+    if (ext === 'json' || ext === 'ndjson' || ext === 'jsonl') return 'json';
+    throw httpError(400, 'Could not tell the file format from its name; choose CSV, Parquet or JSON.');
+}
+
+// `file` is a server-generated temp path, never user input.
+function importReader(format, file) {
+    const lit = quoteLiteral(file);
+    if (format === 'csv') return `read_csv(${lit}, auto_detect = true)`;
+    if (format === 'parquet') return `read_parquet(${lit})`;
+    return `read_json_auto(${lit})`;
+}
+
+/**
+ * Work out how incoming columns map onto an existing table, using the same
+ * schema-evolution rules as POST /upload (src/schema-evolution.js):
+ *   insert  same name; DuckDB casts the value (castFrom set when types differ)
+ *   widen   STRUCT column widened to hold both shapes
+ *   add     new column, added to the table (if addColumns)
+ *   skip    cannot evolve, or a new column with addColumns off
+ * Missing created/updated TIMESTAMP columns are filled with the import time,
+ * as rows added through the API are.
+ */
+function planAppend(existingCols, incoming, addColumns) {
+    const existing = new Map(existingCols.map(c => [c.column_name.toLowerCase(), c]));
+    const columns = incoming.map(({ name, type }) => {
+        const match = existing.get(name.toLowerCase());
+        if (!match) return addColumns ? { name, type, action: 'add' } : { name, type, action: 'skip', reason: 'new column (adding columns is off)' };
+        const target = String(match.data_type);
+        const r = resolveTypeConflict(target, type);
+        if (r.action === 'skip') return { name: match.column_name, type, action: 'skip', reason: r.reason };
+        if (r.action === 'widen') return { name: match.column_name, type, action: 'widen', newType: r.newType, from: target };
+        return { name: match.column_name, type, action: 'insert', castFrom: target.toUpperCase() === type.toUpperCase() ? null : target };
+    });
+    const incomingNames = new Set(incoming.map(c => c.name.toLowerCase()));
+    const missing = existingCols.filter(c => !incomingNames.has(c.column_name.toLowerCase()));
+    const autoFill = missing.filter(c => ['created', 'updated'].includes(c.column_name) && isTimestampType(c.data_type))
+        .map(c => ({ name: c.column_name, type: String(c.data_type) }));
+    return { columns, missing: missing.map(c => c.column_name).filter(n => !autoFill.some(a => a.name === n)), autoFill };
+}
+
+/**
+ * Import a staged file (CSV, Parquet or JSON / NDJSON) into a new table
+ * (mode "create") or append it to an existing one (mode "append"). With
+ * dryRun nothing is written; the result describes the detected columns, row
+ * count, a preview and, for append, the per-column plan.
+ */
+export async function importFile(file, { format, table, mode = 'create', dryRun = false, addColumns = true } = {}) {
+    if (!['create', 'append'].includes(mode)) throw httpError(400, 'mode must be "create" or "append"');
+    const reader = importReader(format, file);
+    return withConnection(async (conn) => {
+        let incoming;
+        try {
+            incoming = (await rows(conn, `DESCRIBE SELECT * FROM ${reader}`)).map(r => ({ name: String(r.column_name), type: String(r.column_type) }));
+        } catch (err) {
+            throw httpError(400, `Could not read the file as ${format.toUpperCase()}: ${cleanDuckDbError(err)}`);
+        }
+        if (incoming.length === 0) throw httpError(400, 'The file has no columns');
+
+        let plan = null;
+        if (mode === 'create') {
+            requireNewName(table, 'Table');
+            if (await tableExists(conn, table)) throw httpError(409, `Table "${table}" already exists; choose "append" to add rows to it`);
+        } else {
+            plan = planAppend(await requireTable(conn, table), incoming, addColumns);
+            if (!plan.columns.some(c => c.action !== 'skip')) throw httpError(400, 'None of the file\'s columns can be imported into this table');
+        }
+
+        const totalRows = Number(await scalar(conn, `SELECT count(*) FROM ${reader}`));
+
+        if (dryRun) {
+            const sample = await rows(conn,
+                `SELECT ${incoming.map((c, i) => `left(CAST(${quoteIdent(c.name)} AS VARCHAR), ${IMPORT_PREVIEW_CHARS}) AS c${i}`).join(', ')} FROM ${reader} LIMIT ${IMPORT_PREVIEW_ROWS}`);
+            return {
+                dryRun: true, format, mode, table, totalRows, columns: incoming,
+                preview: sample.map(r => incoming.map((_, i) => (r[`c${i}`] === null || r[`c${i}`] === undefined ? null : String(r[`c${i}`])))),
+                plan,
+            };
+        }
+
+        const t = quoteIdent(table);
+        if (mode === 'create') {
+            await ddl(conn, `CREATE TABLE ${t} AS SELECT * FROM ${reader}`);
+            invalidateColumnCache(table);
+            return { table, mode, format, inserted: totalRows, columns: incoming.length };
+        }
+
+        const applied = { added: [], widened: [] };
+        for (const c of plan.columns) {
+            if (c.action === 'add') {
+                await ddl(conn, `ALTER TABLE ${t} ADD COLUMN ${quoteIdent(c.name)} ${c.type}`);
+                applied.added.push(c.name);
+            } else if (c.action === 'widen') {
+                await ddl(conn, `ALTER TABLE ${t} ALTER COLUMN ${quoteIdent(c.name)} SET DATA TYPE ${c.newType}`);
+                applied.widened.push(c.name);
+            }
+        }
+        if (applied.added.length || applied.widened.length) invalidateColumnCache(table);
+        const select = plan.columns.filter(c => c.action !== 'skip').map(c => quoteIdent(c.name))
+            .concat(plan.autoFill.map(c => `CAST(CURRENT_TIMESTAMP AS ${c.type}) AS ${quoteIdent(c.name)}`));
+        try {
+            await conn.run(`INSERT INTO ${t} BY NAME SELECT ${select.join(', ')} FROM ${reader}`);
+        } catch (err) {
+            throw httpError(400, `Import failed, no rows were added: ${cleanDuckDbError(err)}` +
+                (applied.added.length ? ` (column(s) ${applied.added.join(', ')} were already added)` : ''));
+        }
+        return {
+            table, mode, format, inserted: totalRows, ...applied,
+            skipped: plan.columns.filter(c => c.action === 'skip').map(c => c.name),
+        };
     });
 }

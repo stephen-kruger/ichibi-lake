@@ -37,6 +37,7 @@ import adminRouter from './rbac-api.js';
 import { createConsoleRouter, initConsole, loadSettingOverrides, publicBaseUrl } from './console/index.js';
 import { EXPORT_FORMATS, runExport, exportStats } from './export.js';
 import { httpMetricsMiddleware, renderMetrics } from './metrics.js';
+import { checkReadiness, lakeStats, getStartupState, setStartupState } from './health.js';
 import swaggerUi from 'swagger-ui-express';
 import YAML from 'yamljs';
 import { createHandler } from 'graphql-http/lib/use/express';
@@ -229,20 +230,6 @@ app.get('/swagger.yaml', (req, res) => {
 
 // --- Operations: health checks and metrics ---
 
-// Set once the startup sequence in app.listen() below has finished (RBAC/ACL
-// bootstrap, migrations, admin console). Until then the gateway is live but not ready.
-let startupState = 'starting';
-
-function withTimeout(promise, ms, what) {
-    let timer;
-    return Promise.race([
-        promise,
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms); }),
-    ]).finally(() => clearTimeout(timer));
-}
-
-const HEALTH_CHECK_TIMEOUT_MS = 5000;
-
 // GET /health - liveness. No auth, no database access: answers as long as the
 // Node event loop is responsive. Used by the compose healthcheck.
 app.get('/health', (req, res) => {
@@ -251,51 +238,12 @@ app.get('/health', (req, res) => {
 
 // GET /health/ready - readiness. No auth. 200 only when startup finished, the
 // DuckLake catalog is attached on the primary instance and its Postgres
-// metadata database answers a query; otherwise 503 with the failing check.
+// metadata database answers a query; otherwise 503 with the failing check
+// (see src/health.js).
 app.get('/health/ready', async (req, res) => {
-    const checks = { startup: startupState, ducklake: 'unknown', postgres: 'unknown' };
-    try {
-        const rows = await withTimeout(
-            execute("SELECT count(*) AS n FROM duckdb_databases() WHERE database_name = 'ducklake' AND type = 'ducklake'"),
-            HEALTH_CHECK_TIMEOUT_MS, 'DuckLake check');
-        checks.ducklake = Number(rows[0]?.n) === 1 ? 'ok' : 'not attached';
-    } catch (err) {
-        checks.ducklake = `error: ${String(err.message || err).split('\n')[0]}`;
-    }
-    try {
-        // A real round trip to the metadata Postgres through DuckLake's own
-        // attachment (DuckLake caches nothing for this).
-        await withTimeout(
-            execute("SELECT * FROM postgres_query('__ducklake_metadata_ducklake', 'SELECT 1')"),
-            HEALTH_CHECK_TIMEOUT_MS, 'Postgres check');
-        checks.postgres = 'ok';
-    } catch (err) {
-        checks.postgres = `error: ${String(err.message || err).split('\n')[0]}`;
-    }
-    const ready = checks.startup === 'ready' && checks.ducklake === 'ok' && checks.postgres === 'ok';
+    const { ready, checks } = await checkReadiness();
     res.set('Cache-Control', 'no-store').status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not ready', checks });
 });
-
-// DuckLake catalog size for /metrics, cached so frequent scrapes do not query
-// the metadata database every time.
-const LAKE_STATS_TTL_MS = 30000;
-let lakeStatsCache = { at: 0, value: null };
-async function lakeStats() {
-    if (Date.now() - lakeStatsCache.at < LAKE_STATS_TTL_MS) return lakeStatsCache.value;
-    let value = null;
-    try {
-        const rows = await withTimeout(execute(`
-            SELECT count(*) FILTER (WHERE NOT starts_with(table_name, '_')) AS tables,
-                   coalesce(sum(file_count), 0) AS files,
-                   coalesce(sum(file_size_bytes), 0) AS bytes
-            FROM ducklake_table_info('ducklake')`), HEALTH_CHECK_TIMEOUT_MS, 'DuckLake stats');
-        value = { tables: Number(rows[0].tables), files: Number(rows[0].files), bytes: Number(rows[0].bytes) };
-    } catch (err) {
-        console.warn('[Metrics] DuckLake stats query failed:', String(err.message || err).split('\n')[0]);
-    }
-    lakeStatsCache = { at: Date.now(), value };
-    return value;
-}
 
 // GET /metrics - Prometheus text format. With METRICS_TOKEN set, scrapers send
 // "Authorization: Bearer <METRICS_TOKEN>". Without it, a superuser API key is
@@ -316,7 +264,7 @@ app.get('/metrics', async (req, res) => {
             error: token ? 'Unauthorized: missing or wrong METRICS_TOKEN bearer token' : 'Unauthorized: /metrics requires a superuser API key (or set METRICS_TOKEN)',
         });
     }
-    const body = renderMetrics({ userQuery: userQueryStats(), exports: exportStats(), lake: await lakeStats(), ready: startupState === 'ready' });
+    const body = renderMetrics({ userQuery: userQueryStats(), exports: exportStats(), lake: await lakeStats(), ready: getStartupState() === 'ready' });
     res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8').set('Cache-Control', 'no-store').send(body);
 });
 
@@ -1992,12 +1940,12 @@ app.listen(port, '0.0.0.0', async () => {
     for (let attempt = 1; ; attempt++) {
         try {
             await runStartupSteps();
-            startupState = 'ready';
+            setStartupState('ready');
             break;
         } catch (err) {
             console.error(`Startup Error (attempt ${attempt}/${STARTUP_ATTEMPTS}):`, err);
             if (attempt >= STARTUP_ATTEMPTS) {
-                startupState = 'failed';
+                setStartupState('failed');
                 console.error('[Server] Startup failed; exiting so the process can be restarted.');
                 process.exit(1);
             }

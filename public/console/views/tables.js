@@ -57,8 +57,9 @@
         draw();
 
         const create = h('button', { class: 'btn primary', type: 'button', disabled: !ctx.isAdmin, onclick: () => createTableDialog(ctx) }, icon('plus'), 'New table');
+        const importBtn = h('button', { class: 'btn', type: 'button', disabled: !ctx.isAdmin, onclick: () => importDialog(ctx, { tables: res.tables.map(t => t.name) }) }, icon('upload'), 'Import');
         return [
-            pageHeader('Tables & Data', 'Browse, edit and restructure DuckLake tables. System tables (prefixed "_") are managed on their own pages and hidden here.', create),
+            pageHeader('Tables & Data', 'Browse, edit and restructure DuckLake tables. System tables (prefixed "_") are managed on their own pages and hidden here.', importBtn, create),
             h('div', { class: 'card' },
                 h('div', { class: 'card-header' }, h('h2', {}, `${res.tables.length} table(s)`), filter),
                 h('div', { class: 'card-body flush table-wrap' },
@@ -115,8 +116,11 @@
         const schema = await api('GET', `/data/tables/${enc(table)}/schema`);
         if (schema.columnTypes) meta.columnTypes = schema.columnTypes;
 
-        const actions = [];
+        const actions = [
+            h('button', { class: 'btn', type: 'button', onclick: () => exportDialog(table, schema) }, icon('download'), 'Export'),
+        ];
         if (ctx.isAdmin) {
+            actions.push(h('button', { class: 'btn', type: 'button', onclick: () => importDialog(ctx, { table }) }, icon('upload'), 'Import'));
             actions.push(h('button', { class: 'btn', type: 'button', onclick: () => renameTableDialog(ctx, table, schema) }, icon('edit'), 'Rename'));
             actions.push(h('button', { class: 'btn danger', type: 'button', onclick: () => dropTableDialog(ctx, table, schema) }, icon('trash'), 'Drop'));
         }
@@ -567,5 +571,168 @@
             toast(`Column ${col.name} dropped`, 'success');
             ctx.reload();
         });
+    }
+    // =========================================================================
+    // Export / import
+    // =========================================================================
+
+    async function exportDialog(table, schema) {
+        const st = stateFor(table);
+        const filtered = st.filters.length > 0 || !!st.search;
+        const format = h('select', {},
+            h('option', { value: 'parquet' }, 'Parquet (typed, compressed)'),
+            h('option', { value: 'csv' }, 'CSV'),
+            h('option', { value: 'ndjson' }, 'NDJSON (one JSON object per line)'));
+        const useView = h('input', { type: 'checkbox', checked: filtered });
+        const limit = h('input', { type: 'number', min: 0, placeholder: 'all rows (up to the export cap)' });
+        const ok = await modal({
+            title: `Export ${table}`,
+            body: h('div', { class: 'row-gap' },
+                field('Format', format),
+                h('label', { class: 'checkbox' }, useView,
+                    filtered ? `Only rows matching the current filters/search (${st.filters.length} filter(s)${st.search ? ', search' : ''}) in the current sort order`
+                        : 'Use the current sort order'),
+                field('Row limit', limit, `Optional. Exports are capped by EXPORT_MAX_ROWS; a truncated export is flagged in the download's X-Export-Truncated header. ${schema.rows.toLocaleString()} row(s) in the table.`)),
+            actions: [{ label: 'Cancel', value: false }, { label: 'Download', value: true, primary: true }],
+        });
+        if (!ok) return;
+        const params = new URLSearchParams({ format: format.value });
+        if (useView.checked) {
+            if (st.filters.length) params.set('filters', JSON.stringify(st.filters));
+            if (st.search) params.set('search', st.search);
+            if (st.sort) params.set('sort', JSON.stringify(st.sort));
+        }
+        if (limit.value !== '') params.set('limit', limit.value);
+        // A plain link streams the file straight to disk (no in-memory blob).
+        const a = h('a', { href: `api/data/tables/${enc(table)}/export?${params}`, download: '' });
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        toast('Export started; your browser will save the file.', 'success');
+    }
+
+    function importUrl(file, opts) {
+        const params = new URLSearchParams({ filename: file.name, table: opts.table, mode: opts.mode, addColumns: opts.addColumns ? '1' : '0' });
+        if (opts.format) params.set('format', opts.format);
+        if (opts.dryRun) params.set('dryRun', '1');
+        return `api/data/import?${params}`;
+    }
+
+    async function uploadImport(file, opts) {
+        // Large files take a while to upload and scan; keep a note up until done.
+        const mb = file.size / 1048576;
+        const note = h('div', { class: 'toast', role: 'status' },
+            `${opts.dryRun ? 'Reading' : 'Importing'} ${file.name}${mb >= 1 ? ` (${mb.toFixed(1)} MB)` : ''}…`);
+        document.getElementById('toasts').appendChild(note);
+        try {
+            const res = await fetch(importUrl(file, opts), {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/octet-stream', 'X-Console-Request': '1' },
+                body: file,
+            });
+            let data = {};
+            try { data = await res.json(); } catch { /* empty */ }
+            if (!res.ok) throw new Error(data.error || `Import failed (${res.status})`);
+            return data;
+        } finally {
+            note.remove();
+        }
+    }
+
+    function suggestTableName(filename) {
+        let n = String(filename).replace(/\.[^.]*$/, '').replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+/, '');
+        if (!/^[A-Za-z_]/.test(n)) n = `t_${n}`;
+        return n.slice(0, 63) || 'imported';
+    }
+
+    /**
+     * Two steps: choose a file and target, then review a dry-run preview (detected
+     * columns, row count, sample rows, schema changes) before anything is written.
+     * The file is sent again for the real import, so nothing is staged on the server.
+     */
+    async function importDialog(ctx, { table = null, tables = null } = {}) {
+        const file = h('input', { type: 'file', accept: '.csv,.tsv,.txt,.parquet,.pq,.json,.ndjson,.jsonl' });
+        const format = h('select', {},
+            h('option', { value: '' }, 'Detect from file name'),
+            h('option', { value: 'csv' }, 'CSV'), h('option', { value: 'parquet' }, 'Parquet'), h('option', { value: 'json' }, 'JSON / NDJSON'));
+        const modeNew = h('input', { type: 'radio', name: 'import-mode', value: 'create', checked: !table });
+        const modeAppend = h('input', { type: 'radio', name: 'import-mode', value: 'append', checked: !!table });
+        const newName = h('input', { type: 'text', placeholder: 'new_table_name' });
+        const target = table
+            ? h('input', { type: 'text', value: table, readOnly: true })
+            : h('select', {}, (tables || []).map(t => h('option', { value: t }, t)));
+        const addColumns = h('input', { type: 'checkbox', checked: true });
+        file.addEventListener('change', () => { if (file.files[0] && !newName.value) newName.value = suggestTableName(file.files[0].name); });
+        const newField = field('New table name', newName, 'Letters, digits and underscores; must not start with "_".');
+        const existingField = field('Existing table', target);
+        const addField = h('label', { class: 'checkbox' }, addColumns, 'Add columns that the table does not have yet (otherwise they are skipped)');
+        const syncMode = () => {
+            const append = modeAppend.checked;
+            newField.hidden = append;
+            existingField.hidden = !append;
+            addField.hidden = !append;
+        };
+        modeNew.addEventListener('change', syncMode);
+        modeAppend.addEventListener('change', syncMode);
+        syncMode();
+        const ok = await modal({
+            title: table ? `Import into ${table}` : 'Import data',
+            body: h('div', { class: 'row-gap' },
+                field('File', file, 'CSV (header and types detected automatically), Parquet, or JSON (an array or one object per line).'),
+                field('Format', format),
+                h('div', { class: 'radio-row' },
+                    h('label', {}, modeNew, 'Create a new table'),
+                    h('label', {}, modeAppend, 'Append to an existing table')),
+                newField, existingField, addField),
+            actions: [{ label: 'Cancel', value: false }, { label: 'Preview', value: true, primary: true }],
+            wide: true,
+        });
+        if (!ok) return;
+        const f = file.files[0];
+        if (!f) return toast('Choose a file to import.', 'error');
+        if (modeAppend.checked && !target.value) return toast('There is no table to append to.', 'error');
+        const opts = {
+            format: format.value,
+            mode: modeAppend.checked ? 'append' : 'create',
+            table: modeAppend.checked ? target.value : newName.value.trim(),
+            addColumns: addColumns.checked,
+        };
+        const preview = await withBusy(null, () => uploadImport(f, { ...opts, dryRun: true }));
+        if (!preview) return;
+
+        const planByName = new Map((preview.plan?.columns || []).map(c => [c.name.toLowerCase(), c]));
+        const describe = (c) => {
+            const p = planByName.get(c.name.toLowerCase());
+            if (!p) return h('span', { class: 'badge ok' }, 'new table');
+            if (p.action === 'add') return h('span', { class: 'badge warn' }, 'column will be added');
+            if (p.action === 'widen') return h('span', { class: 'badge warn' }, `widened to ${p.newType}`);
+            if (p.action === 'skip') return h('span', { class: 'badge off', title: p.reason || '' }, 'skipped');
+            return p.castFrom ? h('span', { class: 'badge', title: 'values are converted; rows that cannot be converted fail the import' }, `cast to ${p.castFrom}`) : h('span', { class: 'badge ok' }, 'matches');
+        };
+        const plan = preview.plan;
+        const confirmed = await modal({
+            title: `Import ${preview.totalRows.toLocaleString()} row(s) ${opts.mode === 'create' ? 'into new table' : 'into'} ${opts.table}?`,
+            body: h('div', { class: 'row-gap' },
+                h('div', {}, `${f.name} · ${preview.format.toUpperCase()} · ${preview.columns.length} column(s) · ${preview.totalRows.toLocaleString()} row(s)`),
+                h('div', { class: 'table-wrap' }, h('table', {},
+                    h('thead', {}, h('tr', {}, h('th', {}, 'Column'), h('th', {}, 'Detected type'), h('th', {}, 'Result'))),
+                    h('tbody', {}, preview.columns.map(c => h('tr', {}, h('td', {}, c.name), h('td', {}, c.type), h('td', {}, describe(c))))))),
+                plan && plan.missing.length ? h('div', { class: 'callout info' }, `Not in the file, left NULL: ${plan.missing.join(', ')}`) : null,
+                plan && plan.autoFill.length ? h('div', { class: 'callout info' }, `Filled with the import time: ${plan.autoFill.map(c => c.name).join(', ')}`) : null,
+                h('div', { class: 'label' }, `First ${preview.preview.length} row(s)`),
+                h('div', { class: 'import-preview' }, h('table', {},
+                    h('thead', {}, h('tr', {}, preview.columns.map(c => h('th', {}, c.name)))),
+                    h('tbody', {}, preview.preview.map(r => h('tr', {}, r.map(v => h('td', { title: v ?? 'NULL' }, v === null ? h('span', { class: 'muted' }, 'NULL') : v)))))))),
+            actions: [{ label: 'Cancel', value: false }, { label: `Import ${preview.totalRows.toLocaleString()} row(s)`, value: true, primary: true }],
+            wide: true,
+        });
+        if (!confirmed) return;
+        const result = await withBusy(null, () => uploadImport(f, opts));
+        if (!result) return;
+        gridState.delete(result.table);
+        toast(`Imported ${result.inserted.toLocaleString()} row(s) into ${result.table}` +
+            (result.added?.length ? `; added column(s) ${result.added.join(', ')}` : ''), 'success');
+        ctx.navigate('tables', result.table);
     }
 })();

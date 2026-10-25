@@ -14,7 +14,7 @@ import { SECTIONS, SETTINGS, getSettingDef, normaliseSettingValue, maskSecret } 
 import { containedBlobPath, isSystemTable, matchTables, normaliseRule, buildPredicates, PROTECTED_TABLES, isLegacyMultiTable, detectEpochUnit, isEpochType, isDateType, normaliseConditions, buildConditionPredicate } from '../src/console/retention.js';
 import { parseCron, nextRun, nextRuns, validateCron } from '../src/console/cron.js';
 import { intervalToCron } from '../src/console/store.js';
-import { normaliseType, quoteIdent, quoteLiteral, buildWhere, wideningTargets, isEditableType, cleanDuckDbError } from '../src/console/data.js';
+import { normaliseType, quoteIdent, quoteLiteral, buildWhere, wideningTargets, isEditableType, cleanDuckDbError, detectImportFormat } from '../src/console/data.js';
 
 let passed = 0, failed = 0;
 
@@ -377,6 +377,15 @@ async function run() {
     });
     await test('DuckDB error messages are shortened for display', () => {
         assert.equal(cleanDuckDbError(new Error('Catalog Error: Cannot change type\nLINE 1: ...')), 'Cannot change type');
+    });
+    await test('import format is taken from the choice or the file extension', () => {
+        assert.equal(detectImportFormat('', 'data.CSV'), 'csv');
+        assert.equal(detectImportFormat('', 'x.tsv'), 'csv');
+        assert.equal(detectImportFormat('', 'x.parquet'), 'parquet');
+        assert.equal(detectImportFormat('', 'events.jsonl'), 'json');
+        assert.equal(detectImportFormat('parquet', 'misnamed.csv'), 'parquet');
+        assert.throws(() => detectImportFormat('', 'x.xlsx'), /format/);
+        assert.throws(() => detectImportFormat('xlsx', 'x.csv'), /Unsupported/);
     });
 }
 
