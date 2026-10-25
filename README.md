@@ -115,7 +115,7 @@ Browser → /console ─────┼─► ichibi-lake gateway ─► DuckDB 
                         │          └── Filesystem (blobs)
 ```
 
-The gateway runs two DuckDB instances: a **primary** instance (connection pool) for REST reads and writes, ingestion, DDL, the admin console and registry writes, and an isolated, locked-down **user-query** instance that runs user-supplied SQL and graph queries (superuser-only, read-only, no file or network access outside the lake; see [§3.5](#35-sql-enforcement)), so heavy queries cannot stall ingestion. Durable state (table data, ACLs, RBAC, and **property-graph definitions**) is persisted through DuckLake so it survives restarts and is shared across instances. Admin-console state (logins, settings, pruning rules, audit log) lives in a separate DuckLake catalog, `ichibi_console`, that only the primary instance attaches. Property graphs are an exception that DuckPGQ stores only in the in-memory catalog of whichever DuckDB instance created them — ichibi-lake works around this with a **durable graph registry** (see [§12.1](#121-architecture-durable-registry--lazy-materialization)).
+The gateway runs two DuckDB instances: a **primary** instance (connection pool) for REST reads and writes, ingestion, DDL, the admin console and registry writes, and an isolated, locked-down **user-query** instance that runs user-supplied SQL and graph queries (table-scoped for non-superusers, read-only, no file or network access outside the lake; see [§3.5](#35-sql-enforcement)), so heavy queries cannot stall ingestion. Durable state (table data, ACLs, RBAC, and **property-graph definitions**) is persisted through DuckLake so it survives restarts and is shared across instances. Admin-console state (logins, settings, pruning rules, audit log) lives in a separate DuckLake catalog, `ichibi_console`, that only the primary instance attaches. Property graphs are an exception that DuckPGQ stores only in the in-memory catalog of whichever DuckDB instance created them — ichibi-lake works around this with a **durable graph registry** (see [§12.1](#121-architecture-durable-registry--lazy-materialization)).
 
 ---
 
@@ -192,14 +192,23 @@ Filesystem BLOBs always use a **local (or mounted) directory**, also when the la
 
 ### 3.5 SQL Enforcement
 
-User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endpoints `POST /graphs`, `DELETE /graphs/:name`, `POST /graphs/:name/query`) cannot be checked against RBAC roles or per-table ACLs, so it is locked down in layers:
+User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endpoints `POST /graphs`, `DELETE /graphs/:name`, `POST /graphs/:name/query`) is locked down in layers:
 
-1. **Superuser keys only.** Keys with the RBAC `superuser` role, or any `API_KEYS` key when RBAC is not configured (those are superusers anyway). Readers and writers get HTTP 403 and use the table REST endpoints, which do enforce RBAC. Graph queries count as SQL because their `match`/`where`/`columns` fragments can contain subqueries.
+1. **Table-scoped for non-superusers.** Superuser keys (the RBAC `superuser` role, or any `API_KEYS` key when RBAC is not configured) may run any read-only SQL. Every other key (writers, readers, ACL-only keys) may run SQL on exactly the tables it can read: the gateway parses the query with DuckDB's own parser (`json_serialize_sql`), collects every table it references (FROM, JOINs, subqueries in any clause, CTEs, set operations, `DESCRIBE`/`SUMMARIZE`) and checks each one with the same RBAC-then-ACL rule as `GET /tables/:name`. Any denied table fails the whole query with HTTP 403 naming it, before anything runs (so NDJSON streams never start). CTE names are resolved the way DuckDB binds them: `WITH secret AS (SELECT * FROM allowed) SELECT * FROM secret` reads only `allowed`, while `WITH secret AS (SELECT * FROM secret) ...` reads the real table `secret`. For non-superusers the parser also rejects, failing closed:
+   - anything but a single `SELECT` statement (multiple statements: 400; writes, `EXPLAIN`, `SET`, `PIVOT` statements: 403);
+   - every table function (`read_parquet`, `read_csv`, `read_text`, `glob`, `query`, `range`, `unnest` in FROM, `duckdb_*()`, `ducklake_*()`): 403;
+   - tables outside `ducklake.main` (`t`, `main.t`, `ducklake.t` and `ducklake.main.t` are fine; `information_schema`, `pg_catalog`, `memory`, `system`, `temp`, the console catalog and the DuckLake metadata catalog are not): 403;
+   - system tables (`_`-prefixed), unknown tables, file paths such as `'x.parquet'` and DuckDB's catalog views such as `duckdb_tables`: 404, the same answer as the REST API for a missing table; views: 403; `SHOW TABLES`: 403 (use `GET /tables`);
+   - any construct the walker does not recognise: 400.
+
+   **Graph queries stay superuser-only.** DuckPGQ parses `GRAPH_TABLE`, but `json_serialize_sql` cannot serialize it ("Cannot serialize a table function with process-local bind input", DuckDB 2.0.0), so the tables read by a graph query's `match`/`where`/`columns` fragments (which can contain subqueries) cannot be determined. Creating and deleting graphs is superuser-only as well.
 2. **Always read-only.** DDL/DML/admin keywords are rejected with HTTP 403. There is no setting to turn this off; change data through the REST API (upload, records, blobs) or the [admin console](#13-admin-console).
 3. **Locked-down engine.** The SQL runs on a separate DuckDB instance that has dropped its DuckLake secret, can read only the lake's data directory (no `read_text('/etc/...')`, no BLOB directory, no network), and does not attach the admin console's catalog. With object storage, the only remote location it can read is the lake's own `s3://bucket/prefix/` (other prefixes, other buckets and `http(s)://` are refused). It keeps the S3 secret, because reading the lake needs it, but DuckDB only ever shows it redacted and refuses to display it unredacted once external access is disabled.
 4. **No connection-string introspection.** `duckdb_databases()`, `pragma_database_list`, `duckdb_settings()`, `current_setting()`, `duckdb_secrets()` and `which_secret()` are rejected, because DuckDB would reveal the metadata Postgres password through them.
 
-**System tables** (names starting with `_`: RBAC users and their API keys, ACLs, the graph registry) are never reachable through the table REST endpoints, for any key, and cannot be targets of `/upload`, `/kafka-sink` or the Kafka consumer. They are managed through the superuser-only admin API and the console.
+Layers 2 to 4 apply to every key, superusers included, on top of layer 1.
+
+**System tables** (names starting with `_`: RBAC users and their API keys, ACLs, the graph registry) are never reachable through the table REST endpoints, for any key, nor through SQL for non-superusers, and cannot be targets of `/upload`, `/kafka-sink` or the Kafka consumer. They are managed through the superuser-only admin API and the console.
 
 ### 3.6 Performance & Caching
 
@@ -396,7 +405,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 - **First start may be slower** on large catalogs, since migration runs during startup before requests are served.
 - **Admin console data moves to its own catalog.** Console logins, settings and the audit log from earlier releases are moved from the main catalog to `ichibi_console` on first start, and old single-table retention rules are converted into pruning rules (`RETENTION_INTERVAL_MINUTES` becomes each rule's schedule; the setting is gone). Console logins and passwords keep working.
 - **The bundled DuckDB web UI was removed** (it had no authentication). Use the console's **Tables & Data** page instead.
-- **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
+- **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (since then, `/query` and GraphQL `sql` accept non-superusers again, scoped to the tables they can read) (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
 - **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
 - **Rebuild the image** (`docker compose up -d --build --remove-orphans`; `--remove-orphans` also removes the retired `duckdb-ui` container from older releases). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
 
@@ -498,7 +507,7 @@ The RBAC system adds fine-grained role- and per-table-based authorization on top
 | **writer** | All tables | All tables (unless denied) | Has global read + write access to every table. |
 | **reader** | All tables | None (unless granted via per-table `allow_write`) | Has global read access to every table. |
 
-"All tables" means user tables through the table REST endpoints. Raw SQL (`/query`, GraphQL `sql`) and graph management/queries are **superuser-only**, and system tables (`_`-prefixed) are never accessible through the table endpoints; see [§3.5](#35-sql-enforcement).
+"All tables" means user tables, through the table REST endpoints and through SQL: writers and readers may run read-only `SELECT`s via `/query` and GraphQL `sql` on exactly the tables they can read (a per-table `deny` applies to SQL too, including tables reached through a join, subquery or CTE). Superusers may run any read-only SQL. Graph management and graph queries are **superuser-only**, and system tables (`_`-prefixed) are never accessible to non-superusers; see [§3.5](#35-sql-enforcement).
 
 #### Per-Table Permission Overrides
 
@@ -566,7 +575,7 @@ RBAC_SUPERUSERS="sk-admin-01"                     # superuser
 RBAC_USERS='[{"apiKey":"sk-writer-01","name":"Writer","roles":["writer"]}]'
 ```
 
-All three keys authenticate. Because RBAC variables are set, the legacy bootstrap does not run: `sk-admin-01` is a superuser and `sk-writer-01` can write to all tables, but `sk-deploy-key` has no RBAC role. It can only reach tables whose ACL lists it (for example tables it created) and cannot use superuser-only features such as `/query`. To make it a superuser, add it to `RBAC_SUPERUSERS` as well.
+All three keys authenticate. Because RBAC variables are set, the legacy bootstrap does not run: `sk-admin-01` is a superuser and `sk-writer-01` can write to all tables, but `sk-deploy-key` has no RBAC role. It can only reach tables whose ACL lists it (for example tables it created) and cannot use superuser-only features such as property graphs; its `/query` SQL is limited to those tables. To make it a superuser, add it to `RBAC_SUPERUSERS` as well.
 
 ### 5.4 ACL Management Endpoints
 
@@ -765,7 +774,7 @@ curl -X POST "http://ichibi-lake:3333/query" \
   -d '{"sql": "SELECT category, count(*) FROM ichibi_table GROUP BY 1"}'
 ```
 
-Requires a **superuser** API key; other keys get HTTP 403. User-supplied SQL is always read-only: DDL/DML statements and connection-revealing functions are rejected with HTTP 403 (see [§3.5](#35-sql-enforcement)). Queries run on the isolated user-query instance, at most `USER_QUERY_CONCURRENCY` at once (the rest queue).
+Any key may query: superusers run any read-only SQL; other keys may run a single `SELECT` over the tables they can read, and get HTTP 403 naming the first table they cannot (see [§3.5](#35-sql-enforcement) for what else is rejected). User-supplied SQL is always read-only: DDL/DML statements and connection-revealing functions are rejected with HTTP 403 (see [§3.5](#35-sql-enforcement)). Queries run on the isolated user-query instance, at most `USER_QUERY_CONCURRENCY` at once (the rest queue).
 
 Results are read from DuckDB chunk by chunk and capped, so a large result can no longer exhaust the gateway's memory. Two response formats:
 
@@ -842,7 +851,7 @@ A GraphQL endpoint is available at `/graphql` (`GET` and `POST`, via `graphql-ht
 | Query | Returns | Access |
 | :--- | :--- | :--- |
 | `tables` | Names of user tables (system tables are hidden) | Any valid API key |
-| `sql(query: String!)` | Rows of a read-only SQL query, as JSON | **Superuser** keys only, with the same rules as `POST /query` ([§3.5](#35-sql-enforcement)) |
+| `sql(query: String!)` | Rows of a read-only SQL query, as JSON | Same rules as `POST /query`: any SQL for superusers, table-scoped `SELECT`s for other keys ([§3.5](#35-sql-enforcement)) |
 
 ```sh
 curl -X POST "http://ichibi-lake:3333/graphql" \
@@ -851,7 +860,7 @@ curl -X POST "http://ichibi-lake:3333/graphql" \
   -d '{"query": "{ tables sql(query: \"SELECT count(*) AS n FROM ichibi_table\") }"}'
 ```
 
-*Response:* `{ "data": { "tables": ["ichibi_table", ...], "sql": [{ "n": "42" }] } }`. Errors (for example a non-superuser calling `sql`) are returned in the standard GraphQL `errors` array.
+*Response:* `{ "data": { "tables": ["ichibi_table", ...], "sql": [{ "n": "42" }] } }`. Errors (for example a reader querying a table it is denied) are returned in the standard GraphQL `errors` array.
 
 ---
 
@@ -868,7 +877,7 @@ ichibi-lake supports graph property queries via the **DuckPGQ** community extens
 | `DELETE` | `/graphs/:graphName` | Drop a graph and remove its registration | Superuser |
 | `POST` | `/graphs/:graphName/query` | Execute a SQL/PGQ pattern query against the graph | Superuser |
 
-Creating, deleting and querying graphs is superuser-only because query fragments can contain subqueries over any table ([§3.5](#35-sql-enforcement)). System tables (`_`-prefixed) cannot be used in graph definitions.
+Creating, deleting and querying graphs is superuser-only because query fragments can contain subqueries over any table and `GRAPH_TABLE` cannot be parsed into an AST for table-level authorization ([§3.5](#35-sql-enforcement)). System tables (`_`-prefixed) cannot be used in graph definitions.
 
 ### 12.1 Architecture: Durable Registry & Lazy Materialization
 
@@ -1271,18 +1280,19 @@ Every cap reports truncation (`truncated` / trailer line / `X-Export-Truncated`)
 
 ```sh
 npm test                       # Run all suites, including RBAC and console (requires Docker: app, db, kafka)
-npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console, SQL guard, storage)
+npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console, SQL guard, SQL table extraction, storage)
 npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
 npm run test:pgq-grammar       # DuckDB 2.0 SQL/PGQ grammar opt-in tests (no Docker needed)
 npm run test:console-unit      # Admin console auth, settings, data browser, pruning and cron unit tests (no Docker needed)
 npm run test:sql-guard         # Read-only / introspection guard for user-supplied SQL (no Docker needed)
+npm run test:sql-tables        # Table extraction for table-scoped SQL, against DuckDB's parser (no Docker needed)
 npm run test:storage           # Object-storage config, S3 secret SQL and maintenance settings (no Docker needed)
 npm run test:maintenance       # Data inlining and scheduled lake maintenance (file counts drop), against the running stack
 npm run test:orderby           # DuckLake ORDER BY corruption regression (no Docker needed)
 npm run test:kafka-topic-filter # Kafka topic subscription filter (no Docker needed)
 npm run test:console           # Admin console integration tests (uses docker exec for a temporary admin)
 npm run test:ops               # Health, metrics, NDJSON streaming (4M rows, bounded memory), row caps, table export round trips and RBAC
-npm run test:rbac              # RBAC: superuser / writer / reader permissions, per-table overrides, superuser-only SQL and graphs, system tables
+npm run test:rbac              # RBAC: superuser / writer / reader permissions, per-table overrides, table-scoped SQL, superuser-only graphs, system tables
 npm run test:api               # Integration tests
 npm run test:rest              # REST API tests
 npm run test:blob              # BLOB tests
