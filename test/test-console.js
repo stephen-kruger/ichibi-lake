@@ -653,10 +653,14 @@ async function run() {
         await test('readers keep RBAC-checked REST access to user tables', async () => {
             assert((await asReader('GET', `/tables/console_batch_${TS}`)).status === 200, 'reader read');
         });
-        await test('user-supplied SQL and graph management are superuser-only', async () => {
-            assert((await sq('SELECT 1', readerKey)).status === 403, '/query');
-            const gql = await asReader('POST', '/graphql', { query: '{ sql(query: "SELECT 1 AS x") }' });
-            assert(gql.data.errors && /superuser/i.test(gql.data.errors[0].message), `graphql: ${JSON.stringify(gql.data)}`);
+        await test('reader SQL is table-scoped; graph management is superuser-only', async () => {
+            assert((await sq(`SELECT count(*) AS n FROM console_batch_${TS}`, readerKey)).status === 200, '/query on a readable table');
+            for (const sql of ['SELECT * FROM _console_users', 'SELECT * FROM _rbac_users']) {
+                assert((await sq(sql, readerKey)).status === 404, `${sql} should be 404`);
+            }
+            assert((await sq('SELECT * FROM ichibi_console.main._console_settings', readerKey)).status === 403, 'console catalog');
+            const gql = await asReader('POST', '/graphql', { query: '{ sql(query: "SELECT * FROM _rbac_users") }' });
+            assert(gql.data.errors && /not found/i.test(gql.data.errors[0].message), `graphql: ${JSON.stringify(gql.data)}`);
             assert((await asReader('POST', '/graphs', { name: `g_${TS}`, vertexTables: [`console_batch_${TS}`], edgeTables: [] })).status === 403, 'create graph');
             assert((await asReader('POST', '/graphs/anything/query', { match: '(a)', columns: 'a.id' })).status === 403, 'graph query');
             assert((await asReader('DELETE', '/graphs/anything')).status === 403, 'delete graph');

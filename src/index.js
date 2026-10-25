@@ -20,6 +20,8 @@ import {
     listGraphDefinitions,
     deleteGraphDefinition,
     ensureGraphMaterialized,
+    serializeSql,
+    findLakeTable,
     VARCHAR,
     BLOB,
     blobValue,
@@ -32,6 +34,7 @@ import { migrateTimestamps } from './migrate-timestamps.js';
 import { initAclTable, ensureTableAcl, checkReadAccess, checkWriteAccess, getTableAcl, updateTableAcl, invalidateAclCache, migrateToAcl } from './acl.js';
 import { initRbacTables, bootstrapRbac, isValidApiKey, checkAccess, isRbacConfigured, legacyBootstrap, isSuperuserKey } from './rbac.js';
 import { assertReadOnlySql } from './sql-guard.js';
+import { analyzeUserSql } from './sql-tables.js';
 import { retryOnConflict } from './conflict.js';
 import adminRouter from './rbac-api.js';
 import { createConsoleRouter, initConsole, loadSettingOverrides, publicBaseUrl } from './console/index.js';
@@ -148,17 +151,49 @@ const BLOBS_PATH = process.env.BLOBS_PATH || './data/blobs';
 const maxBatchSize = () => Math.max(1, parseInt(process.env.MAX_BATCH_SIZE || '10000', 10) || 10000);
 
 // --- User-supplied SQL ---
-// POST /query, the GraphQL `sql` resolver and the graph endpoints accept SQL
-// (graph query fragments can embed subqueries), and RBAC roles / table ACLs
-// cannot be applied to arbitrary SQL. They are therefore superuser-only, always
-// read-only (assertReadOnlySql in src/sql-guard.js) and run on the locked-down
-// user-query instance (src/db.js). Readers and writers use the table-scoped
-// REST endpoints, which do check RBAC and ACLs.
+// POST /query and the GraphQL `sql` resolver accept SQL from any role. Every
+// query is read-only (assertReadOnlySql in src/sql-guard.js) and runs on the
+// locked-down user-query instance (src/db.js). For non-superusers the query is
+// additionally parsed by DuckDB (json_serialize_sql) and every table it reads
+// is authorized with the same RBAC + ACL check as the table REST endpoints
+// (authorizeUserSql below, walker in src/sql-tables.js).
+//
+// Property graphs (create, delete AND query) stay superuser-only: DuckPGQ's
+// GRAPH_TABLE cannot be serialized by json_serialize_sql ("Cannot serialize a
+// table function with process-local bind input", DuckDB 2.0.0 / DuckPGQ), so
+// the tables read by a graph query's match/where/columns fragments cannot be
+// determined, and the fragments may embed subqueries over any table.
 async function requireSuperuser(req) {
     if (!(await isSuperuserKey(req.apiKey))) {
-        const err = new Error('Forbidden: user-supplied SQL and graph management require a superuser API key. Use the table REST endpoints instead.');
+        const err = new Error('Forbidden: property graphs (create, delete and query) require a superuser API key.');
         err.statusCode = 403;
         throw err;
+    }
+}
+
+function accessError(message, statusCode) {
+    return Object.assign(new Error(message), { statusCode });
+}
+
+// Authorize user-supplied SQL for the caller. Superusers may run any
+// read-only SQL. Everyone else may run a single SELECT that reads only lake
+// tables they have read access to: no table functions, no other catalogs or
+// schemas, no system tables, no views. Throws a 400/403/404-tagged Error.
+async function authorizeUserSql(sql, apiKey) {
+    if (await isSuperuserKey(apiKey)) return;
+    const tables = analyzeUserSql(await serializeSql(sql));
+    for (const requested of tables) {
+        const table = await findLakeTable(requested);
+        // Also rejects replacement scans ('file.parquet') and catalog views
+        // (duckdb_tables, ...), which are not tables of ducklake.main.
+        if (!table) throw accessError(`Table "${requested}" not found`, 404);
+        if (table.name.startsWith('_')) throw accessError(`Table "${requested}" not found`, 404);
+        if (table.type !== 'BASE TABLE') {
+            throw accessError(`Access denied: "${table.name}" is a view; only tables can be queried with table-scoped SQL`, 403);
+        }
+        if (!(await checkReadAccess(table.name, apiKey))) {
+            throw accessError(`Access denied: no read permission for table "${table.name}"`, 403);
+        }
     }
 }
 
@@ -1021,6 +1056,10 @@ app.get('/tables/:tableName/export', async (req, res) => {
 
 // POST /query - Raw SQL query (read-only, isolated DuckDB instance with timeout)
 //
+// Superusers may run any read-only SQL. Other keys may run a single SELECT over
+// the lake tables they can read; every table is authorized before the query
+// runs (authorizeUserSql), so streaming responses are covered too.
+//
 // Results are read from DuckDB in chunks and capped, so memory stays bounded:
 //   JSON (default)  {success, rows, rowCount, truncated, maxRows}; at most
 //                   QUERY_MAX_ROWS rows, within USER_QUERY_TIMEOUT_MS.
@@ -1060,8 +1099,8 @@ app.post('/query', async (req, res) => {
                 return res.status(400).json({ success: false, error: 'maxRows must be a positive integer' });
             }
         }
-        await requireSuperuser(req);
         assertReadOnlySql(sql);
+        await authorizeUserSql(sql, req.apiKey);
 
         // Interrupt the query if the client goes away before we finish.
         const abort = new AbortController();
@@ -1138,8 +1177,8 @@ const schema = buildSchema(`
 const root = {
     sql: async ({ query }, context) => {
         try {
-            await requireSuperuser({ apiKey: context?.apiKey });
             assertReadOnlySql(query);
+            await authorizeUserSql(query, context?.apiKey);
             // Routed through the isolated user instance so a runaway query
             // cannot block the primary REST/ingest connection pool.
             return await executeUserSql(query);
@@ -1162,8 +1201,8 @@ const root = {
 app.all('/graphql', createHandler({
     schema: schema,
     rootValue: root,
-    // Expose the authenticated API key to resolvers (the sql resolver is
-    // superuser-only).
+    // Expose the authenticated API key to resolvers (the sql resolver
+    // authorizes the tables a query reads for that key).
     context: (req) => ({ apiKey: req.raw?.apiKey }),
 }));
 
@@ -1244,7 +1283,9 @@ app.post('/graphs/:graphName/query', async (req, res) => {
         }
 
         // Graph query fragments (match/where/columns/graphTable) can embed
-        // subqueries over any table, so this is user-supplied SQL.
+        // subqueries over any table, and GRAPH_TABLE cannot be parsed into an
+        // AST for table-level authorization (see requireSuperuser), so graph
+        // queries are superuser-only.
         await requireSuperuser(req);
 
         const body = req.body || {};

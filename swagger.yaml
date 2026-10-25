@@ -13,8 +13,10 @@ info:
     The API key that creates a table automatically becomes an owner.
     ACLs can be retrieved and updated through dedicated management endpoints.
 
-    User-supplied SQL (POST /query, the GraphQL `sql` query) and graph management/queries
-    are superuser-only, because per-table permissions cannot be enforced on arbitrary SQL.
+    User-supplied SQL (POST /query, the GraphQL `sql` query) is read-only. Superusers may run any
+    read-only SQL; other keys may run a single SELECT over exactly the tables they can read (every
+    referenced table is checked with the same RBAC/ACL rule as the table endpoints). Graph
+    management and graph queries are superuser-only.
     System tables (names starting with `_`) are never accessible through the table endpoints.
 
     Authentication is via the `x-api-key` header. Unauthenticated requests are rejected with HTTP 401.
@@ -1152,7 +1154,8 @@ paths:
       description: |
         A GraphQL API mapped directly over DuckDB.
         It supports running raw SQL using the `sql` query, which returns results as JSON.
-        The `sql` query is superuser-only and read-only, with the same rules as POST /query.
+        The `sql` query is read-only, with the same rules as POST /query (any SQL for superusers,
+        table-scoped SELECTs for other keys).
         It also allows fetching tables with the `tables` query.
       requestBody:
         required: true
@@ -1193,9 +1196,14 @@ paths:
     post:
       summary: Execute a SQL query (JSON or streamed NDJSON)
       description: >-
-        Executes a read-only SQL query against the DuckLake catalog. Superuser API keys only
-        (RBAC `superuser` role, or any key from API_KEYS when RBAC is not configured); other keys
-        get 403, because table permissions cannot be applied to arbitrary SQL. Statements that modify
+        Executes a read-only SQL query against the DuckLake catalog. Superuser API keys (RBAC
+        `superuser` role, or any key from API_KEYS when RBAC is not configured) may run any read-only
+        SQL. Other keys may run a single SELECT over the lake tables they can read: the query is parsed
+        with DuckDB's parser, every referenced table (joins, subqueries, CTEs, UNIONs) is checked with
+        the RBAC/ACL read rule, and the first denied table yields 403 naming it, before any row is
+        sent. For these keys table functions (read_parquet, read_csv, glob, query, ...), other
+        catalogs/schemas and SHOW TABLES are rejected with 403, multiple statements with 400, and
+        system (`_`-prefixed) or unknown tables with 404. Statements that modify
         schema or data, and DuckDB introspection functions that reveal connection details
         (duckdb_databases, duckdb_settings, current_setting, pragma_*), are rejected with 403.
         Server files outside the lake are not readable, and system tables are not exposed.
@@ -1285,7 +1293,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '403':
-          description: Not a superuser key, or the SQL is not read-only
+          description: >-
+            The SQL is not read-only, or (non-superusers) it reads a table the key may not read,
+            uses a table function or reaches outside ducklake.main
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: (non-superusers) The SQL references a system or unknown table
           content:
             application/json:
               schema:
@@ -1584,7 +1600,9 @@ paths:
         Graph. Either supply a structured request (`match` + `columns`) or pass a
         raw `graphTable` body containing everything that would appear *inside*
         `FROM GRAPH_TABLE ( <graphName> ... )`. Superuser API keys only: query
-        fragments can contain subqueries, so this is treated like POST /query.
+        fragments can contain subqueries over any table, and DuckDB cannot serialize
+        GRAPH_TABLE into an AST, so the tables a graph query reads cannot be authorized
+        individually the way POST /query does for non-superusers.
         Creating and deleting graphs is superuser-only as well.
 
         Examples from the DuckPGQ documentation:

@@ -18,8 +18,12 @@
  *   - Self-service /admin/check endpoint
  *   - Legacy backward-compat mode (API_KEYS → superuser)
  *   - Reader cannot write, writer can write (unless denied per-table)
- *   - Raw SQL (/query, GraphQL sql) and property graphs are superuser-only;
- *     writers and readers get 403, superusers get read-only SQL
+ *   - Table-scoped SQL (/query incl. NDJSON streaming, GraphQL sql): writers
+ *     and readers may SELECT the tables they can read; a denied table gets 403
+ *     however it is referenced (join, subquery, CTE, UNION, quoting); system
+ *     tables 404; other catalogs, table functions, writes and multiple
+ *     statements are rejected. Superusers get any read-only SQL.
+ *   - Property graphs (create, query, delete) stay superuser-only
  *   - System tables ("_"-prefixed) are unreachable through the table
  *     endpoints, /upload and /kafka-sink for every role
  */
@@ -31,6 +35,7 @@ const SUPER_KEY = API_KEY;
 const WRITER_KEY = `sk-test-writer-${Date.now()}`;
 const READER_KEY = `sk-test-reader-${Date.now()}`;
 const DENIED_TABLE = `${T}_restricted`;
+const READER_DENIED_TABLE = `${T}_reader_denied`;
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -115,6 +120,13 @@ const teardown = async () => {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': SUPER_KEY },
             body: JSON.stringify({ sql: `DROP TABLE IF EXISTS "${DENIED_TABLE}"` }),
+        });
+    } catch (_) {}
+    try {
+        await fetch(`${BASE_URL}/query`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-api-key': SUPER_KEY },
+            body: JSON.stringify({ sql: `DROP TABLE IF EXISTS "${READER_DENIED_TABLE}"` }),
         });
     } catch (_) {}
 };
@@ -315,6 +327,18 @@ async function run() {
             if (!json?.success) throw new Error(JSON.stringify(json));
         });
 
+        await test('Create a table denied to the reader', async () => {
+            const { json } = await uploadJSON(`${BASE_URL}/upload/${READER_DENIED_TABLE}`, [
+                { id: 'r2', value: 'reader-secret' },
+            ]);
+            if (!json?.success) throw new Error(JSON.stringify(json));
+            const deny = await authPut(
+                `${BASE_URL}/admin/tables/${READER_DENIED_TABLE}/permissions`,
+                { apiKey: READER_KEY, permission: 'deny' }
+            );
+            if (!deny.json?.success) throw new Error(JSON.stringify(deny.json));
+        });
+
         await test('Upgrade reader to allow_write on test table', async () => {
             const { json } = await authPut(
                 `${BASE_URL}/admin/tables/${T}/permissions`,
@@ -420,20 +444,14 @@ async function run() {
     });
 
     // ── 7. Superuser privileges ────────────────────────────────────────────
-    await describe('Superuser-only features (raw SQL, graphs) and system tables', async () => {
+    await describe('Superuser-only features (graphs) and system tables', async () => {
         const ROLES = [['writer', WRITER_KEY], ['reader', READER_KEY]];
         const GRAPH = `rbac_graph_${Date.now()}`;
 
         for (const [role, key] of ROLES) {
-            await test(`${role} cannot run raw SQL via /query (403)`, async () => {
-                const r = await authPost(`${BASE_URL}/query`, { sql: 'SELECT 1 AS one' }, key);
-                if (r.status !== 403) throw new Error(`Expected 403, got ${r.status}: ${JSON.stringify(r.json)}`);
-            });
-            await test(`${role} cannot run raw SQL via the GraphQL sql query`, async () => {
-                const r = await authPost(`${BASE_URL}/graphql`, { query: '{ sql(query: "SELECT 1 AS one") }' }, key);
-                if (!r.json?.errors || !/superuser/i.test(r.json.errors[0]?.message || '')) {
-                    throw new Error(`Expected a superuser error, got ${r.status}: ${JSON.stringify(r.json)}`);
-                }
+            await test(`${role} cannot run SQL with GRAPH_TABLE outside the graph endpoints`, async () => {
+                const r = await authPost(`${BASE_URL}/query`, { sql: `FROM GRAPH_TABLE (${GRAPH} MATCH (a:${T}) COLUMNS (a.id))` }, key);
+                if (r.status === 200) throw new Error(`Expected a rejection, got 200: ${JSON.stringify(r.json)}`);
             });
             await test(`${role} cannot create, query or delete property graphs (403)`, async () => {
                 const create = await authPost(`${BASE_URL}/graphs`, { name: `${GRAPH}_${role}`, vertexTables: [T], edgeTables: [] }, key);
@@ -460,6 +478,13 @@ async function run() {
             if (!read.ok) throw new Error(`read: ${read.status}`);
             const write = await uploadJSON(`${BASE_URL}/upload/${T}`, [{ id: 'w-sec', value: 'still-allowed' }], WRITER_KEY);
             if (!write.json?.success) throw new Error(`write: ${JSON.stringify(write.json)}`);
+        });
+
+        await test('superuser can query tables denied to other users and system tables', async () => {
+            for (const table of [DENIED_TABLE, READER_DENIED_TABLE, '_rbac_users']) {
+                const r = await authPost(`${BASE_URL}/query`, { sql: `SELECT count(*) AS n FROM "${table}"` }, SUPER_KEY);
+                if (r.status !== 200) throw new Error(`${table}: ${r.status} ${JSON.stringify(r.json)}`);
+            }
         });
 
         await test('superuser can run read-only raw SQL', async () => {
@@ -493,6 +518,106 @@ async function run() {
         });
     });
 
+    await describe('Table-scoped SQL for writers and readers', async () => {
+        // Each role has one table it is denied (RBAC 'deny', not in the ACL).
+        const CASES = [['writer', WRITER_KEY, DENIED_TABLE], ['reader', READER_KEY, READER_DENIED_TABLE]];
+        const query = (sql, key, format) => authPost(`${BASE_URL}/query${format ? `?format=${format}` : ''}`, { sql }, key);
+        const gql = (sql, key) => authPost(`${BASE_URL}/graphql`, { query: 'query Q($q: String!) { sql(query: $q) }', variables: { q: sql } }, key);
+        const expectStatus = async (sql, key, status, re) => {
+            const r = await query(sql, key);
+            if (r.status !== status) throw new Error(`${sql}\n    expected ${status}, got ${r.status}: ${JSON.stringify(r.json)}`);
+            if (re && !re.test(r.json?.error || '')) throw new Error(`${sql}\n    unexpected error: ${r.json?.error}`);
+            return r;
+        };
+
+        for (const [role, key, denied] of CASES) {
+            const deniedRe = new RegExp(`no read permission for table "${denied}"`);
+
+            await test(`${role} can SELECT an allowed table via /query`, async () => {
+                const r = await expectStatus(`SELECT id, value FROM "${T}" ORDER BY id`, key, 200);
+                if (!Array.isArray(r.json?.rows) || r.json.rows.length === 0) throw new Error(JSON.stringify(r.json));
+                await expectStatus('SELECT 1 AS one', key, 200);
+                await expectStatus(`WITH x AS (SELECT * FROM ${T}) SELECT count(*) AS n FROM x JOIN main.${T} USING (id)`, key, 200);
+                await expectStatus(`SELECT * FROM ducklake.main.${T.toUpperCase()}`, key, 200);
+            });
+
+            await test(`${role} can stream an allowed table as NDJSON`, async () => {
+                const res = await fetch(`${BASE_URL}/query?format=ndjson`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': key },
+                    body: JSON.stringify({ sql: `SELECT id FROM "${T}"` }),
+                });
+                const text = await res.text();
+                if (res.status !== 200) throw new Error(`${res.status}: ${text}`);
+                const lines = text.trim().split('\n').map(l => JSON.parse(l));
+                if (!lines.at(-1)?._ichibi || lines.length < 2) throw new Error(text);
+            });
+
+            await test(`${role} can SELECT an allowed table via GraphQL sql`, async () => {
+                const r = await gql(`SELECT count(*) AS n FROM ${T}`, key);
+                if (r.json?.errors || !(Number(r.json?.data?.sql?.[0]?.n) > 0)) throw new Error(JSON.stringify(r.json));
+            });
+
+            await test(`${role} gets 403 naming a denied table, however it is referenced`, async () => {
+                for (const sql of [
+                    `SELECT * FROM "${denied}"`,
+                    `SELECT * FROM ${denied.toUpperCase()}`,
+                    `SELECT * FROM ducklake.main.${denied}`,
+                    `SELECT * FROM ${T} JOIN ${denied} USING (id)`,
+                    `SELECT * FROM ${T} WHERE id IN (SELECT id FROM ${denied})`,
+                    `SELECT (SELECT max(value) FROM ${denied}) AS v`,
+                    `SELECT * FROM (SELECT * FROM (SELECT * FROM ${denied}) a) b`,
+                    `WITH x AS (SELECT * FROM ${denied}) SELECT * FROM x`,
+                    `WITH ${denied} AS (SELECT * FROM ${denied}) SELECT * FROM ${denied}`,
+                    `SELECT id FROM ${T} UNION ALL SELECT id FROM ${denied}`,
+                    `SELECT * FROM ${T} WHERE EXISTS (SELECT 1 FROM ${denied} /* comment */)`,
+                    `DESCRIBE ${denied}`,
+                ]) {
+                    await expectStatus(sql, key, 403, deniedRe);
+                }
+            });
+
+            await test(`${role}: a CTE named like a denied table only shadows it`, async () => {
+                const r = await expectStatus(`WITH ${denied} AS (SELECT * FROM ${T}) SELECT count(*) AS n FROM ${denied}`, key, 200);
+                if (!(Number(r.json?.rows?.[0]?.n) > 0)) throw new Error(JSON.stringify(r.json));
+            });
+
+            await test(`${role} gets the 403 on NDJSON and GraphQL too (nothing streamed)`, async () => {
+                const r = await query(`SELECT * FROM ${denied}`, key, 'ndjson');
+                if (r.status !== 403 || !deniedRe.test(r.json?.error || '')) throw new Error(`${r.status}: ${JSON.stringify(r.json)}`);
+                const g = await gql(`SELECT * FROM ${T} WHERE id IN (SELECT id FROM ${denied})`, key);
+                if (!g.json?.errors || !deniedRe.test(g.json.errors[0]?.message || '')) throw new Error(JSON.stringify(g.json));
+            });
+
+            await test(`${role}: system tables are not found, other catalogs refused`, async () => {
+                for (const sql of ['SELECT * FROM _rbac_users', 'SELECT * FROM ducklake.main._table_acls',
+                    `SELECT * FROM ${T} WHERE id IN (SELECT api_key FROM "_rbac_users")`, 'SELECT * FROM _graph_registry',
+                    'SELECT * FROM duckdb_tables', `SELECT * FROM no_such_table_${Date.now()}`, "SELECT * FROM 'x.parquet'"]) {
+                    await expectStatus(sql, key, 404, /not found/);
+                }
+                for (const sql of ['SELECT * FROM information_schema.tables', 'SELECT * FROM ichibi_console.main._console_users',
+                    'SELECT * FROM __ducklake_metadata_ducklake.public.ducklake_table', 'SELECT * FROM memory.main.x',
+                    'SHOW TABLES']) {
+                    await expectStatus(sql, key, 403);
+                }
+            });
+
+            await test(`${role}: table functions, writes and multiple statements are rejected`, async () => {
+                for (const sql of ["SELECT * FROM read_parquet('/data/**/*.parquet')", "SELECT * FROM read_csv('/etc/passwd')",
+                    "SELECT * FROM glob('/data/*')", `SELECT * FROM query('SELECT * FROM ${denied}')`, 'SELECT * FROM range(3)',
+                    `WITH x AS (SELECT * FROM read_json('/etc/hosts')) SELECT * FROM x`]) {
+                    await expectStatus(sql, key, 403, /Table function/);
+                }
+                await expectStatus(`DELETE FROM ${T}`, key, 403);
+                await expectStatus(`SELECT * FROM ${T}; SELECT * FROM ${denied}`, key, 400, /one SQL statement/);
+            });
+        }
+
+        await test('writer can query the table denied to the reader and vice versa', async () => {
+            await expectStatus(`SELECT * FROM ${READER_DENIED_TABLE}`, WRITER_KEY, 200);
+            await expectStatus(`SELECT * FROM ${DENIED_TABLE}`, READER_KEY, 200);
+        });
+    });
+
     await describe('Superuser privileges', async () => {
         await test('Superuser can access denied table (superuser bypass)', async () => {
             const { json } = await getData(`${BASE_URL}/tables/${DENIED_TABLE}`, SUPER_KEY);
@@ -520,6 +645,16 @@ async function run() {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'x-api-key': SUPER_KEY },
                     body: JSON.stringify({ sql: `DROP TABLE IF EXISTS "${T}"` }),
+                });
+            } catch (_) {}
+        });
+
+        await test('Drop reader-denied table', async () => {
+            try {
+                await fetch(`${BASE_URL}/query`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'x-api-key': SUPER_KEY },
+                    body: JSON.stringify({ sql: `DROP TABLE IF EXISTS "${READER_DENIED_TABLE}"` }),
                 });
             } catch (_) {}
         });
