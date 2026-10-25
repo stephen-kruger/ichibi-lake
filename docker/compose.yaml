@@ -75,6 +75,13 @@ services:
       # console link). Defaults to the host port published above; set it to
       # your real address (e.g. https://lake.example.com) when deployed.
       - PUBLIC_URL=${PUBLIC_URL:-http://localhost:${PORT:-3333}}
+      # Bulk import (POST /tables/:tableName/import): largest upload in MB,
+      # s3:// prefixes any writer may import from (comma-separated; other
+      # s3:// sources need a superuser key), and how long Idempotency-Key
+      # results are kept.
+      - IMPORT_MAX_MB=${IMPORT_MAX_MB:-1024}
+      - IMPORT_ALLOWED_SOURCES=${IMPORT_ALLOWED_SOURCES:-}
+      - IDEMPOTENCY_TTL_HOURS=${IDEMPOTENCY_TTL_HOURS:-24}
       # Bearer token for GET /metrics (Prometheus). When empty, /metrics
       # requires a superuser API key instead.
       - METRICS_TOKEN=${METRICS_TOKEN:-}

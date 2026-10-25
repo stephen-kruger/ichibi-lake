@@ -102,7 +102,7 @@ export const S3_SECRET_NAME = 'ichibi_s3';
  * it is only ever used for the lake's own objects. A temporary (in-memory)
  * secret: nothing is written to ~/.duckdb.
  */
-export function buildS3SecretSql(cfg) {
+export function buildS3SecretSql(cfg, { name = S3_SECRET_NAME, scope = cfg?.dataPath, ifNotExists = false } = {}) {
     if (!cfg || cfg.kind !== 's3') return null;
     const opts = ['TYPE s3'];
     if (cfg.provider === 'credential_chain') {
@@ -114,8 +114,87 @@ export function buildS3SecretSql(cfg) {
     }
     opts.push(`REGION ${lit(cfg.region)}`);
     if (cfg.endpoint) opts.push(`ENDPOINT ${lit(cfg.endpoint)}`);
-    opts.push(`URL_STYLE ${lit(cfg.urlStyle)}`, `USE_SSL ${cfg.useSsl ? 'true' : 'false'}`, `SCOPE ${lit(cfg.dataPath)}`);
-    return `CREATE OR REPLACE TEMPORARY SECRET ${S3_SECRET_NAME} (${opts.join(', ')})`;
+    opts.push(`URL_STYLE ${lit(cfg.urlStyle)}`, `USE_SSL ${cfg.useSsl ? 'true' : 'false'}`, `SCOPE ${lit(scope)}`);
+    const create = ifNotExists ? 'CREATE TEMPORARY SECRET IF NOT EXISTS' : 'CREATE OR REPLACE TEMPORARY SECRET';
+    return `${create} ${name} (${opts.join(', ')})`;
+}
+
+// --- Bulk import from object storage (POST /tables/:tableName/import) ------------
+
+/** Name of the DuckDB secret used to read import sources (primary instance only). */
+export const S3_IMPORT_SECRET_NAME = 'ichibi_s3_import';
+
+/**
+ * S3 settings for reading import sources: the same S3_* credentials, endpoint
+ * and URL style as the lake, also when the lake itself is on local disk.
+ */
+export function importS3Config(env = process.env) {
+    return storageConfig({ ...env, DUCKLAKE_DATA_PATH: 's3://import/' });
+}
+
+/**
+ * Secret for import reads. Scoped to all of s3:// so allow-listed buckets
+ * outside the lake are readable; DuckDB picks the secret with the longest
+ * matching scope, so the lake's own secret still wins for its prefix.
+ */
+export function buildImportSecretSql(env = process.env) {
+    return buildS3SecretSql(importS3Config(env), { name: S3_IMPORT_SECRET_NAME, scope: 's3://', ifNotExists: true });
+}
+
+const S3_SOURCE_RE = /^s3:\/\/([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])\/(.+)$/;
+const GLOB_CHARS_RE = /[*?[\]{}]/;
+
+/**
+ * Validate an import source. Only s3:// URLs with a plain bucket name and a
+ * non-empty key (or glob) are accepted: no local paths, no file://, http(s)://
+ * or other schemes, no "." / ".." segments, backslashes, quotes or control
+ * characters. Throws an Error with statusCode 400 otherwise. Returns
+ * { source, bucket, key, literalPrefix } where literalPrefix is the part
+ * before the first glob character, i.e. everything the source can match
+ * starts with it.
+ */
+export function parseImportSource(raw) {
+    const fail = (msg) => { throw Object.assign(new Error(msg), { statusCode: 400 }); };
+    const source = typeof raw === 'string' ? raw.trim() : '';
+    if (!source) fail('"source" must be an s3:// URL');
+    if (source.length > 1024) fail('"source" is too long');
+    const m = source.match(S3_SOURCE_RE);
+    if (!m) fail('Only s3://bucket/key sources are supported (no local paths or other URL schemes)');
+    const [, bucket, key] = m;
+    // eslint-disable-next-line no-control-regex
+    if (/[\x00-\x1f\x7f\\'"`]/.test(key)) fail('"source" contains characters that are not allowed');
+    const segments = key.split('/');
+    if (segments.some((seg, i) => seg === '.' || seg === '..' || (seg === '' && i < segments.length - 1))) {
+        fail('"source" must not contain empty, "." or ".." path segments');
+    }
+    if (key.endsWith('/')) fail('"source" must name a file or a glob such as s3://bucket/prefix/*.parquet, not a directory');
+    const g = source.search(GLOB_CHARS_RE);
+    return { source, bucket, key, literalPrefix: g === -1 ? source : source.slice(0, g) };
+}
+
+/**
+ * IMPORT_ALLOWED_SOURCES: comma-separated s3:// prefixes non-superusers may
+ * import from. A bare bucket (s3://b) means the whole bucket; every entry is
+ * treated as a directory prefix (s3://b/raw means s3://b/raw/...).
+ */
+export function importAllowList(env = process.env) {
+    return String(env.IMPORT_ALLOWED_SOURCES || '').split(',').map(s => s.trim()).filter(Boolean)
+        .filter(s => /^s3:\/\/[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](\/.*)?$/.test(s))
+        .map(withTrailingSlash);
+}
+
+/**
+ * True when everything a parsed source can match lies under an allow-listed
+ * prefix and outside the lake's own data path (reading the lake's Parquet
+ * files directly would bypass table ACLs).
+ */
+export function isImportSourceAllowed(parsed, env = process.env) {
+    const prefix = parsed.literalPrefix;
+    if (!importAllowList(env).some(entry => prefix.startsWith(entry))) return false;
+    let lake = null;
+    try { lake = storageConfig(env); } catch (_) { /* invalid lake config: nothing to protect */ }
+    if (lake?.kind === 's3' && (prefix.startsWith(lake.dataPath) || lake.dataPath.startsWith(prefix))) return false;
+    return true;
 }
 
 /** Human-readable location for logs and the console (never includes credentials). */

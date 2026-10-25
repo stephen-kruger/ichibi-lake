@@ -77,8 +77,18 @@ export const SETTINGS = [
     },
     {
         key: 'IMPORT_MAX_MB', section: 'ingestion', type: 'number', default: '1024',
-        min: 1, max: 102400, editable: true, live: true, label: 'Max console import size (MB)',
-        help: 'Largest file an admin can import on the Tables & Data page.',
+        min: 1, max: 102400, editable: true, live: true, label: 'Max import size (MB)',
+        help: 'Largest file accepted by POST /tables/:tableName/import and the Tables & Data page import (HTTP 413 above it).',
+    },
+    {
+        key: 'IMPORT_ALLOWED_SOURCES', section: 'ingestion', type: 'list', default: '',
+        editable: false, label: 'Import allow-list (object storage)',
+        help: 'Comma-separated s3:// prefixes any writer may import from with POST /tables/:tableName/import. Other s3:// sources need a superuser key; the lake\'s own data path never counts as allow-listed.',
+    },
+    {
+        key: 'IDEMPOTENCY_TTL_HOURS', section: 'ingestion', type: 'number', default: '24',
+        min: 1, max: 8760, editable: true, live: true, label: 'Idempotency key lifetime (hours)',
+        help: 'How long an Idempotency-Key on /upload, /kafka-sink or a table import replays its first result.',
     },
     {
         key: 'DEFAULT_PARTITION_KEY', section: 'ingestion', type: 'string', default: 'created',
