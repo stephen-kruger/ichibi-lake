@@ -27,6 +27,7 @@ import { matchTables, isDateType, isEpochType } from './retention.js';
 import { EXPORT_FORMATS, runExport } from '../export.js';
 import { resolveTypeConflict } from '../schema-evolution.js';
 import { getTableKeys, setTableKeys, normaliseKeyList, assertKeysMatchColumns, countDuplicateKeys, renameKeyColumn } from '../table-keys.js';
+import { isTransactionConflict } from '../conflict.js';
 
 export const SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 export const PAGE_SIZES = [25, 50, 100, 250, 500];
@@ -718,9 +719,12 @@ export const IMPORT_FORMATS = ['csv', 'parquet', 'json'];
 const IMPORT_PREVIEW_ROWS = 20;
 const IMPORT_PREVIEW_CHARS = 200;
 
+const IMPORT_FORMAT_ALIASES = { ndjson: 'json', jsonl: 'json', tsv: 'csv' };
+
 /** Format from an explicit choice, else from the file name's extension. */
 export function detectImportFormat(format, filename = '') {
     if (format) {
+        format = IMPORT_FORMAT_ALIASES[String(format).toLowerCase()] || String(format).toLowerCase();
         if (!IMPORT_FORMATS.includes(format)) throw httpError(400, `Unsupported import format "${format}". Use one of: ${IMPORT_FORMATS.join(', ')}`);
         return format;
     }
@@ -731,12 +735,18 @@ export function detectImportFormat(format, filename = '') {
     throw httpError(400, 'Could not tell the file format from its name; choose CSV, Parquet or JSON.');
 }
 
-// `file` is a server-generated temp path, never user input.
-function importReader(format, file) {
+/**
+ * Table function reading an import source. `file` is a server-generated temp
+ * path or an s3:// URL already checked by parseImportSource() (src/storage.js),
+ * never raw user input. Remote sources may be globs over several files, which
+ * are combined by column name.
+ */
+export function importReader(format, file, { remote = false } = {}) {
     const lit = quoteLiteral(file);
-    if (format === 'csv') return `read_csv(${lit}, auto_detect = true)`;
-    if (format === 'parquet') return `read_parquet(${lit})`;
-    return `read_json_auto(${lit})`;
+    const union = remote ? ', union_by_name = true' : '';
+    if (format === 'csv') return `read_csv(${lit}, auto_detect = true${union})`;
+    if (format === 'parquet') return `read_parquet(${lit}${union})`;
+    return `read_json_auto(${lit}${union})`;
 }
 
 /**
@@ -767,24 +777,42 @@ function planAppend(existingCols, incoming, addColumns) {
     return { columns, missing: missing.map(c => c.column_name).filter(n => !autoFill.some(a => a.name === n)), autoFill };
 }
 
+export const IMPORT_MODES = ['create', 'append', 'replace', 'auto'];
+
 /**
- * Import a staged file (CSV, Parquet or JSON / NDJSON) into a new table
- * (mode "create") or append it to an existing one (mode "append"). With
- * dryRun nothing is written; the result describes the detected columns, row
- * count, a preview and, for append, the per-column plan.
+ * Import a staged file or an object-storage source (CSV, Parquet or JSON /
+ * NDJSON) on the primary instance. Shared by the console import and
+ * POST /tables/:tableName/import.
+ *   create   new table (409 if it exists)
+ *   append   add rows to an existing table, with /upload's schema evolution
+ *   replace  swap an existing table's rows for the file's in one transaction
+ *            (schema evolves as for append; the table keeps its ACL and
+ *            partitioning); creates the table when it does not exist
+ *   auto     create when missing, else append
+ * With dryRun nothing is written; the result describes the detected columns,
+ * row count, a preview and, for append/replace, the per-column plan. The
+ * result has created: true when this call created the table.
+ * `prepare(conn)` runs first on the connection (e.g. to load httpfs and the
+ * import secret for s3:// sources).
  */
-export async function importFile(file, { format, table, mode = 'create', dryRun = false, addColumns = true } = {}) {
-    if (!['create', 'append'].includes(mode)) throw httpError(400, 'mode must be "create" or "append"');
-    const reader = importReader(format, file);
+export async function importFile(file, { format, table, mode = 'create', dryRun = false, addColumns = true, remote = false, prepare = null } = {}) {
+    if (!IMPORT_MODES.includes(mode)) throw httpError(400, `mode must be one of: ${IMPORT_MODES.join(', ')}`);
+    const reader = importReader(format, file, { remote });
     return withConnection(async (conn) => {
+        if (prepare) await prepare(conn);
         let incoming;
         try {
             incoming = (await rows(conn, `DESCRIBE SELECT * FROM ${reader}`)).map(r => ({ name: String(r.column_name), type: String(r.column_type) }));
         } catch (err) {
-            throw httpError(400, `Could not read the file as ${format.toUpperCase()}: ${cleanDuckDbError(err)}`);
+            throw httpError(400, `Could not read the ${remote ? 'source' : 'file'} as ${format.toUpperCase()}: ${cleanDuckDbError(err)}`);
         }
         if (incoming.length === 0) throw httpError(400, 'The file has no columns');
 
+        if (mode === 'auto' || mode === 'replace') {
+            const exists = await tableExists(conn, table);
+            if (!exists) mode = 'create';
+            else if (mode === 'auto') mode = 'append';
+        }
         let plan = null;
         if (mode === 'create') {
             requireNewName(table, 'Table');
@@ -808,9 +836,15 @@ export async function importFile(file, { format, table, mode = 'create', dryRun 
 
         const t = quoteIdent(table);
         if (mode === 'create') {
-            await ddl(conn, `CREATE TABLE ${t} AS SELECT * FROM ${reader}`);
+            try {
+                await conn.run(`CREATE TABLE ${t} AS SELECT * FROM ${reader}`);
+            } catch (err) {
+                // Lost a race with a concurrent create of the same name.
+                if (/already exists/i.test(err?.message || '')) throw httpError(409, `Table "${table}" already exists; choose "append" to add rows to it`);
+                throw httpError(400, cleanDuckDbError(err));
+            }
             invalidateColumnCache(table);
-            return { table, mode, format, inserted: totalRows, columns: incoming.length };
+            return { table, mode, format, inserted: totalRows, columns: incoming.length, created: true };
         }
 
         const applied = { added: [], widened: [] };
@@ -826,14 +860,22 @@ export async function importFile(file, { format, table, mode = 'create', dryRun 
         if (applied.added.length || applied.widened.length) invalidateColumnCache(table);
         const select = plan.columns.filter(c => c.action !== 'skip').map(c => quoteIdent(c.name))
             .concat(plan.autoFill.map(c => `CAST(CURRENT_TIMESTAMP AS ${c.type}) AS ${quoteIdent(c.name)}`));
+        let deleted = 0;
         try {
+            if (mode === 'replace') {
+                await conn.run('BEGIN TRANSACTION');
+                deleted = Number(await scalar(conn, `SELECT count(*) FROM ${t}`));
+                await conn.run(`DELETE FROM ${t}`);
+            }
             await conn.run(`INSERT INTO ${t} BY NAME SELECT ${select.join(', ')} FROM ${reader}`);
+            if (mode === 'replace') await conn.run('COMMIT');
         } catch (err) {
-            throw httpError(400, `Import failed, no rows were added: ${cleanDuckDbError(err)}` +
+            if (mode === 'replace') await conn.run('ROLLBACK').catch(() => {});
+            throw httpError(isTransactionConflict(err) ? 409 : 400, `Import failed, no rows were ${mode === 'replace' ? 'changed' : 'added'}: ${cleanDuckDbError(err)}` +
                 (applied.added.length ? ` (column(s) ${applied.added.join(', ')} were already added)` : ''));
         }
         return {
-            table, mode, format, inserted: totalRows, ...applied,
+            table, mode, format, inserted: totalRows, ...(mode === 'replace' ? { deleted } : {}), ...applied,
             skipped: plan.columns.filter(c => c.action === 'skip').map(c => c.name),
         };
     });

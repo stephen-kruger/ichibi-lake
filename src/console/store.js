@@ -18,6 +18,7 @@ const LEGACY_RETENTION = table('_console_retention');
 export const PRUNE_RULES = table('_console_prune_rules');
 export const PRUNE_RUNS = table('_console_prune_runs');
 export const MAINTENANCE = table('_console_maintenance');
+export const IDEMPOTENCY = table('_console_idempotency');
 const MAINTENANCE_ID = 'lake';
 const AUDIT = table('_console_audit');
 const CONSOLE_TABLES = ['_console_users', '_console_settings', '_console_audit'];
@@ -130,6 +131,19 @@ export async function initConsoleTables() {
         last_summary VARCHAR,
         updated_ms BIGINT,
         updated_by VARCHAR
+    )`);
+    // Idempotency-Key records for /upload, /kafka-sink and table imports
+    // (src/idempotency.js). Append-only apart from purging expired rows.
+    await execute(`CREATE TABLE IF NOT EXISTS ${IDEMPOTENCY} (
+        scope VARCHAR,
+        idem_key VARCHAR,
+        request_hash VARCHAR,
+        token VARCHAR,
+        state VARCHAR,
+        status_code INTEGER,
+        response VARCHAR,
+        created_ms BIGINT,
+        expires_ms BIGINT
     )`);
     await migrateFromMainCatalog();
     await migrateLegacyRetention();
@@ -667,4 +681,37 @@ export async function audit(username, action, detail = '', ip = '') {
 export async function listAudit(limit = 200) {
     const n = Math.max(1, Math.min(1000, Number(limit) || 200));
     return execute(`SELECT ${ts('ts')}, username, action, detail, ip FROM ${AUDIT} a ORDER BY a.ts DESC LIMIT ${n}`);
+}
+
+// --- Idempotency keys --------------------------------------------------------------
+
+/**
+ * Every row for an idempotency key that has not expired, in commit order
+ * (DuckLake assigns row ids when a transaction commits). Rows
+ * are only ever appended (state 'pending' when a request claims the key, then
+ * 'done' with the stored response or 'released' when it failed), so
+ * concurrent requests never update the same row; see src/idempotency.js.
+ */
+export async function idempotencyRows(scope, key, nowMs) {
+    const rows = await executeWithParams(
+        `SELECT rowid AS seq, request_hash, token, state, status_code, response, created_ms FROM ${IDEMPOTENCY}
+         WHERE scope = ? AND idem_key = ? AND expires_ms > ? ORDER BY rowid`,
+        [scope, key, BigInt(nowMs)], [VARCHAR, VARCHAR, BIGINT]);
+    return rows.map(r => ({
+        seq: Number(r.seq), requestHash: r.request_hash, token: r.token, state: r.state,
+        statusCode: r.status_code === null ? null : Number(r.status_code), response: r.response, createdMs: num(r.created_ms),
+    }));
+}
+
+export async function appendIdempotencyRow({ scope, key, requestHash, token, state, statusCode = null, response = null, createdMs, expiresMs }) {
+    await retryOnConflict(() => executeWithParams(
+        `INSERT INTO ${IDEMPOTENCY} (scope, idem_key, request_hash, token, state, status_code, response, created_ms, expires_ms)
+         VALUES (?, ?, ?, ?, ?, CAST(? AS INTEGER), ?, ?, ?)`,
+        [scope, key, requestHash, token, state, statusCode === null ? null : String(statusCode), response, BigInt(createdMs), BigInt(expiresMs)],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, BIGINT]));
+}
+
+/** Delete expired idempotency rows; returns nothing, conflicts are left for the next purge. */
+export async function purgeIdempotency(nowMs) {
+    await executeWithParams(`DELETE FROM ${IDEMPOTENCY} WHERE expires_ms <= ?`, [BigInt(nowMs)], [BIGINT]);
 }
