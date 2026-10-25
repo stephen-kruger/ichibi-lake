@@ -1,11 +1,7 @@
 import { Kafka } from 'kafkajs';
-import { withConnection } from './db.js';
 import { recordKafkaLag } from './metrics.js';
-import { resolveTypeConflict, formatSchemaDefinition } from './schema-evolution.js';
 import { ensureTableAcl } from './acl.js';
-import { randomUUID } from 'crypto';
-import fs from 'fs/promises';
-import path from 'path';
+import { ingestRows, describeIngest, INGEST_MODES } from './ingest.js';
 
 // Store batches in memory
 const BATCH_SIZE = parseInt(process.env.KAFKA_BATCH_SIZE || '100');
@@ -53,110 +49,53 @@ async function flushBatch(topic) {
         return;
     }
 
-    const tempFileName = `kafka_temp_${randomUUID()}.json`;
-    const tempFilePath = path.join(process.cwd(), tempFileName);
-
+    const { mode, keys } = topicIngestMode(topic);
     try {
-        await fs.writeFile(tempFilePath, JSON.stringify(dataToInsert));
-
-        // withConnection guarantees the DuckDB connection is closed in a
-        // finally, avoiding a per-batch native-handle leak (previous code
-        // called getConnection() and never released it).
-        await withConnection(async (connection) => {
-            // Check whether the target table already exists. `getRows()` returns a
-            // Promise in @duckdb/node-api; forgetting to await it (as the previous
-            // implementation did) meant `tableExists` was always false, so every
-            // batch after the first hit "Catalog Error: Table ... already exists!".
-            const checkSql = `SELECT count(*) FROM information_schema.tables WHERE table_name = '${tableName}'`;
-            const checkResult = await connection.run(checkSql);
-            const checkRows = await checkResult.getRows();
-            const countVal = checkRows[0] && checkRows[0][0] != null ? checkRows[0][0] : 0;
-            const tableExists = Number(countVal) > 0;
-
-            const readOptions = 'sample_size=-1';
-
-            try {
-                if (!tableExists) {
-                    await connection.run(`CREATE TABLE ${tableName} AS SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-                    await ensureTableAcl(tableName, 'kafka-internal');
-                    console.log(`[Kafka] Created table ${tableName} and inserted ${dataToInsert.length} records.`);
-                    return;
-                }
-            } catch (createErr) {
-                // Defensive fallback: if a concurrent flush (e.g. multi-partition
-                // topic) raced us to CREATE TABLE, treat the table as existing
-                // and proceed with the safe INSERT path below.
-                if (!tableExists && /already exists/i.test(createErr.message || '')) {
-                    console.log(`[Kafka] Race resolved for ${tableName}, falling back to INSERT.`);
-                    tableExists = true;
-                } else {
-                    throw createErr;
-                }
-            }
-
-            if (tableExists) {
-                // Schema Evolution: add any columns present in the incoming
-                // messages that the existing target table does not yet have.
-                // For STRUCT columns with different shapes, widen the column
-                // type to the union of both shapes so DuckDB can cast safely.
-                const existingResult = await connection.run(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '${tableName}'`);
-                const existingRows = await existingResult.getRows();
-                const existingCols = new Map(existingRows.map(r => [r[0], r[1]]));
-
-                const newDataResult = await connection.run(`DESCRIBE SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-                const newDataRows = await newDataResult.getRows();
-                const newDataCols = newDataRows.map(r => ({ name: r[0], type: r[1] }));
-
-                const selectColumns = [];
-                let schemaChanged = false;
-                for (const col of newDataCols) {
-                    const existingType = existingCols.get(col.name);
-                    if (existingType) {
-                        const resolution = resolveTypeConflict(existingType, col.type);
-                        if (resolution.action === 'skip') {
-                            console.warn(`[Schema Evolution] Skipping column "${col.name}" in ${tableName} for this batch: ${resolution.reason}`);
-                            continue;
-                        }
-                        if (resolution.action === 'widen') {
-                            console.log(`[Schema Evolution] Widening column "${col.name}" in ${tableName} from ${existingType} to ${resolution.newType}`);
-                            try {
-                                await connection.run(`ALTER TABLE ${tableName} ALTER COLUMN "${col.name}" SET DATA TYPE ${resolution.newType}`);
-                                schemaChanged = true;
-                            } catch (alterErr) {
-                                console.warn(`[Schema Evolution] Skipping column "${col.name}" in ${tableName} for this batch: ALTER failed (${alterErr.message || alterErr})`);
-                                continue;
-                            }
-                        }
-                    } else {
-                        // Brand-new column – add it to the table first.
-                        console.log(`[Schema Evolution] Adding column ${col.name} (${col.type}) to ${tableName}`);
-                        try {
-                            await connection.run(`ALTER TABLE ${tableName} ADD COLUMN "${col.name}" ${col.type}`);
-                            schemaChanged = true;
-                        } catch (addErr) {
-                            console.warn(`[Schema Evolution] Skipping new column "${col.name}" in ${tableName} for this batch: ADD COLUMN failed (${addErr.message || addErr})`);
-                            continue;
-                        }
-                    }
-                    selectColumns.push(`"${col.name}"`);
-                }
-
-                if (schemaChanged) {
-                    const schemaResult = await connection.run(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '${tableName}' ORDER BY ordinal_position`);
-                    const schemaRows = await schemaResult.getRows();
-                    const columns = schemaRows.map(r => ({ column_name: r[0], data_type: r[1] }));
-                    console.log(`[Schema Evolution] New schema for ${tableName}:\n${formatSchemaDefinition(tableName, columns)}`);
-                }
-
-                await connection.run(`INSERT INTO ${tableName} BY NAME SELECT ${selectColumns.join(', ')} FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-                console.log(`[Kafka] Appended ${dataToInsert.length} records into ${tableName}. First record: ${JSON.stringify(dataToInsert[0])}`);
-            }
+        const result = await ingestRows(tableName, dataToInsert, {
+            mode,
+            keys,
+            keysAreDefault: true,
+            tempPrefix: 'kafka_temp',
+            updatedBy: 'kafka-internal',
+            onCreated: () => ensureTableAcl(tableName, 'kafka-internal'),
         });
+        if (result.created) {
+            console.log(`[Kafka] Created table ${tableName}: ${describeIngest(result)}.`);
+        } else {
+            console.log(`[Kafka] ${describeIngest(result)}. First record: ${JSON.stringify(dataToInsert[0])}`);
+        }
     } catch (e) {
-        console.error(`[Kafka Consumer Error] Failed inserting to ${tableName}:`, e);
-    } finally {
-        fs.unlink(tempFilePath).catch(err => console.error("Could not remove temp file", err));
+        console.error(`[Kafka Consumer Error] Failed writing ${dataToInsert.length} message(s) (mode=${mode}) to ${tableName}:`, e.message || e);
     }
+}
+
+/**
+ * Parse KAFKA_INGEST_MODES: comma-separated `topic=mode[:key1+key2]` entries,
+ * e.g. `customers=upsert:customer_id,devices=dedupe:device_id+region`.
+ * `topic` is the (sanitised) table name; `*` sets the default for every other
+ * topic. Keys are only used to declare them when the table has none yet;
+ * declared keys (PUT /tables/:tableName/keys) take precedence. Invalid entries
+ * are ignored with a warning.
+ */
+export function parseIngestModes(raw = '') {
+    const out = new Map();
+    for (const entry of String(raw).split(',').map(s => s.trim()).filter(Boolean)) {
+        const m = entry.match(/^([A-Za-z0-9_.*-]+)\s*=\s*([a-z]+)(?::([A-Za-z0-9_+]+))?$/i);
+        if (!m || !INGEST_MODES.includes(m[2].toLowerCase())) {
+            console.warn(`[Kafka] Ignoring invalid KAFKA_INGEST_MODES entry "${entry}" (expected topic=append|upsert|dedupe[:key1+key2]).`);
+            continue;
+        }
+        const keys = m[3] ? m[3].split('+').filter(Boolean) : null;
+        out.set(m[1] === '*' ? '*' : m[1].replace(/[^a-zA-Z0-9_]/g, '_'), { mode: m[2].toLowerCase(), keys });
+    }
+    return out;
+}
+
+/** Ingestion mode for a topic. Read on use so the console can change it live. */
+export function topicIngestMode(topic) {
+    const modes = parseIngestModes(process.env.KAFKA_INGEST_MODES || '');
+    const tableName = topic.replace(/[^a-zA-Z0-9_]/g, '_');
+    return modes.get(tableName) || modes.get('*') || { mode: 'append', keys: null };
 }
 
 export async function startKafkaConsumer() {
