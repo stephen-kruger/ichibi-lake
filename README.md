@@ -44,7 +44,8 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [8.1 Exporting Tables](#81-exporting-tables)
 - [9. Event Ingestion](#9-event-ingestion)
   - [9.1 JSON Upload](#91-json-upload)
-  - [9.2 Raw SQL Query](#92-raw-sql-query)
+  - [9.2 Upserts & Deduplication (Key Columns)](#92-upserts--deduplication-key-columns)
+  - [9.3 Raw SQL Query](#93-raw-sql-query)
 - [10. Kafka Integration](#10-kafka-integration)
   - [10.1 HTTP Sink](#101-http-sink-post-kafka-sink)
   - [10.2 Internal Background Consumer](#102-internal-background-consumer)
@@ -128,6 +129,7 @@ The gateway runs two DuckDB instances: a **primary** instance (connection pool) 
 | `PORT` | `3000` | Port the Node gateway listens on |
 | `JSON_BODY_LIMIT` | `50mb` | Max JSON request body size (e.g. `2gb`, `50mb`) |
 | `MAX_BATCH_SIZE` | `10000` | Max rows per `/upload` request; prevents OOM. Also editable live in the console. |
+| `INGEST_CONFLICT_RETRIES` | `10` | Attempts for an upsert/dedupe batch that loses a DuckLake commit race with a concurrent write to the same table, before it fails with HTTP 409 ([§9.2](#92-upserts--deduplication-key-columns)). Also editable live in the console. |
 | `NODE_ENV` | `production` | Node environment |
 
 ### 3.2 DuckLake (Postgres Metadata)
@@ -232,6 +234,7 @@ User-supplied SQL (`POST /query`, the GraphQL `sql` resolver, and the graph endp
 | `KAFKA_BATCH_SIZE` | `100` | Max messages per consumer batch (also caps the producer's messages per batch) |
 | `KAFKA_BATCH_TIMEOUT_MS` | `5000` | Max wait to complete a batch (ms) |
 | `KAFKA_METADATA_MAX_AGE_MS` | `10000` | Metadata refresh interval (ms) |
+| `KAFKA_INGEST_MODES` | — | Per-topic ingestion mode: comma-separated `topic=append\|upsert\|dedupe[:key1+key2]`, `*` for all other topics (e.g. `customers=upsert:customer_id,*=append`). Editable live in the console. See [§10.2](#102-internal-background-consumer). |
 
 **Producer / SSE:**
 
@@ -702,7 +705,7 @@ curl -H "x-api-key: YOUR_KEY" \
   "http://ichibi-lake:3333/tables/ichibi_table?owner=marwan&limit=10&sort=-created_at"
 ```
 
-`GET /tables/:tableName` is for browsing and paging. To take whole tables out of the lake use the export endpoint below, and for ad-hoc SQL over large results use NDJSON streaming on `POST /query` ([§9.2](#92-raw-sql-query)).
+`GET /tables/:tableName` is for browsing and paging. To take whole tables out of the lake use the export endpoint below, and for ad-hoc SQL over large results use NDJSON streaming on `POST /query` ([§9.3](#93-raw-sql-query)).
 
 ### 8.1 Exporting Tables
 
@@ -756,7 +759,73 @@ curl -X POST "http://ichibi-lake:3333/upload/user_stats" \
   -d '[{"user": "duck", "points": 100}, {"user": "lake", "points": 250}]'
 ```
 
-### 9.2 Raw SQL Query
+By default every row is appended. `?mode=upsert` and `?mode=dedupe` write by key instead ([§9.2](#92-upserts--deduplication-key-columns)).
+
+### 9.2 Upserts & Deduplication (Key Columns)
+
+Appending suits events; entities whose rows change over time (customers, devices, dimension tables) need writes by key. A table can declare one or more **key columns**, and `POST /upload/:tableName` and `POST /kafka-sink` take a `mode`:
+
+| `mode` | Effect |
+| :--- | :--- |
+| `append` (default) | Insert every row. |
+| `upsert` | Replace the rows whose key matches an incoming row; insert rows with a new key. |
+| `dedupe` | Insert only rows whose key does not exist yet; rows with an existing key are skipped. |
+
+**Declaring keys**
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/tables/:tableName/keys` | Declared key columns (read access). Also returned as `keys` by `GET /tables/:tableName/schema`. |
+| `PUT` | `/tables/:tableName/keys` | Body `{"keys": ["region", "device_id"]}` declares a (composite) key; `{"keys": []}` clears it. Requires write access (table owner or RBAC writer). |
+
+```sh
+curl -X PUT "http://ichibi-lake:3333/tables/customers/keys" \
+  -H "x-api-key: YOUR_KEY" -H "Content-Type: application/json" \
+  -d '{"keys": ["customer_id"]}'
+# {"success":true,"tableName":"customers","keys":["customer_id"],"duplicateKeys":0}
+```
+
+Key columns must exist and be comparable by value (not STRUCT, LIST, MAP, JSON or BLOB). The response reports `duplicateKeys`, the number of key values that already occur more than once (plus a `warning`); an upsert replaces *all* rows with a matching key, so such duplicates disappear as their keys are written again. Keys can also be declared on the first keyed write with `?key=`: `?key=customer_id` or `?key=region,device_id` (in key order). This is the only way to upsert into a table that does not exist yet; the table is then created from the batch with that key. Keys live in the `_table_keys` system table, so every gateway instance shares them. In the admin console they are set on a table's **Schema** tab ([§13.2](#132-features)). DuckLake has no unique constraints: keys are maintained by the keyed modes, not enforced. `mode=append`, `PATCH /tables/:tableName/records/:id`, and the console's **Add row** and **Import** can still write a key that exists.
+
+**Upsert**
+
+```sh
+curl -X POST "http://ichibi-lake:3333/upload/customers?mode=upsert" \
+  -H "x-api-key: YOUR_KEY" -H "Content-Type: application/json" \
+  -d '[{"customer_id": 2, "name": "Bea", "tier": "gold"}, {"customer_id": 3, "name": "Cy"}]'
+# {"success":true,"message":"Upserted 2 records into customers: 1 inserted, 1 updated",
+#  "mode":"upsert","keys":["customer_id"],"received":2,"inserted":1,"updated":1,"skipped":0,"duplicates":0}
+```
+
+- **Whole-row replace.** A matching row is replaced by the incoming row: columns the incoming row does not carry become NULL. Send the full entity, not a partial patch (use `PATCH /tables/:tableName/records/:id` to change single fields).
+- **`created` / `updated`.** When the table has a `created` and/or `updated` column (TIMESTAMP, DATE or VARCHAR), a replaced row keeps its existing `created` value, `updated` is set to the current time, and inserted rows get the current time in both (an incoming `created` is used for new rows).
+- **Duplicates within a batch.** The last occurrence of a key in the batch wins. With `?orderBy=<column>` the row with the highest value of that column wins instead (ties: the later row), e.g. `?orderBy=version` or `?orderBy=event_time`. Collapsed rows are reported as `duplicates`.
+- **Schema evolution** works as for appends: new columns are added and STRUCT columns widened before the write.
+- **Validation (HTTP 400, nothing written).** A batch without a key column, a row with a NULL key value, an `orderBy` column missing from the batch, a keyed write to a table with no declared keys and no `?key=`, or an unknown `mode`. A `?key=` that differs from the table's declared keys returns 409.
+- **RBAC.** Keyed writes need the same write access as appends; readers get 403.
+
+**Dedupe**
+
+```sh
+curl -X POST "http://ichibi-lake:3333/upload/events?mode=dedupe&key=event_id" \
+  -H "x-api-key: YOUR_KEY" -H "Content-Type: application/json" \
+  -d '[{"event_id": "e1", "kind": "click"}, {"event_id": "e1", "kind": "click"}]'
+# ..."inserted":1,"skipped":0,"duplicates":1
+```
+
+Only rows whose key is not in the table yet are inserted (`skipped` counts the others); existing rows are never changed. Within a batch the **first** occurrence of a key wins (or the highest `?orderBy=` value). Use it for idempotent re-delivery: replaying a batch inserts nothing new.
+
+**`/kafka-sink`** takes the same `mode`, `key` and `orderBy` query parameters. The key refers to fields of the flattened record value, or to `_kafka_key` to key on the Kafka message key:
+
+```sh
+curl -X POST "http://ichibi-lake:3333/kafka-sink?topic=devices&mode=upsert&key=_kafka_key" \
+  -H "x-api-key: YOUR_KEY" -H "Content-Type: application/json" \
+  -d '[{"key": "dev-1", "value": {"fw": "2.1", "online": true}}]'
+```
+
+**How it works & concurrency.** A keyed batch is spooled to a temp file, deduplicated with a window function and written with one `MERGE INTO` (DuckDB 2.0 supports it on DuckLake tables) inside a transaction on one connection, so it is all-or-nothing. DuckLake commits optimistically and detects conflicts per **table**: when two keyed writes to the same table overlap (from this or another gateway instance, even with disjoint keys), one commits and the other fails with a DuckLake transaction conflict, is rolled back and retried, up to `INGEST_CONFLICT_RETRIES` times (default 10, jittered backoff, editable live on the console's **Ingestion** page). If every attempt loses, the request returns **HTTP 409** and nothing from the batch was written, so retry it; rows are never silently lost or half-written, and keys never end up duplicated by concurrent keyed writes. Writes to one table are therefore serialised: throughput comes from larger batches, not from many concurrent small upserts to the same table. Keyed and plain writes do not protect each other: a concurrent `mode=append` that commits after an upsert does not conflict with it and can add a row with an existing key. Each keyed write deletes and re-inserts the matched rows, so frequently upserted tables accumulate delete files; scheduled lake maintenance ([§4.7](#47-lake-maintenance-small-files)) rewrites them.
+
+### 9.3 Raw SQL Query
 
 ```sh
 curl -X POST "http://ichibi-lake:3333/query" \
@@ -807,6 +876,14 @@ curl -X POST "http://ichibi-lake:3333/kafka-sink" \
 ### 10.2 Internal Background Consumer
 
 Enable by setting `KAFKA_BROKERS` in the environment. The consumer automatically ingests events from topics matching `KAFKA_TOPIC_REGEX` into DuckDB tables (one table per topic, registered under the `kafka-internal` ACL key). Kafka's internal `__` topics are never subscribed, and topics whose table name would start with `_` are skipped.
+
+By default each batch is appended. `KAFKA_INGEST_MODES` (also editable live on the console's **Kafka** settings page) switches topics to key-based ingestion ([§9.2](#92-upserts--deduplication-key-columns)): comma-separated `topic=mode[:key1+key2]` entries, where `topic` is the table name (non-alphanumeric characters replaced by `_`) and `*` sets the default for every other topic:
+
+```sh
+KAFKA_INGEST_MODES=customers=upsert:customer_id,devices=upsert:_kafka_key,clicks=dedupe:event_id+ts
+```
+
+The keys in the setting are declared on the table when it has none yet (for example when the first batch creates it); keys declared with `PUT /tables/:tableName/keys` or the console take precedence. Within a batch the last message for a key wins (first for `dedupe`). Conflicting concurrent writes are retried as in [§9.2](#92-upserts--deduplication-key-columns); a batch that still fails (including a batch with a missing or NULL key) is logged as `[Kafka Consumer Error]` and not written, as for any other failed batch.
 
 Configure via environment variables in [§3.7](#37-kafka-integration).
 
@@ -1139,6 +1216,7 @@ Resetting a setting removes the override and returns to the `docker/.env` value 
 - **Schema** (admins): add columns (with an optional default that backfills existing rows), rename columns, change defaults and NULL-ability, change types and drop columns. In the **Edit column** dialog every type can be chosen:
   - **(in place)**: widening changes DuckLake supports natively (e.g. `INTEGER → BIGINT`, `FLOAT → DOUBLE`). Data and column position are unchanged.
   - **(convert)**: any other change (e.g. `VARCHAR → INTEGER`, `BIGINT → VARCHAR`). The console copies the converted values into a new column, drops the old one, and renames the new one, all in **one transaction**, so nothing changes if any step fails. Row ids are preserved; the column **moves to the end** of the table and **loses its default**; NOT NULL is kept. Use **Check values** first: if any value cannot be converted (e.g. `"n/a"` to INTEGER), the change is refused with a count and examples unless you tick **Set values that cannot be converted to NULL**. Converting is blocked while a property graph references the table, or while a pruning rule prunes this table by the age of the column and the new type is not a date/timestamp.
+  - **Key columns**: the **Key columns** card shows the table's declared key (marked *key* in the column list) and **Edit keys** sets or clears it; for a composite key, tick the columns in key order. Keys drive `?mode=upsert` / `?mode=dedupe` ingestion ([§9.2](#92-upserts--deduplication-key-columns)). Saving reports how many key values already occur more than once. A key column cannot be dropped until it is removed from the key; renaming a key column or the table updates the key. Changes are audited.
 - **Tables** (admins): create tables with a column builder, rename them (table ACLs, RBAC table permissions and pruning rules follow the new name; API clients using the old name will fail), and drop them, which requires typing the table name. Tables referenced by a property graph cannot be renamed or dropped, and their columns cannot be renamed or dropped, until the graph is removed.
 - **Export** (all console users): **Export** on a table's page downloads it as Parquet, CSV or NDJSON, optionally only the rows matching the grid's current filters and search, in its sort order, with an optional row limit. It uses the same engine and limits as `GET /tables/:tableName/export` ([§8.1](#81-exporting-tables)): streamed, capped at `EXPORT_MAX_ROWS`, at most `EXPORT_CONCURRENCY` at once. Exports are recorded in the audit log.
 - **Import** (admins): **Import** on the table list (new table or append) or on a table's page (append) loads a **CSV** (header, delimiter and column types detected automatically), **Parquet** or **JSON** file (an array of objects, or one object per line). **Preview** reads the file without writing anything and shows the detected columns and types, the row count, the first 20 rows and, when appending, what happens to each column: *matches*, *cast to* the table's type, *widened* (STRUCT), *column will be added*, or *skipped*, plus columns missing from the file (left NULL; `created`/`updated` timestamp columns are filled with the import time). Appending follows the same schema-evolution rules as `POST /upload`; untick **Add columns** to skip new columns instead. The insert is a single statement, so a row that cannot be converted fails the whole import and no rows are added. Files are limited to `IMPORT_MAX_MB` (default 1024 MB, editable on the **Ingestion** page), streamed to a temp file (`IMPORT_TMP_DIR`, default the OS temp dir) and deleted afterwards; nothing is kept between Preview and Import (the browser sends the file again), so it works behind a load balancer. Imported tables, like console-created ones, have no ACL row. Imports are recorded in the audit log.
@@ -1271,7 +1349,7 @@ Every cap reports truncation (`truncated` / trailer line / `X-Export-Truncated`)
 
 ```sh
 npm test                       # Run all suites, including RBAC and console (requires Docker: app, db, kafka)
-npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console, SQL guard, storage)
+npm run test:unit              # Unit tests only (schema evolution, graph DDL, topic filter, ORDER BY, PGQ grammar, console, SQL guard, storage, ingest modes)
 npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
 npm run test:pgq-grammar       # DuckDB 2.0 SQL/PGQ grammar opt-in tests (no Docker needed)
 npm run test:console-unit      # Admin console auth, settings, data browser, pruning and cron unit tests (no Docker needed)
@@ -1280,6 +1358,8 @@ npm run test:storage           # Object-storage config, S3 secret SQL and mainte
 npm run test:maintenance       # Data inlining and scheduled lake maintenance (file counts drop), against the running stack
 npm run test:orderby           # DuckLake ORDER BY corruption regression (no Docker needed)
 npm run test:kafka-topic-filter # Kafka topic subscription filter (no Docker needed)
+npm run test:ingest-modes      # Ingestion mode / key list / KAFKA_INGEST_MODES parsing (no Docker needed)
+npm run test:upsert            # Key columns, upsert / dedupe (composite keys, batch duplicates, created/updated, schema evolution, RBAC, concurrent upserts)
 npm run test:console           # Admin console integration tests (uses docker exec for a temporary admin)
 npm run test:ops               # Health, metrics, NDJSON streaming (4M rows, bounded memory), row caps, table export round trips and RBAC
 npm run test:rbac              # RBAC: superuser / writer / reader permissions, per-table overrides, superuser-only SQL and graphs, system tables

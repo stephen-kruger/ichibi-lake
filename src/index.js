@@ -25,13 +25,14 @@ import {
     blobValue,
 } from './db.js';
 import { isSafeIdentifier, buildCreatePropertyGraphSql } from './graphs.js';
-import { resolveTypeConflict, formatSchemaDefinition } from './schema-evolution.js';
 import { startKafkaConsumer } from './kafka-consumer.js';
 import { getKafka } from './kafka-producer.js';
 import { migrateTimestamps } from './migrate-timestamps.js';
 import { initAclTable, ensureTableAcl, checkReadAccess, checkWriteAccess, getTableAcl, updateTableAcl, invalidateAclCache, migrateToAcl } from './acl.js';
 import { initRbacTables, bootstrapRbac, isValidApiKey, checkAccess, isRbacConfigured, legacyBootstrap, isSuperuserKey } from './rbac.js';
 import { assertReadOnlySql } from './sql-guard.js';
+import { ingestRows, parseIngestMode, describeIngest } from './ingest.js';
+import { initTableKeys, getTableKeys, setTableKeys, normaliseKeyList, assertKeysMatchColumns, countDuplicateKeys } from './table-keys.js';
 import { retryOnConflict } from './conflict.js';
 import adminRouter from './rbac-api.js';
 import { createConsoleRouter, initConsole, loadSettingOverrides, publicBaseUrl } from './console/index.js';
@@ -146,6 +147,22 @@ const BLOBS_PATH = process.env.BLOBS_PATH || './data/blobs';
 // send massive arrays. Configure via MAX_BATCH_SIZE. Read on use so the
 // admin console can change it live.
 const maxBatchSize = () => Math.max(1, parseInt(process.env.MAX_BATCH_SIZE || '10000', 10) || 10000);
+
+// Ingestion mode query parameters shared by /upload and /kafka-sink.
+function ingestOptions(req) {
+    const one = (v) => (Array.isArray(v) ? v[0] : v);
+    return {
+        mode: parseIngestMode(one(req.query.mode)),
+        keys: one(req.query.key) ?? one(req.query.keys) ?? null,
+        orderBy: one(req.query.orderBy) ?? null,
+        updatedBy: req.apiKey ? 'api' : null,
+    };
+}
+
+function ingestSummary(r) {
+    if (r.mode === 'append') return { mode: r.mode, inserted: r.inserted };
+    return { mode: r.mode, keys: r.keys, received: r.received, inserted: r.inserted, updated: r.updated, skipped: r.skipped, duplicates: r.duplicates };
+}
 
 // --- User-supplied SQL ---
 // POST /query, the GraphQL `sql` resolver and the graph endpoints accept SQL
@@ -827,7 +844,7 @@ app.get('/tables/:tableName/schema', async (req, res) => {
             return res.status(404).json({ success: false, error: 'Table not found' });
         }
         await requireReadAccess(tableName, req);
-        res.json({ success: true, tableName, schema: rows });
+        res.json({ success: true, tableName, schema: rows, keys: await getTableKeys(tableName) });
     } catch (error) {
         res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
@@ -870,6 +887,52 @@ app.patch('/tables/:tableName/acl', async (req, res) => {
         await requireWriteAccess(tableName, req);
         await updateTableAcl(tableName, ownerKeys, readerKeys);
         res.json({ success: true, message: `ACL updated for table "${tableName}"` });
+    } catch (error) {
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    }
+});
+
+// GET /tables/:tableName/keys - Declared key columns (used by mode=upsert|dedupe)
+app.get('/tables/:tableName/keys', async (req, res) => {
+    try {
+        const { tableName } = req.params;
+        assertSafeIdentifier(tableName, 'tableName');
+        assertNotSystemTable(tableName);
+        if ((await getTableColumns(tableName)).length === 0) {
+            return res.status(404).json({ success: false, error: 'Table not found' });
+        }
+        await requireReadAccess(tableName, req);
+        res.json({ success: true, tableName, keys: await getTableKeys(tableName) });
+    } catch (error) {
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    }
+});
+
+// PUT /tables/:tableName/keys - Declare (or with [] clear) the key columns
+app.put('/tables/:tableName/keys', async (req, res) => {
+    try {
+        const { tableName } = req.params;
+        assertSafeIdentifier(tableName, 'tableName');
+        assertNotSystemTable(tableName);
+        const keys = normaliseKeyList(req.body?.keys);
+        const rows = await executeWithParams(
+            `SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ?`,
+            [tableName], [VARCHAR]
+        );
+        if (rows.length === 0) {
+            return res.status(404).json({ success: false, error: 'Table not found' });
+        }
+        await requireWriteAccess(tableName, req);
+        assertKeysMatchColumns(tableName, keys, new Map(rows.map(r => [r.column_name, r.data_type])));
+        await setTableKeys(tableName, keys, 'api');
+        const duplicateKeys = await countDuplicateKeys(tableName, keys);
+        res.json({
+            success: true,
+            tableName,
+            keys,
+            duplicateKeys,
+            ...(duplicateKeys ? { warning: `${duplicateKeys} key value(s) occur more than once in existing rows. An upsert replaces all rows with a matching key, so they converge as those keys are written again.` } : {}),
+        });
     } catch (error) {
         res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
@@ -1357,128 +1420,24 @@ app.post('/kafka-sink', async (req, res) => {
         return res.status(400).json({ error: 'Expected an array of messages' });
     }
 
-    const tempFileName = `kafka_sink_${randomUUID()}.json`;
-    const tempFilePath = path.join(process.cwd(), tempFileName);
-
     try {
-        const targetApiKey = req.apiKey || '';
-
-        // Write incrementally to avoid memory exhaustion on large payloads
-        const fileHandle = await fs.open(tempFilePath, 'w');
-        try {
-            for (const msg of data) {
-                const row = {
-                    _ingest_timestamp: new Date().toISOString(),
-                    ...(typeof msg.value === 'object' ? msg.value : { value: msg.value }),
-                    _kafka_key: msg.key,
-                };
-                await fileHandle.write(JSON.stringify(row) + '\n');
-            }
-        } finally {
-            await fileHandle.close();
-        }
-
-        const checkResult = await executeWithParams(
-            `SELECT count(*) as count FROM information_schema.tables WHERE table_name = ?`,
-            [topic], [VARCHAR]
-        );
-        const tableExists = checkResult[0] && parseInt(checkResult[0].count) > 0;
-
-        const readOptions = `sample_size=-1`;
-        let createdTable = false;
-
-        await withConnection(async (conn) => {
-            // Create the table when it does not appear to exist yet. Catch the
-            // "already exists" race (concurrent sink/upload for the same topic)
-            // and fall through to the existing-table path, which enforces write
-            // access before appending the losing request's messages.
-            let mustEvolveExisting = tableExists;
-            if (!tableExists) {
-                try {
-                    await conn.run(`CREATE TABLE "${topic}" AS SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-                    createdTable = true;
-                    await ensureTableAcl(topic, targetApiKey);
-                    invalidateColumnCache(topic);
-                } catch (createErr) {
-                    if (/already exists/i.test(createErr.message || '')) {
-                        invalidateColumnCache(topic);
-                        mustEvolveExisting = true;
-                    } else {
-                        throw createErr;
-                    }
-                }
-            }
-
-            if (mustEvolveExisting) {
-                await requireWriteAccess(topic, req);
-                // Schema Evolution: add any columns present in the incoming
-                // messages that the existing target table does not yet have.
-                // For STRUCT columns with different shapes, widen the column
-                // type to the union of both shapes so DuckDB can cast safely.
-                const existingColsRows = await executeWithParams(
-                    `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?`,
-                    [topic], [VARCHAR]
-                );
-                const existingCols = new Map(existingColsRows.map(r => [r.column_name, r.data_type]));
-
-                const newDataColsRows = await execute(`DESCRIBE SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-                const newDataCols = newDataColsRows.map(r => ({ name: r.column_name, type: r.column_type }));
-
-                const selectColumns = [];
-                let schemaChanged = false;
-                for (const col of newDataCols) {
-                    const existingType = existingCols.get(col.name);
-                    if (existingType) {
-                        const resolution = resolveTypeConflict(existingType, col.type);
-                        if (resolution.action === 'skip') {
-                            console.warn(`[Schema Evolution] Skipping column "${col.name}" in ${topic} for this batch: ${resolution.reason}`);
-                            continue;
-                        }
-                        if (resolution.action === 'widen') {
-                            console.log(`[Schema Evolution] Widening column "${col.name}" in ${topic} from ${existingType} to ${resolution.newType}`);
-                            try {
-                                await conn.run(`ALTER TABLE "${topic}" ALTER COLUMN "${col.name}" SET DATA TYPE ${resolution.newType}`);
-                                schemaChanged = true;
-                            } catch (alterErr) {
-                                console.warn(`[Schema Evolution] Skipping column "${col.name}" in ${topic} for this batch: ALTER failed (${alterErr.message || alterErr})`);
-                                continue;
-                            }
-                        }
-                    } else {
-                        console.log(`[Schema Evolution] Adding column ${col.name} (${col.type}) to ${topic}`);
-                        try {
-                            await conn.run(`ALTER TABLE "${topic}" ADD COLUMN "${col.name}" ${col.type}`);
-                            schemaChanged = true;
-                        } catch (addErr) {
-                            console.warn(`[Schema Evolution] Skipping new column "${col.name}" in ${topic} for this batch: ADD COLUMN failed (${addErr.message || addErr})`);
-                            continue;
-                        }
-                    }
-                    selectColumns.push(`"${col.name}"`);
-                }
-
-                if (schemaChanged) {
-                    invalidateColumnCache(topic);
-                    const schemaRows = await executeWithParams(
-                        `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position`,
-                        [topic], [VARCHAR]
-                    );
-                    console.log(`[Schema Evolution] New schema for ${topic}:\n${formatSchemaDefinition(topic, schemaRows)}`);
-                }
-
-                await conn.run(`INSERT INTO "${topic}" BY NAME SELECT ${selectColumns.join(', ')} FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-            }
+        const rows = data.map((msg) => ({
+            _ingest_timestamp: new Date().toISOString(),
+            ...(typeof msg.value === 'object' ? msg.value : { value: msg.value }),
+            _kafka_key: msg.key,
+        }));
+        const result = await ingestRows(topic, rows, {
+            ...ingestOptions(req),
+            tempPrefix: 'kafka_sink',
+            onCreated: () => ensureTableAcl(topic, req.apiKey || ''),
+            beforeExisting: () => requireWriteAccess(topic, req),
         });
+        if (result.created) await applyDefaultPartitioning(topic);
 
-        if (createdTable) await applyDefaultPartitioning(topic);
-
-        res.json({ success: true, message: `Sinked ${data.length} messages to ${topic}` });
+        const message = result.mode === 'append' ? `Sinked ${data.length} messages to ${topic}` : describeIngest(result);
+        res.json({ success: true, message, ...ingestSummary(result) });
     } catch (error) {
         res.status(error.statusCode || 500).json({ success: false, error: error.message });
-    } finally {
-        // Always remove the spooled payload, even on the error paths, so a
-        // failed sink cannot leak the request's JSON to disk indefinitely.
-        try { await fs.unlink(tempFilePath); } catch (e) { /* already gone */ }
     }
 });
 
@@ -1753,11 +1712,13 @@ app.get('/kafka-subscribe/:topicName', async (req, res) => {
 });
 
 // POST /upload - Ingest data
+//
+//   ?mode=append (default) | upsert | dedupe   see src/ingest.js
+//   ?key=col[,col]   key columns to declare when the table has none yet
+//   ?orderBy=col     keyed modes: within the batch keep the highest value
 app.post(['/upload', '/upload/:tableName'], async (req, res) => {
     const tableName = req.params.tableName || 'ichibi_table';
     const data = req.body;
-    const tempFileName = `temp_${randomUUID()}.json`;
-    const tempFilePath = path.join(process.cwd(), tempFileName);
 
     if (!Array.isArray(data)) {
         return res.status(400).json({ error: 'Expected an array of JSON objects' });
@@ -1771,120 +1732,20 @@ app.post(['/upload', '/upload/:tableName'], async (req, res) => {
     }
 
     try {
-        const targetApiKey = req.apiKey || '';
-
-        // Write incrementally to avoid memory exhaustion on large payloads
-        const fileHandle = await fs.open(tempFilePath, 'w');
-        try {
-            for (const row of data) {
-                await fileHandle.write(JSON.stringify(row) + '\n');
-            }
-        } finally {
-            await fileHandle.close();
-        }
-
-        // Check if table exists
         assertSafeIdentifier(tableName, 'tableName');
-        const checkResult = await executeWithParams(
-            `SELECT count(*) as count FROM information_schema.tables WHERE table_name = ?`,
-            [tableName], [VARCHAR]
-        );
-        const tableExists = checkResult[0] && parseInt(checkResult[0].count) > 0;
-
-        const readOptions = `sample_size=-1`;
-        let createdTable = false;
-
-        await withConnection(async (conn) => {
-            // Attempt to create the table when it does not appear to exist yet.
-            // A concurrent /upload for the same name can win the race between our
-            // existence check above and this CREATE; we catch "already exists"
-            // and fall through to the existing-table path, which enforces write
-            // access before inserting the losing request's rows.
-            let mustEvolveExisting = tableExists;
-            if (!tableExists) {
-                try {
-                    await conn.run(`CREATE TABLE "${tableName}" AS SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-                    createdTable = true;
-                    await ensureTableAcl(tableName, targetApiKey);
-                    invalidateColumnCache(tableName);
-                } catch (createErr) {
-                    if (/already exists/i.test(createErr.message || '')) {
-                        invalidateColumnCache(tableName);
-                        mustEvolveExisting = true;
-                    } else {
-                        throw createErr;
-                    }
-                }
-            }
-
-            if (mustEvolveExisting) {
-                await requireWriteAccess(tableName, req);
-                // Schema Evolution: Add missing columns.
-                // For STRUCT columns with different shapes, widen the column
-                // type to the union of both shapes so DuckDB can cast safely.
-                const existingColsRows = await executeWithParams(
-                    `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?`,
-                    [tableName], [VARCHAR]
-                );
-                const existingCols = new Map(existingColsRows.map(r => [r.column_name, r.data_type]));
-
-                const newDataColsRows = await execute(`DESCRIBE SELECT * FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-                const newDataCols = newDataColsRows.map(r => ({ name: r.column_name, type: r.column_type }));
-
-                const selectColumns = [];
-                let schemaChanged = false;
-                for (const col of newDataCols) {
-                    const existingType = existingCols.get(col.name);
-                    if (existingType) {
-                        const resolution = resolveTypeConflict(existingType, col.type);
-                        if (resolution.action === 'skip') {
-                            console.warn(`[Schema Evolution] Skipping column "${col.name}" in ${tableName} for this batch: ${resolution.reason}`);
-                            continue;
-                        }
-                        if (resolution.action === 'widen') {
-                            console.log(`[Schema Evolution] Widening column "${col.name}" in ${tableName} from ${existingType} to ${resolution.newType}`);
-                            try {
-                                await conn.run(`ALTER TABLE "${tableName}" ALTER COLUMN "${col.name}" SET DATA TYPE ${resolution.newType}`);
-                                schemaChanged = true;
-                            } catch (alterErr) {
-                                console.warn(`[Schema Evolution] Skipping column "${col.name}" in ${tableName} for this batch: ALTER failed (${alterErr.message || alterErr})`);
-                                continue;
-                            }
-                        }
-                    } else {
-                        console.log(`[Schema Evolution] Adding column ${col.name} (${col.type}) to ${tableName}`);
-                        try {
-                            await conn.run(`ALTER TABLE "${tableName}" ADD COLUMN "${col.name}" ${col.type}`);
-                            schemaChanged = true;
-                        } catch (addErr) {
-                            console.warn(`[Schema Evolution] Skipping new column "${col.name}" in ${tableName} for this batch: ADD COLUMN failed (${addErr.message || addErr})`);
-                            continue;
-                        }
-                    }
-                    selectColumns.push(`"${col.name}"`);
-                }
-
-                if (schemaChanged) {
-                    invalidateColumnCache(tableName);
-                    const schemaRows = await executeWithParams(
-                        `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position`,
-                        [tableName], [VARCHAR]
-                    );
-                    console.log(`[Schema Evolution] New schema for ${tableName}:\n${formatSchemaDefinition(tableName, schemaRows)}`);
-                }
-
-                await conn.run(`INSERT INTO "${tableName}" BY NAME SELECT ${selectColumns.join(', ')} FROM read_json_auto('${tempFilePath}', ${readOptions})`);
-            }
+        // The table-scoped routes 404 system tables; keep that for uploads.
+        assertNotSystemTable(tableName);
+        const result = await ingestRows(tableName, data, {
+            ...ingestOptions(req),
+            tempPrefix: 'temp',
+            onCreated: () => ensureTableAcl(tableName, req.apiKey || ''),
+            beforeExisting: () => requireWriteAccess(tableName, req),
         });
-
-        if (createdTable) await applyDefaultPartitioning(tableName);
-
-        res.json({ success: true, message: `Inserted ${data.length} records into ${tableName}` });
+        if (result.created) await applyDefaultPartitioning(tableName);
+        res.json({ success: true, message: describeIngest(result), ...ingestSummary(result) });
     } catch (error) {
-        console.error('Upload error:', error);
-        res.status(500).json({ success: false, error: error.message });
-    } finally {
-        try { await fs.unlink(tempFilePath); } catch (e) { }
+        if (!error.statusCode || error.statusCode >= 500) console.error('Upload error:', error);
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
 });
 
@@ -1910,6 +1771,7 @@ const STARTUP_STEPS = [
     ['setting overrides', loadSettingOverrides],
     ['RBAC bootstrap', () => (isRbacConfigured() ? bootstrapRbac() : legacyBootstrap())],
     ['ACL table', initAclTable],
+    ['table keys', initTableKeys],
     ['graph registry', initGraphRegistry],
     ['table migration', migrateExistingTables],
     ['ACL migration', migrateToAcl],

@@ -26,6 +26,7 @@ import * as consoleStore from './store.js';
 import { matchTables, isDateType, isEpochType } from './retention.js';
 import { EXPORT_FORMATS, runExport } from '../export.js';
 import { resolveTypeConflict } from '../schema-evolution.js';
+import { getTableKeys, setTableKeys, normaliseKeyList, assertKeysMatchColumns, countDuplicateKeys, renameKeyColumn } from '../table-keys.js';
 
 export const SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 export const PAGE_SIZES = [25, 50, 100, 250, 500];
@@ -243,6 +244,7 @@ export async function getSchema(tableName) {
                 widenTo: wideningTargets(c.data_type),
             })),
             graphs: await graphsReferencing(tableName),
+            keys: await getTableKeys(tableName, conn),
             columnTypes: COLUMN_TYPES,
         };
     });
@@ -598,6 +600,7 @@ export async function alterColumn(tableName, column, changes = {}) {
             await ddl(conn, `ALTER TABLE ${t} RENAME COLUMN ${c} TO ${quoteIdent(changes.newName)}`);
             applied.push(`renamed to ${changes.newName}`);
             c = quoteIdent(changes.newName);
+            await renameKeyColumn(tableName, column, changes.newName);
             // Keep exact-name pruning rules pointing at the renamed column.
             await consoleStore.renameColumnInRules(tableName, column, changes.newName).catch(() => {});
         }
@@ -612,14 +615,30 @@ export async function dropColumn(tableName, column) {
         if (!cols.some(c => c.column_name === column)) throw httpError(404, `Column "${column}" not found`);
         if (cols.length === 1) throw httpError(400, 'Cannot drop the only column; drop the table instead');
         await assertNoGraphs(tableName, 'drop a column');
+        if ((await getTableKeys(tableName, conn)).includes(column)) {
+            throw httpError(409, `Cannot drop "${column}": it is a key column. Change the table's keys first.`);
+        }
         await ddl(conn, `ALTER TABLE ${quoteIdent(tableName)} DROP COLUMN ${quoteIdent(column)}`);
         invalidateColumnCache(tableName);
         return { dropped: column };
     });
 }
 
+/**
+ * Declare (or with [] clear) the key columns used by key-based ingestion
+ * (POST /upload?mode=upsert|dedupe). Returns the keys and how many key values
+ * already occur more than once.
+ */
+export async function setKeys(tableName, rawKeys) {
+    const keys = normaliseKeyList(rawKeys ?? []);
+    const cols = await withConnection(conn => requireTable(conn, tableName));
+    assertKeysMatchColumns(tableName, keys, columnMap(cols));
+    await setTableKeys(tableName, keys, 'console');
+    return { keys, duplicateKeys: await countDuplicateKeys(tableName, keys) };
+}
+
 /** Tables keyed by table name that must follow a rename or be cleaned on drop. */
-const TABLE_REFERENCES = ['_table_acls', '_rbac_table_permissions'];
+const TABLE_REFERENCES = ['_table_acls', '_rbac_table_permissions', '_table_keys'];
 
 export async function renameTable(tableName, newName) {
     requireNewName(newName, 'Table');

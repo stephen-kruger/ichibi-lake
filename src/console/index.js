@@ -816,6 +816,12 @@ export function createConsoleRouter() {
         res.json(await data.previewTypeChange(req.params.table, req.params.column, req.body?.type));
     }));
 
+    api.put('/data/tables/:table/keys', requireAdmin, wrap(async (req, res) => {
+        const result = await data.setKeys(req.params.table, req.body?.keys);
+        await audit(req, 'schema.set_keys', `${req.params.table}: ${result.keys.length ? result.keys.join(', ') : '(none)'}`);
+        res.json({ success: true, ...result });
+    }));
+
     api.delete('/data/tables/:table/columns/:column', requireAdmin, wrap(async (req, res) => {
         const result = await data.dropColumn(req.params.table, req.params.column);
         await audit(req, 'schema.drop_column', `${req.params.table}.${req.params.column}`);
