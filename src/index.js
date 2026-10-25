@@ -41,6 +41,10 @@ import adminRouter from './rbac-api.js';
 import { createConsoleRouter, initConsole, loadSettingOverrides, publicBaseUrl } from './console/index.js';
 import { EXPORT_FORMATS, runExport, exportStats } from './export.js';
 import { httpMetricsMiddleware, renderMetrics } from './metrics.js';
+import { importTempFile, importMaxBytes, receiveUpload, contentTypeFormat, readSourceRequest, prepareS3Import } from './import.js';
+import { detectImportFormat, importFile } from './console/data.js';
+import { parseImportSource, isImportSourceAllowed } from './storage.js';
+import { beginIdempotentRequest, requestHasher, idempotentJson, idempotencyKeyOf } from './idempotency.js';
 import { checkReadiness, lakeStats, getStartupState, setStartupState } from './health.js';
 import swaggerUi from 'swagger-ui-express';
 import YAML from 'yamljs';
@@ -78,7 +82,12 @@ app.use(cors());
 // request exhaust the Node heap and trigger long GC pauses that look like
 // the whole gateway hanging. Configure via JSON_BODY_LIMIT for stress runs.
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '50mb';
-app.use(express.json({ limit: JSON_BODY_LIMIT }));
+// POST /tables/:tableName/import streams its body (which may be a JSON array
+// of any size up to IMPORT_MAX_MB) to a temp file itself, so the JSON parser
+// must leave it alone.
+const IMPORT_PATH_RE = /^\/tables\/[^/]+\/import\/?$/;
+const jsonParser = express.json({ limit: JSON_BODY_LIMIT });
+app.use((req, res, next) => (IMPORT_PATH_RE.test(req.path) ? next() : jsonParser(req, res, next)));
 console.log(`[Server] JSON body limit: ${JSON_BODY_LIMIT}`);
 
 // Identifier guard for table/column names received from URL paths or query
@@ -1412,8 +1421,10 @@ const KAFKA_SINK_DEFAULT_TOPIC = 'ichibi_table';
 // the DuckLake metadata catalog.
 const KAFKA_TOPIC_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 
-// POST /kafka-sink - convenience endpoint for event stream ingestion
-app.post('/kafka-sink', async (req, res) => {
+// POST /kafka-sink - convenience endpoint for event stream ingestion.
+// Honours Idempotency-Key (src/idempotency.js); the topic header is part of
+// the request identity.
+app.post('/kafka-sink', idempotentJson(req => String(req.headers['x-kafka-topic'] || '')), async (req, res) => {
     // Resolve target topic with explicit precedence:
     //   1. X-Kafka-Topic header (trimmed, non-empty)
     //   2. ?topic= query parameter (trimmed, non-empty; first value if repeated)
@@ -1752,12 +1763,12 @@ app.get('/kafka-subscribe/:topicName', async (req, res) => {
     })();
 });
 
-// POST /upload - Ingest data
+// POST /upload - Ingest data. Honours Idempotency-Key (src/idempotency.js).
 //
 //   ?mode=append (default) | upsert | dedupe   see src/ingest.js
 //   ?key=col[,col]   key columns to declare when the table has none yet
 //   ?orderBy=col     keyed modes: within the batch keep the highest value
-app.post(['/upload', '/upload/:tableName'], async (req, res) => {
+app.post(['/upload', '/upload/:tableName'], idempotentJson(), async (req, res) => {
     const tableName = req.params.tableName || 'ichibi_table';
     const data = req.body;
 
@@ -1787,6 +1798,89 @@ app.post(['/upload', '/upload/:tableName'], async (req, res) => {
     } catch (error) {
         if (!error.statusCode || error.statusCode >= 500) console.error('Upload error:', error);
         res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    }
+});
+
+// POST /tables/:tableName/import - bulk import of a file (CSV, Parquet, NDJSON
+// or a JSON array) sent as the raw request body, or, with a JSON body
+// { "source": "s3://bucket/prefix/*.parquet", ... }, of objects in object
+// storage. Modes (?mode=): auto (default: create when missing, else append),
+// create, append, replace. Runs on the primary instance via importFile()
+// (src/console/data.js), shared with the admin console's import.
+app.post('/tables/:tableName/import', async (req, res) => {
+    const tableName = req.params.tableName;
+    let file = null;
+    let bodyRead = false;
+    try {
+        assertSafeIdentifier(tableName, 'tableName');
+        // Check before accepting the upload, so a caller without write
+        // access cannot make the gateway spool a large body.
+        await requireWriteAccess(tableName, req);
+        idempotencyKeyOf(req); // 400 for a malformed key, before the upload
+
+        const contentType = req.headers['content-type'] || '';
+        const hash = requestHasher(req);
+        hash.update(`${contentType}\n`);
+        file = await importTempFile('upload');
+        const size = await receiveUpload(req, file, importMaxBytes(), { onChunk: (chunk) => hash.update(chunk) });
+        bodyRead = true;
+        if (await beginIdempotentRequest(req, res, hash.digest('hex'))) return;
+
+        const q = req.query;
+        const flag = (v, dflt) => (v === undefined || v === null || v === '' ? dflt : !(v === false || /^(0|false|no)$/i.test(String(v))));
+        const sourceRequest = !q.format && contentTypeFormat(contentType) === 'json' ? await readSourceRequest(file, size) : null;
+        let options;
+        if (sourceRequest) {
+            const parsed = parseImportSource(sourceRequest.source);
+            if (!isImportSourceAllowed(parsed) && !(await isSuperuserKey(req.apiKey))) {
+                const err = new Error('Forbidden: this source is not under a prefix in IMPORT_ALLOWED_SOURCES; only superusers may import from it.');
+                err.statusCode = 403;
+                throw err;
+            }
+            options = {
+                source: parsed.source,
+                remote: true,
+                prepare: prepareS3Import,
+                format: detectImportFormat(sourceRequest.format ? String(sourceRequest.format) : '', parsed.key.replace(/[*?[\]{}]+$/, '')),
+                mode: String(sourceRequest.mode ?? q.mode ?? 'auto'),
+                addColumns: flag(sourceRequest.addColumns ?? q.addColumns, true),
+                dryRun: flag(sourceRequest.dryRun ?? q.dryRun, false),
+            };
+        } else {
+            const explicit = q.format ? String(q.format) : contentTypeFormat(contentType);
+            if (!explicit) {
+                const err = new Error('Set the file format with ?format=csv|parquet|json|ndjson or a matching Content-Type (text/csv, application/vnd.apache.parquet, application/json, application/x-ndjson).');
+                err.statusCode = 400;
+                throw err;
+            }
+            options = {
+                source: file,
+                format: detectImportFormat(explicit),
+                mode: String(q.mode || 'auto'),
+                addColumns: flag(q.addColumns, true),
+                dryRun: flag(q.dryRun, false),
+            };
+        }
+
+        const { source, ...importOptions } = options;
+        const result = await importFile(source, { ...importOptions, table: tableName });
+        if (result.created) {
+            await ensureTableAcl(tableName, req.apiKey || '');
+            await applyDefaultPartitioning(tableName);
+        }
+        if (!result.dryRun) {
+            console.log(`[Import] ${tableName}: ${result.inserted} row(s) ${result.mode === 'create' ? 'into new table' : `(${result.mode})`} from ${options.remote ? source : `upload (${size} bytes)`} as ${result.format}`);
+        }
+        res.json({ success: true, ...result, ...(options.remote ? { source } : {}) });
+    } catch (error) {
+        const status = error.statusCode || 500;
+        if (status >= 500) console.error('Import error:', error);
+        // Do not wait for (or keep the connection open for) a body that was
+        // never read.
+        if (!bodyRead) res.set('Connection', 'close');
+        if (!res.headersSent) res.status(status).json({ success: false, error: error.message });
+    } finally {
+        if (file) fs.unlink(file).catch(() => {});
     }
 });
 
