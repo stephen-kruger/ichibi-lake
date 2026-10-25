@@ -592,6 +592,16 @@ async function run() {
             const s = await admin('GET', `/data/tables/${DT}/schema`);
             assert(!s.data.columns.some(c => c.name === 'big'), 'still present');
         });
+        await test('schema: key columns can be set, block dropping the column and are audited', async () => {
+            const r = await admin('PUT', `/data/tables/${DT}/keys`, { keys: ['id'] });
+            assert(r.status === 200 && JSON.stringify(r.data.keys) === '["id"]', JSON.stringify(r.data));
+            const s = await admin('GET', `/data/tables/${DT}/schema`);
+            assert(JSON.stringify(s.data.keys) === '["id"]', `schema keys: ${JSON.stringify(s.data.keys)}`);
+            assert((await admin('PUT', `/data/tables/${DT}/keys`, { keys: ['nope'] })).status === 400, 'unknown key column');
+            assert((await admin('DELETE', `/data/tables/${DT}/columns/id`)).status === 409, 'drop key column');
+            const audit = await admin('GET', '/audit');
+            assert(JSON.stringify(audit.data).includes('schema.set_keys'), 'audited');
+        });
         const DT2 = `${DT}_renamed`;
         await test('rename table moves its ACL; old name is gone', async () => {
             const r = await admin('PATCH', `/data/tables/${DT}`, { newName: DT2 });
@@ -600,6 +610,8 @@ async function run() {
             const acl = await gateway('POST', '/query', { sql: `SELECT count(*) AS n FROM _table_acls WHERE table_name = '${DT2}'` });
             assert(String(acl.data.rows?.[0]?.n) === '1', `acl rows for new name: ${JSON.stringify(acl.data)}`);
             assert((await gateway('GET', `/tables/${DT2}`)).status === 200, 'gateway REST reads renamed table');
+            const keys = await gateway('GET', `/tables/${DT2}/keys`);
+            assert(JSON.stringify(keys.data.keys) === '["id"]', `keys follow the rename: ${JSON.stringify(keys.data)}`);
         });
         await test('tables referenced by a property graph cannot be renamed or dropped', async () => {
             const g = `console_g_${TS}`;

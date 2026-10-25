@@ -620,6 +620,10 @@ paths:
                     type: array
                     items:
                       type: object
+                  keys:
+                    type: array
+                    items: { type: string }
+                    description: Declared key columns (empty when none)
         '404':
           description: Table not found
           content:
@@ -628,6 +632,95 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /tables/{tableName}/keys:
+    get:
+      summary: Get a table's key columns
+      description: Key columns used by `mode=upsert` / `mode=dedupe` ingestion. Requires read access.
+      parameters:
+        - in: path
+          name: tableName
+          schema: { type: string }
+          required: true
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Declared key columns (empty array when none)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  tableName: { type: string }
+                  keys: { type: array, items: { type: string } }
+        '403':
+          description: No read access
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Table not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      summary: Declare a table's key columns
+      description: |
+        Declares the column(s) that identify a row, in key order, for `mode=upsert` / `mode=dedupe` ingestion. An empty list clears the key. Requires write access (table owner or RBAC writer). Key columns must exist and be comparable by value (not STRUCT, LIST, MAP, JSON or BLOB). DuckLake does not enforce keys; `duplicateKeys` reports how many key values already occur more than once.
+      parameters:
+        - in: path
+          name: tableName
+          schema: { type: string }
+          required: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keys]
+              properties:
+                keys:
+                  type: array
+                  items: { type: string }
+              example: { keys: [region, device_id] }
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Keys stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  tableName: { type: string }
+                  keys: { type: array, items: { type: string } }
+                  duplicateKeys: { type: integer, description: Key values that occur more than once in existing rows }
+                  warning: { type: string, description: Present when duplicateKeys > 0 }
+        '400':
+          description: Invalid key list, unknown column or unkeyable column type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: No write access
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Table not found
           content:
             application/json:
               schema:
@@ -991,6 +1084,9 @@ paths:
 
         ### Schema evolution
         If the target table does not exist it is created from the incoming messages. If it already exists with a different schema (for example, the default `ichibi_table` was previously populated by `/upload`), any fields present in the incoming messages but missing from the table are added via `ALTER TABLE ... ADD COLUMN` as NULLable columns before the insert. Existing rows receive `NULL` for the newly added columns. Column types are inferred from the incoming JSON.
+
+        ### Upsert / dedupe
+        `mode`, `key` and `orderBy` work as for `/upload/{tableName}`. Keys refer to fields of the flattened record value, or to `_kafka_key` for the Kafka message key.
       parameters:
         - in: header
           name: X-Kafka-Topic
@@ -1006,6 +1102,9 @@ paths:
           required: false
           description: An alternative to passing the topic via header. Ignored when `X-Kafka-Topic` is also provided and non-empty.
           example: user_events
+        - $ref: '#/components/parameters/IngestMode'
+        - $ref: '#/components/parameters/IngestKey'
+        - $ref: '#/components/parameters/IngestOrderBy'
       requestBody:
         required: true
         content:
@@ -1021,20 +1120,21 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                  message:
-                    type: string
-                  created:
-                    type: integer
-                    description: Epoch timestamp when the records were created
-                  updated:
-                    type: integer
-                    description: Epoch timestamp when the records were last updated
+                $ref: '#/components/schemas/IngestResult'
         '400':
-          description: Bad request (body is not a JSON array, or topic name fails identifier validation)
+          description: Bad request (body is not a JSON array, topic name fails identifier validation, invalid mode, or a keyed-mode validation error as for /upload/{tableName})
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: No write access to the existing table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Keyed modes - key mismatch or commit conflicts on every retry; nothing was written
           content:
             application/json:
               schema:
@@ -1308,6 +1408,11 @@ paths:
       summary: Upload JSON data to the default table (ichibi_table)
       description: |
         Uploads an array of JSON objects. If the table does not exist, it will be created dynamically.
+        See `/upload/{tableName}` for the `mode`, `key` and `orderBy` parameters.
+      parameters:
+        - $ref: '#/components/parameters/IngestMode'
+        - $ref: '#/components/parameters/IngestKey'
+        - $ref: '#/components/parameters/IngestOrderBy'
       requestBody:
         required: true
         content:
@@ -1328,22 +1433,21 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: true
-                  message:
-                    type: string
-                    example: Inserted 2 records into ichibi_table
-                  created:
-                    type: integer
-                    description: Epoch timestamp when the records were created
-                  updated:
-                    type: integer
-                    description: Epoch timestamp when the records were last updated
+                $ref: '#/components/schemas/IngestResult'
         '400':
-          description: Bad request (e.g. payload is not an array)
+          description: Bad request (payload is not an array, invalid mode, or for keyed modes - no key columns, a key column missing from the batch, a NULL key value, unknown orderBy column)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: No write access to the existing table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Keyed modes - `key` differs from the table's declared keys, or the batch lost the DuckLake commit race to concurrent writes on every retry (INGEST_CONFLICT_RETRIES). Nothing was written; retry.
           content:
             application/json:
               schema:
@@ -1360,8 +1464,12 @@ paths:
       summary: Upload JSON data to a specific table
       description: |
         Uploads an array of JSON objects. If the table does not exist, it will be created dynamically
-        using DuckDB's automatic schema inference. If it exists, records will be appended.
+        using DuckDB's automatic schema inference. If it exists, new columns are added (schema evolution)
+        and records are appended, or with `mode=upsert` / `mode=dedupe` written by key (README section 9.2).
       parameters:
+        - $ref: '#/components/parameters/IngestMode'
+        - $ref: '#/components/parameters/IngestKey'
+        - $ref: '#/components/parameters/IngestOrderBy'
         - in: path
           name: tableName
           schema:
@@ -1389,22 +1497,21 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: true
-                  message:
-                    type: string
-                    example: Inserted 2 records into test_table
-                  created:
-                    type: integer
-                    description: Epoch timestamp when the records were created
-                  updated:
-                    type: integer
-                    description: Epoch timestamp when the records were last updated
+                $ref: '#/components/schemas/IngestResult'
         '400':
-          description: Bad request (e.g. payload is not an array)
+          description: Bad request (payload is not an array, invalid mode, or for keyed modes - no key columns, a key column missing from the batch, a NULL key value, unknown orderBy column)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: No write access to the existing table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Keyed modes - `key` differs from the table's declared keys, or the batch lost the DuckLake commit race to concurrent writes on every retry (INGEST_CONFLICT_RETRIES). Nothing was written; retry.
           content:
             application/json:
               schema:
@@ -1690,7 +1797,46 @@ components:
       type: http
       scheme: bearer
       description: METRICS_TOKEN (GET /metrics only).
+  parameters:
+    IngestMode:
+      in: query
+      name: mode
+      required: false
+      schema:
+        type: string
+        enum: [append, upsert, dedupe]
+        default: append
+      description: |
+        `append` inserts every row. `upsert` replaces rows whose key matches an incoming row (whole-row replace; `created` kept, `updated` set to now) and inserts rows with a new key. `dedupe` inserts only rows whose key does not exist yet. The keyed modes use the table's declared key columns (`PUT /tables/{tableName}/keys`) and write the batch atomically with one MERGE INTO; a batch that keeps losing DuckLake commit races to concurrent writes returns 409 and writes nothing.
+    IngestKey:
+      in: query
+      name: key
+      required: false
+      schema:
+        type: string
+      example: region,device_id
+      description: Keyed modes only. Comma-separated key columns, in key order. Declares the keys when the table has none yet (required to upsert into a table that does not exist); must equal the declared keys otherwise (409).
+    IngestOrderBy:
+      in: query
+      name: orderBy
+      required: false
+      schema:
+        type: string
+      example: version
+      description: Keyed modes only. When the batch holds several rows with the same key, keep the one with the highest value of this column (ties and default without orderBy - upsert keeps the last occurrence, dedupe the first).
   schemas:
+    IngestResult:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        message: { type: string, example: 'Upserted 2 records into customers: 1 inserted, 1 updated' }
+        mode: { type: string, enum: [append, upsert, dedupe] }
+        keys: { type: array, items: { type: string }, description: Keyed modes - the key columns used }
+        received: { type: integer, description: Keyed modes - rows in the request }
+        inserted: { type: integer, description: Rows inserted }
+        updated: { type: integer, description: upsert - existing rows replaced }
+        skipped: { type: integer, description: dedupe - rows skipped because their key exists }
+        duplicates: { type: integer, description: Keyed modes - rows collapsed because the batch repeated a key }
     Readiness:
       type: object
       properties:

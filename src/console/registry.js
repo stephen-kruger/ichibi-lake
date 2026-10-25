@@ -91,6 +91,12 @@ export const SETTINGS = [
         },
     },
     {
+        key: 'INGEST_CONFLICT_RETRIES', section: 'ingestion', type: 'number', default: '10',
+        min: 1, max: 100, editable: true, live: true, label: 'Upsert conflict retries',
+        help: 'How often an upsert/dedupe batch is retried when a concurrent write to the same table wins the DuckLake commit. ' +
+            'When every attempt loses, the request fails with HTTP 409 and nothing from the batch is written.',
+    },
+    {
         key: 'JSON_BODY_LIMIT', section: 'ingestion', type: 'string', default: '50mb',
         editable: false, label: 'JSON body limit', help: 'Maximum JSON request size.',
     },
@@ -183,6 +189,18 @@ export const SETTINGS = [
     { key: 'KAFKA_GROUP_ID', section: 'kafka', type: 'string', default: 'ducklake-ingestion-group', editable: false, label: 'Consumer group' },
     { key: 'KAFKA_BATCH_SIZE', section: 'kafka', type: 'number', default: '100', editable: false, label: 'Batch size' },
     { key: 'KAFKA_BATCH_TIMEOUT_MS', section: 'kafka', type: 'number', default: '5000', editable: false, label: 'Batch timeout (ms)' },
+    {
+        key: 'KAFKA_INGEST_MODES', section: 'kafka', type: 'string', default: '', editable: true, live: true,
+        label: 'Ingestion mode per topic',
+        help: 'Comma-separated topic=mode[:key1+key2] entries, e.g. "customers=upsert:customer_id,devices=dedupe:device_id+region". ' +
+            'Modes: append (default), upsert, dedupe. "*" sets the default for all other topics. Keys declare the table\'s key columns ' +
+            'when it has none yet; keys declared on the table (PUT /tables/:tableName/keys or the Schema tab) take precedence.',
+        validate: (v) => {
+            const bad = String(v).split(',').map(s => s.trim()).filter(Boolean)
+                .filter(e => !/^[A-Za-z0-9_.*-]+\s*=\s*(append|upsert|dedupe)(:[A-Za-z_][A-Za-z0-9_]*(\+[A-Za-z_][A-Za-z0-9_]*)*)?$/i.test(e));
+            return bad.length ? `Invalid entr${bad.length === 1 ? 'y' : 'ies'}: ${bad.join(', ')} (expected topic=append|upsert|dedupe[:key1+key2])` : null;
+        },
+    },
     { key: 'KAFKA_PRODUCER_COMPRESSION', section: 'kafka', type: 'enum', options: ['gzip', 'snappy', 'lz4', 'zstd', 'none'], default: 'gzip', editable: false, label: 'Producer compression' },
 
     {
