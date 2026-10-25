@@ -170,6 +170,7 @@ Used when `DUCKLAKE_DATA_PATH` is an `s3://` URL. S3-compatible stores (MinIO, C
 | `S3_USE_SSL` | `true` | `false` for a plain-HTTP endpoint such as a local MinIO |
 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` / `MINIO_BUCKET` | `ichibi-lake` / `change-me-minio-secret` / `ichibi-lake` | Compose `minio` profile only: credentials of the bundled MinIO server and the bucket created at startup |
 | `MINIO_IMAGE` / `MINIO_PORT` / `MINIO_CONSOLE_PORT` | `cgr.dev/chainguard/minio:latest` / `9000` / `9001` | Compose `minio` profile only: image and published host ports |
+| `MINIO_BIND_ADDRESS` | `127.0.0.1` | Compose `minio` profile only: host address the MinIO ports are bound to. `0.0.0.0` makes them reachable from other machines |
 
 ### 3.3 Authentication
 
@@ -265,6 +266,7 @@ Layers 2 to 4 apply to every key, superusers included, on top of layer 1.
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
+| `POSTGRES_PASSWORD` | `postgres` | Password of the bundled Postgres, used by both the `db` and `app` services. Applied by Postgres only when it initialises an empty data directory: see [§4.3](#43-production-checklist) to change it on an existing lake |
 | `KAFKA_LOG_RETENTION_HOURS` | `48` | Kafka log retention in hours |
 | `KAFKA_LOG_RETENTION_BYTES` | `1073741824` | Kafka log retention in bytes per partition |
 | `KAFKA_LOG_SEGMENT_BYTES` | `268435456` | Kafka segment size before roll |
@@ -374,7 +376,8 @@ pm2 startup
 - **Kafka retention** — Set `KAFKA_LOG_RETENTION_HOURS` and `KAFKA_LOG_RETENTION_BYTES` to bound disk usage
 - **Use a reverse proxy** — Place behind nginx, Caddy, or a cloud LB for TLS termination and rate limiting
 - **Claim the admin console** — Complete first-run setup at `/console` right after deploying, and serve it over HTTPS (session cookies are marked `Secure` when the request is HTTPS)
-- **Lock down Postgres and Kafka ports** — `compose.yaml` publishes Postgres on host port `5432` with the default `postgres`/`postgres` login, and Kafka on `9092`/`9094`. Anyone who can reach them can read or change the metadata catalog directly. Change the password (it is set in `compose.yaml` as both `POSTGRES_PASSWORD` for the `db` service and `DUCKLAKE_PG_PASSWORD` for the `app` service; keep them equal), and bind the ports to `127.0.0.1` or remove them if nothing outside Docker needs them
+- **Exposed ports** — `compose.yaml` publishes only the gateway (`3333`) on every interface. Postgres has no published port and sits on an internal network that only the gateway joins (use `docker compose exec db psql -U postgres ducklake` for ad-hoc access). Kafka has no published ports either (it has no authentication; send messages through `POST /kafka-sink`), and the optional MinIO ports (`9000`/`9001`) are bound to `127.0.0.1`. The gateway container drops all Linux capabilities, and no container can gain privileges (`no-new-privileges`)
+- **Change the Postgres password** — set `POSTGRES_PASSWORD` in `docker/.env` (the default is `postgres`). Postgres only applies it when it creates an empty data directory, so on an existing lake run `docker compose exec db psql -U postgres -c "ALTER USER postgres PASSWORD '<new>'"` first, then set `POSTGRES_PASSWORD=<new>` and `docker compose up -d`
 - **Wire up health checks and metrics** — point your load balancer / orchestrator readiness probe at `GET /health/ready` and liveness at `GET /health`; set `METRICS_TOKEN` and scrape `GET /metrics` (see [§14](#14-operations-health-metrics--limits))
 - **Decide on snapshot retention if you prune data** — set `SNAPSHOT_RETENTION_DAYS` so deleted rows actually free storage (see [§13.2](#132-features))
 - **Put the lake on object storage** for durability and multi-host deployments — see [§4.6](#46-object-storage-s3--minio). Keep [lake maintenance](#47-lake-maintenance-small-files) enabled; with inlining it is what turns small writes into Parquet files
@@ -437,7 +440,7 @@ S3_SECRET_KEY=<the same secret>
 S3_USE_SSL=false
 ```
 
-Then `docker compose up -d --build`. MinIO keeps its data in `docker/data/minio/`; its web console is on host port `9001`. The `minio/minio` images are no longer published on Docker Hub or quay.io, so the profile uses Chainguard's build (`cgr.dev/chainguard/minio`, set `MINIO_IMAGE` to use another).
+Then `docker compose up -d --build`. MinIO keeps its data in `docker/data/minio/`; its web console is on `http://localhost:9001` (bound to `127.0.0.1`; see `MINIO_BIND_ADDRESS`). The `minio/minio` images are no longer published on Docker Hub or quay.io, so the profile uses Chainguard's build (`cgr.dev/chainguard/minio`, set `MINIO_IMAGE` to use another).
 
 **AWS S3.** Leave `S3_ENDPOINT` empty and set `S3_REGION`. Either set `S3_ACCESS_KEY`/`S3_SECRET_KEY`, or leave them empty to use the credential chain (instance/task role). The IAM policy needs `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `prefix/*`.
 

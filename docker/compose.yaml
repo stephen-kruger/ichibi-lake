@@ -9,15 +9,24 @@ services:
       dockerfile: docker/Dockerfile
     container_name: ichibi-lake
     hostname: ichibi-lake
-    # The Node gateway listens on ${PORT:-3000}
+    # The Node gateway listens on ${PORT:-3000}. This is the only port that is
+    # published on every host interface: it serves the REST API, Swagger UI and
+    # the admin console. Everything else stays on the Docker networks (or on
+    # 127.0.0.1 where a host-side client needs it).
     ports:
       - "${PORT:-3333}:${PORT:-3000}"
+    # The gateway needs no Linux capabilities (it listens on an unprivileged
+    # port and only writes to directories it owns), and must never gain any.
+    cap_drop: [ "ALL" ]
+    security_opt: [ "no-new-privileges:true" ]
     environment:
       # DuckLake metadata Postgres (consumed by src/db.js).
       - DUCKLAKE_PG_HOST=db
       - DUCKLAKE_PG_PORT=5432
       - DUCKLAKE_PG_USER=postgres
-      - DUCKLAKE_PG_PASSWORD=postgres
+      # Must equal the db service's password (both read POSTGRES_PASSWORD from
+      # docker/.env). See the db service before changing it on an existing lake.
+      - DUCKLAKE_PG_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - DUCKLAKE_PG_DB=ducklake
       # Where DuckLake writes Parquet data files: a local directory (default,
       # persisted via the bind mount to docker/data/ducklake) or an s3:// URL.
@@ -95,6 +104,7 @@ services:
       - "host.docker.internal:host-gateway"
     networks:
       - app-network
+      - db-network
     depends_on:
       db:
         condition: service_healthy
@@ -127,6 +137,8 @@ services:
     image: postgres:17
     container_name: ichibi-lake-postgres-init
     user: "0:0"
+    # Touches only its bind mount: no network at all.
+    network_mode: none
     entrypoint:
       - sh
       - -c
@@ -138,11 +150,16 @@ services:
   db:
     container_name: ichibi-lake-postgres
     image: postgres:17
-    ports:
-      - "5432:5432"
+    # No published port: only the gateway talks to Postgres, over db-network,
+    # an internal network that nothing else joins and that has no route out.
+    # For ad-hoc access use `docker compose exec db psql -U postgres ducklake`.
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      # Set POSTGRES_PASSWORD in docker/.env. Postgres only applies it when it
+      # initialises an EMPTY data directory: on an existing lake, first run
+      #   docker compose exec db psql -U postgres -c "ALTER USER postgres PASSWORD '<new>'"
+      # then set POSTGRES_PASSWORD=<new> and `docker compose up -d`.
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - POSTGRES_DB=ducklake
     depends_on:
       postgres-init:
@@ -176,7 +193,8 @@ services:
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     networks:
-      - app-network
+      - db-network
+    security_opt: [ "no-new-privileges:true" ]
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres" ]
       interval: 5s
@@ -198,6 +216,8 @@ services:
     image: apache/kafka:4.3.1
     container_name: ichibi-lake-kafka-init
     user: "0:0"
+    # Touches only its bind mount: no network at all.
+    network_mode: none
     entrypoint: ["sh", "-c", "chown -R 1000:1000 /var/lib/kafka/data"]
     volumes:
       - ./data/kafka:/var/lib/kafka/data
@@ -209,22 +229,16 @@ services:
     depends_on:
       kafka-init:
         condition: service_completed_successfully
-    ports:
-      - "9092:9092"
-      # External listener for clients running on the docker host (e.g. the
-      # node integration tests in test/test-kafka-sse.js). The PLAINTEXT
-      # listener advertises kafka:9092 which only resolves inside the docker
-      # network; the EXTERNAL listener advertises localhost:9094 so kafkajs
-      # clients on the host can complete the bootstrap → metadata → produce
-      # round trip without DNS failures.
-      - "9094:9094"
+    # No published ports: the broker has no authentication, and only the
+    # gateway uses it (kafka:9092 on app-network). Clients outside Docker send
+    # messages through the gateway's POST /kafka-sink instead.
     environment:
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_NODE_ID: 1
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -254,6 +268,7 @@ services:
       - ./data/kafka:/var/lib/kafka/data
     networks:
       - app-network
+    security_opt: [ "no-new-privileges:true" ]
     healthcheck:
       test: [ "CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list" ]
       interval: 10s
@@ -278,13 +293,17 @@ services:
     environment:
       - MINIO_ROOT_USER=${MINIO_ROOT_USER:-ichibi-lake}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-change-me-minio-secret}
+    # The gateway reaches MinIO as minio:9000 on the Docker network. The host
+    # ports (S3 API and web console) are bound to 127.0.0.1 so only this
+    # machine can use them; set MINIO_BIND_ADDRESS=0.0.0.0 to share them.
     ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${MINIO_BIND_ADDRESS:-127.0.0.1}:${MINIO_PORT:-9000}:9000"
+      - "${MINIO_BIND_ADDRESS:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - ./data/minio:/data
     networks:
       - app-network
+    security_opt: [ "no-new-privileges:true" ]
     restart: unless-stopped
 
   # One-shot: wait for MinIO and create the bucket (idempotent). Uses curl's
@@ -314,3 +333,8 @@ services:
 networks:
   app-network:
     driver: bridge
+  # Postgres only. internal: no published ports work on it and containers on
+  # it have no route out, so the catalog is reachable from the gateway alone.
+  db-network:
+    driver: bridge
+    internal: true

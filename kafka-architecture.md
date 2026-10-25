@@ -124,12 +124,10 @@ data: {"error":"<message>"}
 
 ## Docker Compose Configuration
 
-Both `docker/compose.yaml` and `docker-tailscale/compose.yaml` include:
+`docker/compose.yaml` includes:
 
 - **Kafka service**: `apache/kafka:4.3.1` in KRaft mode (single node, no ZooKeeper)
-- Two listeners exposed:
-  - `PLAINTEXT` on `9092`, advertised as `kafka:9092` — used by the gateway and any other client running inside the docker network.
-  - `EXTERNAL` on `9094`, advertised as `localhost:9094` — used by clients running on the docker host (e.g. the node integration tests in `test/test-kafka-sse.js`). Required because kafkajs follows the broker-advertised address, and `kafka` does not resolve outside the docker network.
+- One client listener: `PLAINTEXT` on `9092`, advertised as `kafka:9092`, used by the gateway inside the docker network. The broker has no authentication, so **no port is published on the host**; clients outside Docker produce through the gateway's `POST /kafka-sink`, and subscribe through `GET /kafka-subscribe/:topicName`.
 - Healthcheck via `/opt/kafka/bin/kafka-topics.sh --list`
 - KRaft logs bind-mounted to `./data/kafka` (via `KAFKA_LOG_DIRS=/var/lib/kafka/data`) so retention behaviour is observable on the host.
 - Environment:
@@ -138,9 +136,9 @@ Both `docker/compose.yaml` and `docker-tailscale/compose.yaml` include:
 KAFKA_PROCESS_ROLES: broker,controller
 KAFKA_NODE_ID: 1
 KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9094
-KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
-KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
 KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
 KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
 KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -178,7 +176,7 @@ The `KAFKA_LOG_RETENTION_*` / `KAFKA_LOG_SEGMENT_BYTES` settings bound on-disk u
 
 - Docker Compose stack running: `docker compose -f docker/compose.yaml up -d`
 - Both `kafka` and `app` services healthy
-- Kafka broker accessible at `localhost:9092` (mapped from container)
+- No direct broker access is needed: the test talks only to the gateway's HTTP API
 
 ### How the test works (`test-kafka-sse.js`)
 
