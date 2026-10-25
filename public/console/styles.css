@@ -91,6 +91,8 @@ h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 .nav a:hover { background: rgba(255,255,255,0.05); color: #fff; }
 .nav a.active { background: var(--sidebar-active); color: #fff; box-shadow: inset 3px 0 0 var(--ochre); }
 .nav svg { width: 17px; height: 17px; flex: none; opacity: 0.9; }
+.nav .nav-external { margin-left: auto; display: grid; }
+.nav .nav-external svg { width: 13px; height: 13px; opacity: 0.6; }
 
 .sidebar-footer { padding: 14px 16px; border-top: 1px solid rgba(255,255,255,0.06); display: flex; align-items: center; gap: 10px; }
 .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--ochre); color: #fff; display: grid;

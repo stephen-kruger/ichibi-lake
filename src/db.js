@@ -38,10 +38,6 @@ export function invalidateColumnCache(tableName) {
 const PRIMARY_POOL_SIZE = Math.max(1, parseInt(process.env.PRIMARY_POOL_SIZE || '4', 10));
 const primaryPool = [];
 
-// Explicitly sized Parquet row groups so DuckLake doesn't write millions of
-// tiny row groups (which kills scan performance). Overridable via env var.
-const PARQUET_ROW_GROUP_SIZE = Math.max(1000, parseInt(process.env.PARQUET_ROW_GROUP_SIZE || '100000', 10));
-
 // Optimizers that must be disabled to avoid a DuckDB engine bug that corrupts
 // VARCHAR columns read from DuckLake inline (Postgres-resident) row data under
 // blocking operators (ORDER BY / DISTINCT / GROUP BY). DuckLake exposes

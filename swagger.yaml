@@ -41,7 +41,7 @@ info:
     a graph from the registry on whichever instance runs a query. The registry is the single
     source of truth; querying a graph that is not registered returns `404`.
     DuckPGQ is pinned to DuckDB 1.5.0 and can be disabled with `DISABLE_DUCKPGQ=1`.
-  version: 1.6.24.1
+  version: 1.6.25.1
 servers:
   - url: http://ichibi-lake:3333
     description: ichibi-lake gateway
@@ -1328,13 +1328,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Keyed modes - key mismatch or commit conflicts on every retry; nothing was written
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '409':
-          description: Idempotency-Key conflict (used for a different request, or the first request is still running)
+          description: "Keyed modes - key mismatch or commit conflicts on every retry; nothing was written. Or an Idempotency-Key conflict: the key was used for a different request, or the first request is still running (with Retry-After)."
           content:
             application/json:
               schema:
@@ -1663,13 +1657,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Keyed modes - `key` differs from the table's declared keys, or the batch lost the DuckLake commit race to concurrent writes on every retry (INGEST_CONFLICT_RETRIES). Nothing was written; retry.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '409':
-          description: Idempotency-Key conflict (used for a different request, or the first request is still running)
+          description: "Keyed modes - `key` differs from the table's declared keys, or the batch lost the DuckLake commit race to concurrent writes on every retry (INGEST_CONFLICT_RETRIES). Nothing was written; retry. Or an Idempotency-Key conflict: the key was used for a different request, or the first request is still running (with Retry-After)."
           content:
             application/json:
               schema:
@@ -1736,13 +1724,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
-          description: Keyed modes - `key` differs from the table's declared keys, or the batch lost the DuckLake commit race to concurrent writes on every retry (INGEST_CONFLICT_RETRIES). Nothing was written; retry.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '409':
-          description: Idempotency-Key conflict (used for a different request, or the first request is still running)
+          description: "Keyed modes - `key` differs from the table's declared keys, or the batch lost the DuckLake commit race to concurrent writes on every retry (INGEST_CONFLICT_RETRIES). Nothing was written; retry. Or an Idempotency-Key conflict: the key was used for a different request, or the first request is still running (with Retry-After)."
           content:
             application/json:
               schema:
@@ -2021,22 +2003,6 @@ paths:
                 $ref: '#/components/schemas/Error'
 
 components:
-  parameters:
-    IdempotencyKey:
-      in: header
-      name: Idempotency-Key
-      required: false
-      schema:
-        type: string
-        maxLength: 255
-      description: |
-        Makes a retry safe. The first request with a key runs normally and, when it succeeds (2xx), its response is
-        stored for `IDEMPOTENCY_TTL_HOURS` (default 24). A later request with the same key and the same method, path,
-        query and body gets that response back with header `Idempotent-Replayed: true`, without writing anything
-        again. The same key with a different request is 409; while the first request is still running, 409 with
-        `Retry-After`. A request that fails releases its key. Keys are scoped to the API key that sends them;
-        1-255 printable ASCII characters.
-      example: 3f2a6c1e-batch-0001
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
@@ -2073,6 +2039,21 @@ components:
         type: string
       example: version
       description: Keyed modes only. When the batch holds several rows with the same key, keep the one with the highest value of this column (ties and default without orderBy - upsert keeps the last occurrence, dedupe the first).
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: false
+      schema:
+        type: string
+        maxLength: 255
+      description: |
+        Makes a retry safe. The first request with a key runs normally and, when it succeeds (2xx), its response is
+        stored for `IDEMPOTENCY_TTL_HOURS` (default 24). A later request with the same key and the same method, path,
+        query and body gets that response back with header `Idempotent-Replayed: true`, without writing anything
+        again. The same key with a different request is 409; while the first request is still running, 409 with
+        `Retry-After`. A request that fails releases its key. Keys are scoped to the API key that sends them;
+        1-255 printable ASCII characters.
+      example: 3f2a6c1e-batch-0001
   schemas:
     IngestResult:
       type: object

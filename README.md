@@ -1,4 +1,4 @@
-# ichibi-lake Gateway v1.6.18.1
+# ichibi-lake Gateway v1.6.25.1
 
 ![ichibi-lake](graphics/ichibi-lake-2.jpg "iChibi Lake")
 
@@ -1286,6 +1286,7 @@ The side menu groups pages by area. **Admins** can change everything; **viewers*
 | **Security / Ingestion / Query Engine / Storage / Kafka** | Effective configuration, showing each value's source (default, `docker/.env`, or console override) |
 | **Audit Log** | Who changed what, from which IP, across all instances |
 | **My Account** | Change your own password |
+| **API Reference** | Opens the Swagger UI (the gateway root, `/`) in a new tab |
 
 **How settings work.** Console changes are stored as overrides in DuckLake, so every gateway instance shares them (instances refresh every 30 s) and they survive restarts and image rebuilds. Only settings the gateway reads on use are editable, and they **apply immediately**:
 
