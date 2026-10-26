@@ -247,7 +247,7 @@ async function testS3(cfg, { current = false, expectFiles = [] } = {}) {
             const back = (await conn.runAndReadAll(`SELECT probe FROM read_parquet('${probe.replace(/'/g, "''")}')`)).getRows();
             if (back[0]?.[0] !== 'ok') throw new Error('read back a different value');
             // Other files at the location (earlier probes do not count).
-            const files = (await conn.runAndReadAll(`SELECT count(*) FROM glob('${(cfg.dataPath + '**').replace(/'/g, "''")}') WHERE file NOT LIKE '%/_ichibi_probe/%'`)).getRows();
+            const files = (await conn.runAndReadAll(`SELECT count(*) FROM glob('${(cfg.dataPath + '**').replace(/'/g, "''")}') WHERE file NOT LIKE '%/\\_ichibi\\_probe/%' ESCAPE '\\'`)).getRows();
             return Number(files[0][0]);
         };
         const others = await withTimeout(run(), TEST_TIMEOUT_MS, () => { try { conn.interrupt(); } catch (_) { /* ignore */ } });
