@@ -387,3 +387,33 @@ label.checkbox.callout[hidden] { display: none; }
     .col-editor-row { grid-template-columns: 1fr 1fr; }
     .form-grid { grid-template-columns: 1fr; }
 }
+
+/* --- AI pages ------------------------------------------------------------------------ */
+.btn[hidden] { display: none; }
+a.btn { text-decoration: none; }
+textarea.sql-editor, textarea.ai-input { width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+    color: var(--text); resize: vertical; }
+textarea.sql-editor { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; tab-size: 4; }
+textarea.ai-input { font: inherit; }
+textarea:focus { outline: 2px solid var(--lake-soft); outline-offset: 1px; border-color: var(--lake-soft); }
+textarea[readonly] { background: var(--surface-2); color: var(--text-muted); }
+.ai-thread { display: flex; flex-direction: column; }
+.ai-question { display: flex; gap: 10px; align-items: flex-start; font-weight: 550; white-space: pre-wrap; }
+.ai-question .avatar { width: 26px; height: 26px; font-size: 12px; }
+.ai-answer { white-space: pre-wrap; overflow-wrap: anywhere; }
+pre.code { font-family: var(--mono); font-size: 12.5px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; margin: 6px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ai-steps ol.steps { margin: 0; padding-left: 20px; }
+.ai-steps ol.steps li + li { margin-top: 10px; }
+.ai-result { border-top: 1px solid var(--border); padding-top: 14px; }
+.ai-result .action-row { margin: 0; }
+.ai-result textarea { margin-bottom: 10px; }
+.result-summary { margin-bottom: 6px; }
+.grid-wrap.result-grid { max-height: 420px; min-height: 0; border: 1px solid var(--border); border-radius: 8px; }
+.ai-composer { display: flex; flex-direction: column; gap: 10px; }
+.ai-composer .action-row { margin: 0; }
+.ai-pending { display: flex; align-items: center; gap: 10px; }
+.spinner { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent); animation: spin 0.8s linear infinite; flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.params[hidden] { display: none; }
+.params .field { margin-bottom: 0; }

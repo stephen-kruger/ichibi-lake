@@ -8,6 +8,7 @@
  * credentials via CONSOLE_ADMIN_USER / CONSOLE_ADMIN_PASSWORD.
  */
 import { execFileSync } from 'child_process';
+import http from 'http';
 import { API_KEY, BASE_URL } from './_env.js';
 import { readZip } from './zip-reader.js';
 
@@ -898,17 +899,163 @@ async function run() {
         });
         await admin('DELETE', `/data/tables/${STO}`, { confirm: STO });
 
+        // Ask AI, against a scripted OpenAI-compatible mock on this host. The
+        // gateway reaches it at AI_MOCK_HOST (host.docker.internal by default).
+        console.log('\n▸ Ask AI & saved functions');
+        const AIT = `ci_ai_${TS}`;
+        const before = (await admin('GET', '/ai/settings')).data;
+        if (before.settings?.some(s => s.source === 'console')) {
+            console.warn('  ! Skipping Ask AI tests: AI settings are saved in this console and would be overwritten.');
+        } else {
+            const modelCalls = [];
+            const mock = http.createServer((req, res) => {
+                let body = '';
+                req.on('data', (c) => { body += c; });
+                req.on('end', () => {
+                    const b = body ? JSON.parse(body) : {};
+                    modelCalls.push({ url: req.url, auth: req.headers.authorization, body: b });
+                    const reply = (message) => res.end(JSON.stringify({ model: 'mock-model', choices: [{ message }], usage: { total_tokens: 10 } }));
+                    res.setHeader('Content-Type', 'application/json');
+                    if (req.url.endsWith('/models')) return res.end(JSON.stringify({ data: [{ id: 'mock-model' }] }));
+                    if (b.tool_choice && typeof b.tool_choice === 'object') {
+                        return reply({ role: 'assistant', tool_calls: [{ id: 'p', type: 'function', function: { name: 'ping', arguments: '{}' } }] });
+                    }
+                    if (b.messages?.at(-1)?.content === 'FAIL') {
+                        res.statusCode = 502;
+                        return res.end(JSON.stringify({ error: { code: 502, message: 'Provider returned error', metadata: { provider_name: 'MockProvider' } } }));
+                    }
+                    const tools = (b.messages || []).filter(m => m.role === 'tool').length;
+                    const call = (id, name, args) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } });
+                    if (tools === 0) {
+                        return reply({ role: 'assistant', content: null, tool_calls: [
+                            call('a', 'describe_table', { table: AIT }), call('b', 'run_sql', { sql: 'SELECT * FROM _console_users' })] });
+                    }
+                    if (tools === 2) {
+                        return reply({ role: 'assistant', content: null, tool_calls: [
+                            call('c', 'run_sql', { sql: `SELECT region, sum(amount) AS total FROM ${AIT} GROUP BY region ORDER BY region`, purpose: 'totals' })] });
+                    }
+                    return reply({ role: 'assistant', content: 'North has the highest total.' });
+                });
+            });
+            await new Promise(r => mock.listen(0, '0.0.0.0', r));
+            const mockUrl = `http://${process.env.AI_MOCK_HOST || 'host.docker.internal'}:${mock.address().port}/v1`;
+            try {
+                const csv = ['region,amount', 'North,10', 'North,20', 'South,5', "O'Hare,7"].join('\n');
+                await admin('POST', `/data/import?filename=a.csv&table=${AIT}&mode=create`, undefined, { rawBody: csv });
+
+                await test('AI settings come with defaults and never return the key', async () => {
+                    assert(before.settings.find(s => s.key === 'OPENAI_BASE_URL').value, JSON.stringify(before));
+                    assert(before.settings.find(s => s.key === 'OPENAI_API_KEY').value === '', 'key value must be empty');
+                });
+                await test('settings are validated and saved as console overrides', async () => {
+                    assert((await admin('PUT', '/ai/settings', { values: { OPENAI_BASE_URL: 'nope' } })).status === 400, 'bad url');
+                    const r = await admin('PUT', '/ai/settings', { values: { OPENAI_BASE_URL: mockUrl, OPENAI_MODEL: 'mock-model', OPENAI_API_KEY: 'sk-ci-secret-value-123', AI_SAMPLE_ROWS: 2 } });
+                    assert(r.status === 200 && r.data.changed.length === 4, JSON.stringify(r.data));
+                    assert(!JSON.stringify(r.data).includes('secret-value'), 'key leaked');
+                    const again = await admin('PUT', '/ai/settings', { values: { OPENAI_MODEL: 'mock-model', OPENAI_API_KEY: '' } });
+                    assert(again.data.changed.length === 0, 'unchanged values and an empty key are not saved');
+                });
+                await test('connection test reaches the model with the saved key', async () => {
+                    const r = await admin('POST', '/ai/settings/test', { values: {} });
+                    assert(r.status === 200 && r.data.ok, JSON.stringify(r.data));
+                    assert(modelCalls.every(c => c.auth === 'Bearer sk-ci-secret-value-123'), 'bearer token');
+                });
+                let answer;
+                await test('a question is answered through tool calls; system tables are refused', async () => {
+                    modelCalls.length = 0;
+                    const r = await admin('POST', '/ai/ask', { question: 'Which region sells most?' });
+                    assert(r.status === 200, JSON.stringify(r.data));
+                    answer = r.data;
+                    assert(answer.answer === 'North has the highest total.', answer.answer);
+                    assert(answer.steps.length === 3 && answer.steps[0].ok && !answer.steps[1].ok && answer.steps[2].ok, JSON.stringify(answer.steps));
+                    assert(/not found|not allowed/i.test(answer.steps[1].error), answer.steps[1].error);
+                    assert(JSON.stringify(answer.result.rows) === JSON.stringify([['North', 30], ["O'Hare", 7], ['South', 5]]), JSON.stringify(answer.result));
+                    const system = modelCalls[0].body.messages[0].content;
+                    assert(system.includes(AIT) && system.includes('amount'), 'schema in the system prompt');
+                    assert(!system.includes('_console_users'), 'system tables must not be listed');
+                    const lastTool = JSON.parse(modelCalls[2].body.messages.filter(m => m.role === 'tool').pop().content);
+                    assert(lastTool.rows.length === 2 && lastTool.rowCount === 3, `AI_SAMPLE_ROWS caps rows sent to the model: ${JSON.stringify(lastTool)}`);
+                });
+                await test('model API errors are shown as is, not as "Internal error"', async () => {
+                    const r = await admin('POST', '/ai/ask', { question: 'FAIL' });
+                    assert(r.status === 502 && /HTTP 502: Provider returned error \(provider: MockProvider\)/.test(r.data.error), JSON.stringify(r.data));
+                });
+                await test('follow-up questions resend earlier turns', async () => {
+                    modelCalls.length = 0;
+                    await admin('POST', '/ai/ask', { question: 'And the lowest?', history: [{ question: 'Which region sells most?', answer: answer.answer, sql: answer.result.sql }] });
+                    const roles = modelCalls[0].body.messages.map(m => m.role);
+                    assert(roles.join(',') === 'system,user,assistant,user', roles.join(','));
+                });
+                await test('edited SQL runs read-only; writes and system tables are refused', async () => {
+                    const ok = await admin('POST', '/ai/run', { sql: `SELECT count(*) AS n FROM ${AIT}` });
+                    assert(ok.status === 200 && ok.data.rows[0][0] === 4, JSON.stringify(ok.data));
+                    assert((await admin('POST', '/ai/run', { sql: `DELETE FROM ${AIT}` })).status === 403, 'delete');
+                    assert((await admin('POST', '/ai/run', { sql: 'SELECT * FROM _console_users' })).status >= 400, 'system table');
+                    assert((await admin('POST', '/ai/run', { sql: "SELECT * FROM read_csv('/etc/passwd')" })).status === 403, 'table function');
+                    assert((await admin('POST', '/ai/run', { sql: `SELECT 1; SELECT 2` })).status >= 400, 'two statements');
+                    assert((await admin('POST', '/ai/run', { sql: 'SELEC 1' })).status === 400, 'syntax error');
+                });
+                let fnId;
+                await test('a result query is saved as a function with a parameter and run', async () => {
+                    const sql = `SELECT region, sum(amount) AS total FROM ${AIT} WHERE region = {{region}} GROUP BY region`;
+                    const c = await admin('POST', '/ai/functions', { name: `CI totals ${TS}`, description: 'per region', sql, question: 'q' });
+                    assert(c.status === 200 && c.data.function.params[0] === 'region', JSON.stringify(c.data));
+                    fnId = c.data.function.id;
+                    assert((await admin('POST', '/ai/functions', { name: `ci TOTALS ${TS}`, sql })).status === 409, 'duplicate name');
+                    assert((await admin('POST', '/ai/functions', { name: 'bad', sql: `DROP TABLE ${AIT}` })).status === 403, 'unsafe sql');
+                    const r = await admin('POST', `/ai/functions/${fnId}/run`, { params: { region: "O'Hare" } });
+                    assert(r.status === 200 && r.data.rows[0][1] === 7, JSON.stringify(r.data));
+                    const inject = await admin('POST', `/ai/functions/${fnId}/run`, { params: { region: "x' OR '1'='1" } });
+                    assert(inject.status === 200 && inject.data.rowCount === 0, 'parameter values are literals');
+                    assert((await admin('POST', `/ai/functions/${fnId}/run`, {})).status === 400, 'missing parameter');
+                });
+                await test('a function downloads as CSV and can be edited', async () => {
+                    const res = await admin('GET', `/ai/functions/${fnId}/export?params=${encodeURIComponent(JSON.stringify({ region: 'North' }))}`, undefined, { raw: true });
+                    assert(res.status === 200 && /text\/csv/.test(res.headers.get('content-type')), `status ${res.status}`);
+                    assert((await res.text()).trim() === 'region,total\r\nNorth,30', 'csv body');
+                    const u = await admin('PUT', `/ai/functions/${fnId}`, { name: `CI totals ${TS}`, description: 'all', sql: `SELECT count(*) FROM ${AIT}` });
+                    assert(u.status === 200 && u.data.function.params.length === 0, JSON.stringify(u.data));
+                    const list = await admin('GET', '/ai/functions');
+                    assert(list.data.functions.some(f => f.id === fnId && f.description === 'all'), 'listed');
+                });
+                await test('viewers can ask and run functions but not save or configure', async () => {
+                    const name = `ci_viewer_ai_${TS}`, pass = `viewer-ai-pass-${TS}`;
+                    await admin('POST', '/logins', { username: name, password: pass, role: 'viewer' });
+                    try {
+                        const v = client();
+                        await v('POST', '/login', { username: name, password: pass });
+                        assert((await v('POST', `/ai/functions/${fnId}/run`, {})).status === 200, 'viewer run');
+                        assert((await v('POST', '/ai/functions', { name: 'x', sql: 'SELECT 1' })).status === 403, 'viewer save');
+                        assert((await v('PUT', '/ai/settings', { values: {} })).status === 403, 'viewer settings');
+                        assert((await v('POST', '/ai/settings/test', { values: {} })).status === 403, 'viewer test');
+                    } finally {
+                        await admin('DELETE', `/logins/${name}`);
+                    }
+                });
+                await test('functions are deleted and settings revert to docker/.env', async () => {
+                    assert((await admin('DELETE', `/ai/functions/${fnId}`)).status === 200, 'delete');
+                    assert((await admin('GET', `/ai/functions/${fnId}`)).status === 404, 'gone');
+                    const r = await admin('DELETE', '/ai/settings');
+                    assert(r.status === 200 && r.data.settings.every(s => s.source !== 'console'), JSON.stringify(r.data));
+                });
+            } finally {
+                await admin('DELETE', '/ai/settings');
+                await admin('DELETE', `/data/tables/${AIT}`, { confirm: AIT });
+                await new Promise(r => mock.close(r));
+            }
+        }
+
         console.log('\n▸ Overview & audit');
         await test('overview reports gateway and DuckDB details', async () => {
             const r = await admin('GET', '/overview');
             assert(r.status === 200 && r.data.duckdb.version && r.data.gateway.version, JSON.stringify(r.data));
         });
         await test('audit log records console actions', async () => {
-            const r = await admin('GET', '/audit?limit=100');
+            const r = await admin('GET', '/audit?limit=500');
             const actions = new Set(r.data.entries.map(e => e.action));
             for (const a of ['console.login', 'setting.update', 'api_key.revoke', 'login.create', 'prune.rule_create', 'prune.job',
                 'row.update', 'row.insert', 'row.delete', 'schema.add_column', 'schema.alter_column', 'table.rename', 'table.drop', 'table.create',
-                'table.export', 'tables.export', 'table.import']) {
+                'table.export', 'tables.export', 'table.import', 'ai.settings_update', 'ai.ask', 'ai.function_create', 'ai.function_run', 'ai.function_export']) {
                 assert(actions.has(a), `missing audit action ${a}`);
             }
         });

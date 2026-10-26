@@ -39,6 +39,9 @@ export const SECTIONS = [
     { id: 'logins',     group: 'Access',  title: 'Console Logins',    icon: 'lock',      kind: 'custom' },
     { id: 'tables',     group: 'Data',    title: 'Tables & Data',     icon: 'table',     kind: 'custom' },
     { id: 'retention',  group: 'Data',    title: 'Retention & Pruning', icon: 'calendar', kind: 'custom' },
+    { id: 'ai-query',   group: 'AI',      title: 'Ask AI',            icon: 'sparkle',   kind: 'custom' },
+    { id: 'ai-functions', group: 'AI',    title: 'Saved Functions',   icon: 'bolt',      kind: 'custom' },
+    { id: 'ai-settings', group: 'AI',     title: 'AI Settings',       icon: 'tune',      kind: 'custom' },
     { id: 'security',   group: 'Settings', title: 'Security',         icon: 'shield',    kind: 'settings' },
     { id: 'ingestion',  group: 'Settings', title: 'Ingestion',        icon: 'upload',    kind: 'settings' },
     { id: 'query',      group: 'Settings', title: 'Query Engine',     icon: 'search',    kind: 'settings' },
@@ -212,6 +215,41 @@ export const SETTINGS = [
         },
     },
     { key: 'KAFKA_PRODUCER_COMPRESSION', section: 'kafka', type: 'enum', options: ['gzip', 'snappy', 'lz4', 'zstd', 'none'], default: 'gzip', editable: false, label: 'Producer compression' },
+
+    // --- AI (edited on the AI Settings page, see src/console/ai.js) ----------
+    {
+        key: 'OPENAI_BASE_URL', section: 'ai-settings', type: 'string', default: 'https://api.openai.com/v1',
+        editable: true, live: true, hidden: true, label: 'API base URL',
+        help: 'Any OpenAI-compatible Chat Completions API: OpenAI, Azure OpenAI, OpenRouter, a local Ollama or LM Studio (e.g. http://host.docker.internal:11434/v1), ...',
+        validate: (v) => (/^https?:\/\/[^\s/]+/i.test(v) ? null : 'Must be an http:// or https:// URL'),
+    },
+    {
+        key: 'OPENAI_API_KEY', section: 'ai-settings', type: 'secret', default: '',
+        editable: true, live: true, hidden: true, label: 'API key',
+        help: 'Sent as a Bearer token. Leave empty for local servers that need none.',
+    },
+    {
+        key: 'OPENAI_MODEL', section: 'ai-settings', type: 'string', default: 'gpt-4o-mini',
+        editable: true, live: true, hidden: true, label: 'Model',
+        help: 'Model name; it must support tool (function) calling.',
+        validate: (v) => (v ? null : 'A model name is required'),
+    },
+    {
+        key: 'AI_REQUEST_TIMEOUT_MS', section: 'ai-settings', type: 'number', default: '120000',
+        min: 1000, max: 600000, editable: true, live: true, hidden: true, label: 'Model request timeout (ms)',
+        help: 'Limit for each call to the model API. Reasoning ("thinking") models can need several minutes for hard questions.',
+    },
+    {
+        key: 'AI_MAX_STEPS', section: 'ai-settings', type: 'number', default: '8',
+        min: 1, max: 30, editable: true, live: true, hidden: true, label: 'Max tool calls per question',
+        help: 'How many queries and table lookups the model may make while answering one question.',
+    },
+    {
+        key: 'AI_SAMPLE_ROWS', section: 'ai-settings', type: 'number', default: '20',
+        min: 0, max: 500, editable: true, live: true, hidden: true, label: 'Rows shared with the model',
+        help: 'Rows of each query result (and of table samples) sent to the model. 0: the model only sees table schemas, ' +
+            'column names and row counts, never data values.',
+    },
 
     {
         key: 'SNAPSHOT_RETENTION_DAYS', section: 'storage', type: 'number', default: '',

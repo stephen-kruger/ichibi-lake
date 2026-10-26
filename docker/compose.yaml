@@ -94,6 +94,15 @@ services:
       # Bearer token for GET /metrics (Prometheus). When empty, /metrics
       # requires a superuser API key instead.
       - METRICS_TOKEN=${METRICS_TOKEN:-}
+      # Ask AI in the admin console: any OpenAI-compatible Chat Completions API
+      # with tool calling. All of these can also be changed on the console's
+      # AI Settings page (saved values take precedence over these).
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-}
+      - AI_REQUEST_TIMEOUT_MS=${AI_REQUEST_TIMEOUT_MS:-}
+      - AI_MAX_STEPS=${AI_MAX_STEPS:-}
+      - AI_SAMPLE_ROWS=${AI_SAMPLE_ROWS:-}
     volumes:
       # Persist DuckLake Parquet data files across container rebuilds.
       - ./data/ducklake:/app/data_files
