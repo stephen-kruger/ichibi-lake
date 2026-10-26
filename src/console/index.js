@@ -26,6 +26,7 @@ import { isSystemTable, normaliseRule, computeNextRun, matchTables, previewRule,
 import { nextRuns, validateCron, SCHEDULE_PRESETS } from './cron.js';
 import * as data from './data.js';
 import { storageOverview, testStorageForm, saveStorage, autoRestart } from './storage-admin.js';
+import * as ai from './ai.js';
 import { importTempFile, receiveUpload } from '../import.js';
 import {
     listUsers as listRbacUsers, getUserRoles, createUser as createRbacUser, updateUser as updateRbacUser,
@@ -852,6 +853,100 @@ export function createConsoleRouter() {
         res.json({ success: true, ...result });
     }));
 
+    // ---- AI: ask questions, saved functions, model settings (src/console/ai.js) --------------
+    // Asking and running are read-only, so open to every console role; saving
+    // functions and changing the model settings need admin. Unexpected errors
+    // on these routes are shown with their message rather than "Internal
+    // error": they involve an external model and user-written SQL, and the
+    // message is what tells the user what to change.
+    const aiRoute = (fn) => wrap(async (req, res, next) => {
+        try { await fn(req, res, next); } catch (err) {
+            if (!err.statusCode && !err.status) {
+                console.error('[Console] AI error:', err);
+                throw Object.assign(new Error(`Ask AI failed: ${String(err.message || err).split('\n')[0].slice(0, 300)}`), { statusCode: 500, expose: true });
+            }
+            throw err;
+        }
+    });
+    const abortOnClose = (res) => {
+        const abort = new AbortController();
+        res.on('close', () => { if (!res.writableFinished) abort.abort(); });
+        return abort.signal;
+    };
+    const parseParams = (raw) => {
+        if (raw === undefined || raw === null || raw === '') return {};
+        try { return typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { throw httpError(400, 'params must be a JSON object'); }
+    };
+
+    api.get('/ai/settings', (req, res) => res.json(ai.settingsView()));
+
+    api.put('/ai/settings', requireAdmin, aiRoute(async (req, res) => {
+        const changed = await ai.saveSettings(req.body?.values, req.consoleUser.username);
+        if (changed.length) await audit(req, 'ai.settings_update', `Changed ${changed.join(', ')}`);
+        res.json({ success: true, changed, ...ai.settingsView() });
+    }));
+
+    api.delete('/ai/settings', requireAdmin, aiRoute(async (req, res) => {
+        await ai.resetSettings();
+        await audit(req, 'ai.settings_reset', 'AI settings reverted to docker/.env');
+        res.json({ success: true, ...ai.settingsView() });
+    }));
+
+    api.post('/ai/settings/test', requireAdmin, aiRoute(async (req, res) => {
+        res.json(await ai.testSettings(req.body?.values));
+    }));
+
+    api.post('/ai/ask', aiRoute(async (req, res) => {
+        const question = String(req.body?.question ?? '');
+        const result = await ai.ask({ question, history: req.body?.history }, { signal: abortOnClose(res) });
+        await audit(req, 'ai.ask', `${question.slice(0, 300)} (${result.steps.length} tool call(s), ${result.usage.total} tokens)`);
+        res.json(result);
+    }));
+
+    // Run SQL edited in the console (from an answer or a function being edited).
+    api.post('/ai/run', aiRoute(async (req, res) => {
+        const sql = ai.bindParams(req.body?.sql, parseParams(req.body?.params));
+        res.json(await ai.runReadOnlySql(sql, { signal: abortOnClose(res) }));
+    }));
+
+    api.get('/ai/functions', aiRoute(async (req, res) => {
+        res.json({ functions: await ai.listFunctions() });
+    }));
+
+    api.get('/ai/functions/:id', aiRoute(async (req, res) => {
+        res.json({ function: await ai.getFunction(req.params.id) });
+    }));
+
+    api.post('/ai/functions', requireAdmin, aiRoute(async (req, res) => {
+        const fn = await ai.createFunction(req.body, req.consoleUser.username);
+        await audit(req, 'ai.function_create', fn.name);
+        res.json({ success: true, function: fn });
+    }));
+
+    api.put('/ai/functions/:id', requireAdmin, aiRoute(async (req, res) => {
+        const fn = await ai.updateFunction(req.params.id, req.body, req.consoleUser.username);
+        await audit(req, 'ai.function_update', fn.name);
+        res.json({ success: true, function: fn });
+    }));
+
+    api.delete('/ai/functions/:id', requireAdmin, aiRoute(async (req, res) => {
+        const fn = await ai.deleteFunction(req.params.id);
+        await audit(req, 'ai.function_delete', fn.name);
+        res.json({ success: true });
+    }));
+
+    api.post('/ai/functions/:id/run', aiRoute(async (req, res) => {
+        const result = await ai.runFunction(req.params.id, parseParams(req.body?.params), { signal: abortOnClose(res) });
+        await audit(req, 'ai.function_run', `${result.function.name}: ${result.rowCount}${result.truncated ? '+' : ''} row(s)`);
+        res.json(result);
+    }));
+
+    // Full result as CSV (?params={"name":"value"}), up to EXPORT_MAX_ROWS rows.
+    api.get('/ai/functions/:id/export', aiRoute(async (req, res) => {
+        const fn = await ai.exportFunctionCsv(req.params.id, parseParams(req.query.params), res);
+        await audit(req, 'ai.function_export', `${fn.name} as csv`);
+    }));
+
     // ---- Audit ----------------------------------------------------------------------------
     api.get('/audit', wrap(async (req, res) => {
         res.json({ entries: await store.listAudit(req.query.limit) });
@@ -861,9 +956,12 @@ export function createConsoleRouter() {
     // eslint-disable-next-line no-unused-vars
     api.use((err, req, res, next) => {
         const status = err.statusCode || err.status || 500;
-        if (status >= 500) console.error('[Console] API error:', err);
+        if (status >= 500 && !err.expose) console.error('[Console] API error:', err);
+        else if (err.expose) console.warn('[Console] API error:', err.message);
         if (res.headersSent) return res.destroy(err);
-        res.status(status).json({ error: status >= 500 ? 'Internal error' : err.message });
+        // Errors flagged `expose` (e.g. from the AI model API) describe an external
+        // service, so their message is safe and useful to show.
+        res.status(status).json({ error: status >= 500 && !err.expose ? 'Internal error' : err.message });
     });
 
     router.use('/api', api);

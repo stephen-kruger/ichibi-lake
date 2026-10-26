@@ -283,6 +283,10 @@ Layers 2 to 4 apply to every key, superusers included, on top of layer 1.
 | `STORAGE_AUTO_RESTART` | *(detected)* | Whether **Save & restart** on the Storage page restarts the gateway. Default: on in a container (Docker restarts it) or under PM2, off otherwise (save, then restart yourself). `1`/`0` forces it. |
 | `METRICS_TOKEN` | *(unset)* | Bearer token for `GET /metrics`. When unset, `/metrics` requires a superuser API key. See [§14.2](#142-prometheus-metrics). |
 | `PUBLIC_URL` | `http://localhost:<port>` | Externally reachable base URL, used in startup log messages (Swagger UI and admin console links). Docker Compose defaults it to the published host port (`http://localhost:3333`); set it to your real address (e.g. `https://lake.example.com`) when deployed. |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible Chat Completions API used by **Ask AI** ([§13.2](#132-features)): OpenAI, Azure OpenAI, OpenRouter, Ollama, LM Studio, ... Also editable in the console. |
+| `OPENAI_API_KEY` | *(unset)* | Bearer token for that API (leave unset for local servers that need none). Also editable in the console, where it is never shown again after saving. |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Model name; it must support tool (function) calling. Also editable in the console. |
+| `AI_REQUEST_TIMEOUT_MS` / `AI_MAX_STEPS` / `AI_SAMPLE_ROWS` | `120000` / `8` / `20` | Per-call timeout to the model API; tool calls (queries, table lookups) per question; result rows shown to the model per query (`0`: schemas and row counts only, never data values). Also editable in the console. |
 | `SNAPSHOT_RETENTION_DAYS` | *(unset)* | Days of DuckLake snapshot history (time travel) to keep. When set, [lake maintenance](#47-lake-maintenance-small-files) and pruning rules with *reclaim storage* expire older snapshots and delete unreferenced files, freeing the space used by deleted rows. Unset: snapshots are never expired. Also editable in the console. |
 
 ---
@@ -1289,6 +1293,9 @@ The side menu groups pages by area. **Admins** can change everything; **viewers*
 | **Console Logins** | Add console users, change roles, reset passwords, delete logins (at least one admin always remains) |
 | **Tables & Data** | Browse every user table with paging, sorting, per-column filters and full-text search; edit cells inline; add and delete rows; view and edit schemas; create, rename and drop tables; **export** one table or several at once (one ZIP) and **import** CSV / Parquet / JSON files (see below) |
 | **Retention & Pruning** | Per-table rules that delete rows older than a given age, beyond the newest *N* rows, and/or matching simple conditions, each on its own schedule; preview, **Run now**, **Clone**, and a run log (see below). Also the **Lake maintenance** schedule and log ([§4.7](#47-lake-maintenance-small-files)) |
+| **Ask AI** | Ask questions about your data in plain language; an OpenAI-compatible model writes DuckDB SQL, runs it read-only and answers, showing its queries and the result table. Edit and re-run the SQL, and save it as a function (see below) |
+| **Saved Functions** | Named SQL queries with optional `{{parameters}}`, run on demand or downloaded as CSV (see below) |
+| **AI Settings** | The model API base URL, key, model and limits (from `docker/.env` unless saved here), with **Test connection** |
 | **Storage** | Where the data files (local disk or S3-compatible) and BLOBs are kept, editable, plus the read-only Postgres catalog and snapshot retention (see below) |
 | **Security / Ingestion / Query Engine / Kafka** | Effective configuration, showing each value's source (default, `docker/.env`, or console override) |
 | **Audit Log** | Who changed what, from which IP, across all instances |
@@ -1335,6 +1342,18 @@ Every change (cell edits, inserts, deletes, schema and table changes) is recorde
 - **Connection details** (credentials, endpoint, region, URL style, TLS) can be changed at any time, with the same test and restart. Because the catalog keeps listing the lake's files at the same `s3://` location, the test also reads the footers of a few existing data files (from the largest tables) through the new connection, and refuses the change if they cannot be read, e.g. when the endpoint now points to a different server or account that happens to have a bucket of the same name.
 - **Several gateway instances** sharing one catalog each read their own `STORAGE_CONFIG_FILE`. Configure storage in `docker/.env` for such deployments: after a move, instances still on the old path refuse to start (DuckLake rejects a data path that does not match the catalog) until they are given the new one.
 - **Without Docker or PM2** the gateway cannot restart itself: **Save** stores the settings and you restart the process (set `STORAGE_AUTO_RESTART=1` if a supervisor restarts it).
+
+**Ask AI.** Configure a model on **AI → AI Settings** (or `OPENAI_*` in `docker/.env`) and use **Test connection**: it lists the models, sends a short completion and forces one tool call, since answering needs tool calling. The form is tested with unsaved changes; an empty API key field keeps the saved key. **Save** stores console overrides (shared by every instance, applied immediately); **Revert to docker/.env** removes them.
+
+On **AI → Ask AI**, type a question. The model gets a system prompt describing the lake (DuckDB / DuckLake, the SQL rules, and every user table with its columns, types and row count) and two tools: `run_sql` and `describe_table` (columns, key columns, a few sample rows). It may query several times, fixing its SQL from the error messages, up to `AI_MAX_STEPS`. The page shows the answer, the tool calls (expand **How it was answered**) and the result of its last successful query, whose SQL you can edit and **Run** again. Follow-up questions resend the conversation's earlier questions, answers and SQL. **Save as function** (admins) stores the query.
+
+**Saved functions** run with the same checks as the model's SQL and can be opened, edited, run and deleted on **AI → Saved Functions**. Put `{{name}}` where a value should be filled in at each run; the page asks for it and inserts it as a quoted SQL literal, so it stands for a whole value: `WHERE region = {{region}}`, `WHERE created >= {{since}}`, `WHERE name ILIKE '%' || {{q}} || '%'` (not `'%{{q}}%'`). Results show up to 1,000 rows; **Download CSV** streams the full result, up to `EXPORT_MAX_ROWS`.
+
+What is enforced, for the model and for people alike:
+
+- **Read-only, user tables only.** Every statement goes through the read-only guard and is parsed by DuckDB with the same table-scoped policy as non-superuser `POST /query` ([§9.3](#93-raw-sql-query)): a single `SELECT`, no table functions (`read_csv`, `read_parquet`, ...), only `ducklake.main` tables, never system tables. It runs on the isolated user-query instance with `USER_QUERY_TIMEOUT_MS` and the user-query concurrency limit.
+- **What leaves the gateway.** The model API receives table and column names and types, row counts and at most `AI_SAMPLE_ROWS` rows of each result (long values cut to 200 characters); with `AI_SAMPLE_ROWS=0` it receives no data values. It never receives system tables, API keys or console data. Pick a provider whose data handling suits your data, or a local model.
+- **Roles.** Every console user can ask questions and run functions (read-only, like browsing tables); saving, editing and deleting functions and changing AI settings need an admin. Questions, function runs, downloads and changes are audited (questions with their text, never result values).
 
 **Retention & Pruning.** A rule deletes rows that meet **any** of its ticked criteria (age, row count, match conditions), like Kafka's time- and size-based retention:
 
@@ -1466,6 +1485,7 @@ npm run test:unit              # Unit tests only (schema evolution, graph DDL, t
 npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
 npm run test:pgq-grammar       # DuckDB 2.0 SQL/PGQ grammar opt-in tests (no Docker needed)
 npm run test:console-unit      # Admin console auth, settings, data browser, pruning and cron unit tests (no Docker needed)
+npm run test:ai                # Ask AI: parameters, settings and the connection test against a mock model API (no Docker needed)
 npm run test:sql-guard         # Read-only / introspection guard for user-supplied SQL (no Docker needed)
 npm run test:sql-tables        # Table extraction for table-scoped SQL, against DuckDB's parser (no Docker needed)
 npm run test:storage           # Object-storage config, S3 secret SQL and maintenance settings (no Docker needed)

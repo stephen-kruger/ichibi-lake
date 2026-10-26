@@ -19,6 +19,7 @@ export const PRUNE_RULES = table('_console_prune_rules');
 export const PRUNE_RUNS = table('_console_prune_runs');
 export const MAINTENANCE = table('_console_maintenance');
 export const IDEMPOTENCY = table('_console_idempotency');
+export const AI_FUNCTIONS = table('_console_ai_functions');
 const MAINTENANCE_ID = 'lake';
 const AUDIT = table('_console_audit');
 const CONSOLE_TABLES = ['_console_users', '_console_settings', '_console_audit'];
@@ -144,6 +145,18 @@ export async function initConsoleTables() {
         response VARCHAR,
         created_ms BIGINT,
         expires_ms BIGINT
+    )`);
+    // Saved SQL queries ("functions") from the Ask AI pages (src/console/ai.js).
+    await execute(`CREATE TABLE IF NOT EXISTS ${AI_FUNCTIONS} (
+        id VARCHAR,
+        name VARCHAR,
+        description VARCHAR,
+        sql VARCHAR,
+        question VARCHAR,
+        created_ms BIGINT,
+        created_by VARCHAR,
+        updated_ms BIGINT,
+        updated_by VARCHAR
     )`);
     await migrateFromMainCatalog();
     await migrateLegacyRetention();
@@ -681,6 +694,44 @@ export async function audit(username, action, detail = '', ip = '') {
 export async function listAudit(limit = 200) {
     const n = Math.max(1, Math.min(1000, Number(limit) || 200));
     return execute(`SELECT ${ts('ts')}, username, action, detail, ip FROM ${AUDIT} a ORDER BY a.ts DESC LIMIT ${n}`);
+}
+
+// --- Saved AI functions -------------------------------------------------------------
+
+function aiFunctionFromRow(r) {
+    return {
+        id: r.id, name: r.name, description: r.description || '', sql: r.sql, question: r.question || '',
+        createdMs: num(r.created_ms), createdBy: r.created_by, updatedMs: num(r.updated_ms), updatedBy: r.updated_by,
+    };
+}
+
+export async function listAiFunctions() {
+    return (await execute(`SELECT * FROM ${AI_FUNCTIONS} ORDER BY lower(name)`)).map(aiFunctionFromRow);
+}
+
+export async function getAiFunction(id) {
+    const rows = await executeWithParams(`SELECT * FROM ${AI_FUNCTIONS} WHERE id = ?`, [id], [VARCHAR]);
+    return rows.length ? aiFunctionFromRow(rows[0]) : null;
+}
+
+export async function createAiFunction(fn) {
+    const now = BigInt(Date.now());
+    await executeWithParams(
+        `INSERT INTO ${AI_FUNCTIONS} (id, name, description, sql, question, created_ms, created_by, updated_ms, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [fn.id, fn.name, fn.description, fn.sql, fn.question, now, fn.user, now, fn.user],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, VARCHAR]);
+}
+
+export async function updateAiFunction(id, fn) {
+    await executeWithParams(
+        `UPDATE ${AI_FUNCTIONS} SET name = ?, description = ?, sql = ?, updated_ms = ?, updated_by = ? WHERE id = ?`,
+        [fn.name, fn.description, fn.sql, BigInt(Date.now()), fn.user, id],
+        [VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR]);
+}
+
+export async function deleteAiFunction(id) {
+    await executeWithParams(`DELETE FROM ${AI_FUNCTIONS} WHERE id = ?`, [id], [VARCHAR]);
 }
 
 // --- Idempotency keys --------------------------------------------------------------
