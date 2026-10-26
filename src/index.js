@@ -999,6 +999,10 @@ app.put('/tables/:tableName/keys', async (req, res) => {
 // Build the filtered/sorted SELECT shared by GET /tables/:tableName and its
 // /export variant. Throws 400 for ?after without a valid ?sort. Returns the
 // WHERE / ORDER BY clauses with their bound parameters.
+// Quote a column name for SQL. Columns created from JSON keys can contain any
+// character, including '"', so embedded quotes must be doubled.
+const quoteColumn = (name) => `"${String(name).replace(/"/g, '""')}"`;
+
 function buildTableFilter(columns, query) {
     const { sort, after, ...rest } = query;
     const columnSet = new Set(columns);
@@ -1009,7 +1013,7 @@ function buildTableFilter(columns, query) {
     // Simple column equality filters (unknown parameters are ignored)
     for (const [key, value] of Object.entries(rest)) {
         if (columnSet.has(key)) {
-            whereClauses.push(`"${key}" = ?`);
+            whereClauses.push(`${quoteColumn(key)} = ?`);
             params.push(String(value));
             types.push(VARCHAR);
         }
@@ -1031,13 +1035,13 @@ function buildTableFilter(columns, query) {
             throw err;
         }
         // ASC: row > cursor; DESC: row < cursor.
-        whereClauses.push(`"${sortColName}" ${isDesc ? '<' : '>'} ?`);
+        whereClauses.push(`${quoteColumn(sortColName)} ${isDesc ? '<' : '>'} ?`);
         params.push(String(after));
         types.push(VARCHAR);
     }
 
     const where = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
-    const orderBy = sortColName ? ` ORDER BY "${sortColName}" ${isDesc ? 'DESC' : 'ASC'}` : '';
+    const orderBy = sortColName ? ` ORDER BY ${quoteColumn(sortColName)} ${isDesc ? 'DESC' : 'ASC'}` : '';
     return { where, orderBy, params, types, sortColName };
 }
 
@@ -1114,7 +1118,7 @@ app.get('/tables/:tableName/export', async (req, res) => {
         const { where, orderBy, params, types } = buildTableFilter(schema.map(c => c.column_name), query);
         // BLOBs travel base64-encoded in the text formats, like the JSON API.
         const selectList = schema.map(({ column_name: c, data_type: t }) =>
-            format !== 'parquet' && /^BLOB/i.test(t) ? `base64("${c}") AS "${c}"` : `"${c}"`).join(', ');
+            format !== 'parquet' && /^BLOB/i.test(t) ? `base64(${quoteColumn(c)}) AS ${quoteColumn(c)}` : quoteColumn(c)).join(', ');
         await runExport({
             format,
             selectSql: `SELECT ${selectList} FROM "${tableName}"${where}${orderBy}`,

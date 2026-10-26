@@ -16,6 +16,7 @@ import { parseCron, nextRun, nextRuns, validateCron } from '../src/console/cron.
 import { intervalToCron } from '../src/console/store.js';
 import { normaliseType, quoteIdent, quoteLiteral, buildWhere, wideningTargets, isEditableType, cleanDuckDbError, detectImportFormat } from '../src/console/data.js';
 import { compareVersions, checkForUpdate, resetUpdateCheckCache } from '../src/console/version.js';
+import { csvField } from '../src/export.js';
 
 let passed = 0, failed = 0;
 
@@ -399,6 +400,17 @@ async function run() {
         assert.deepEqual(await ids([], 'C:\\temp'), [5], 'backslash is literal');
         assert.deepEqual(await ids([], 'HOMEASSISTANT'), [1, 2], 'still case-insensitive');
         conn.closeSync();
+    });
+    await test('CSV export neutralises spreadsheet formulas in text values only', () => {
+        assert.equal(csvField('=HYPERLINK("http://x","y")'), `"'=HYPERLINK(""http://x"",""y"")"`);
+        for (const v of ['+1+2', '-2+3', '@SUM(A1)', '\tcmd', '-']) assert.equal(csvField(v), `'${v}`, v);
+        assert.equal(csvField('\r=1'), `"'\r=1"`, 'CR start: prefixed and quoted');
+        for (const v of ['-5', '+3.5e2', '-.5', '1e-3']) assert.equal(csvField(v), v, `numeric text ${v} stays`);
+        assert.equal(csvField(-5), '-5', 'numbers are not text');
+        assert.equal(csvField(12n), '12');
+        assert.equal(csvField('a=b'), 'a=b', 'only a leading character counts');
+        assert.equal(csvField('has, comma'), '"has, comma"');
+        assert.equal(csvField(null), '');
     });
     await test('DuckDB error messages are shortened for display', () => {
         assert.equal(cleanDuckDbError(new Error('Catalog Error: Cannot change type\nLINE 1: ...')), 'Cannot change type');
