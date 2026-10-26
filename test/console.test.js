@@ -362,7 +362,7 @@ async function run() {
             { column: 'n', op: 'gte', value: '10' },
             { column: 'first name', op: 'is_null' },
         ], '', cols);
-        assert.equal(w.sql, `WHERE CAST("id" AS VARCHAR) ILIKE ? AND "n" >= TRY_CAST(? AS BIGINT) AND "first name" IS NULL`);
+        assert.equal(w.sql, `WHERE CAST("id" AS VARCHAR) ILIKE ? ESCAPE '\\' AND "n" >= TRY_CAST(? AS BIGINT) AND "first name" IS NULL`);
         assert.deepEqual(w.params, ['%50\\%\\_off%', '10']);
     });
     await test('unknown filter columns and operators are rejected', () => {
@@ -372,9 +372,33 @@ async function run() {
     });
     await test('global search covers every non-binary column', () => {
         const w = buildWhere([], 'abc', cols);
-        assert.equal(w.sql, `WHERE (CAST("id" AS VARCHAR) ILIKE ? OR CAST("n" AS VARCHAR) ILIKE ? OR CAST("first name" AS VARCHAR) ILIKE ?)`);
+        assert.equal(w.sql, `WHERE (CAST("id" AS VARCHAR) ILIKE ? ESCAPE '\\' OR CAST("n" AS VARCHAR) ILIKE ? ESCAPE '\\' OR CAST("first name" AS VARCHAR) ILIKE ? ESCAPE '\\')`);
         assert.equal(w.params.length, 3);
         assert.equal(buildWhere([], '   ', cols).sql, '');
+    });
+    await test('search and filters match values containing _, % and \\ when run in DuckDB', async () => {
+        // DuckDB has no default LIKE escape character: without ESCAPE '\' the
+        // escaped "\_" never matched, so e.g. MQTT topics found nothing.
+        const { DuckDBInstance } = await import('@duckdb/node-api');
+        const conn = await (await DuckDBInstance.create(':memory:')).connect();
+        await conn.run(`CREATE TABLE t (id VARCHAR, n BIGINT)`);
+        await conn.run(`INSERT INTO t VALUES
+            ('homeassistant/binary_sensor/occupancysensor_occupancy/last_changed', 1),
+            ('homeassistant/binaryXsensor/other', 2), ('50% off', 3), ('500 off', 4), ('C:\\temp\\x', 5)`);
+        const tcols = new Map([['id', 'VARCHAR'], ['n', 'BIGINT']]);
+        const ids = async (filters, search) => {
+            const w = buildWhere(filters, search, tcols);
+            const r = await conn.runAndReadAll(`SELECT n FROM t ${w.sql} ORDER BY n`, w.params, w.types);
+            return r.getRows().map(row => Number(row[0]));
+        };
+        assert.deepEqual(await ids([], 'homeassistant/binary_sensor/occupancysensor_occupancy/last_changed'), [1]);
+        assert.deepEqual(await ids([], 'binary_sensor'), [1], '"_" is literal, not a wildcard');
+        assert.deepEqual(await ids([{ column: 'id', op: 'contains', value: 'occupancy/last_changed' }]), [1]);
+        assert.deepEqual(await ids([{ column: 'id', op: 'starts_with', value: 'homeassistant/binary_' }]), [1]);
+        assert.deepEqual(await ids([], '50%'), [3], '"%" is literal');
+        assert.deepEqual(await ids([], 'C:\\temp'), [5], 'backslash is literal');
+        assert.deepEqual(await ids([], 'HOMEASSISTANT'), [1, 2], 'still case-insensitive');
+        conn.closeSync();
     });
     await test('DuckDB error messages are shortened for display', () => {
         assert.equal(cleanDuckDbError(new Error('Catalog Error: Cannot change type\nLINE 1: ...')), 'Cannot change type');

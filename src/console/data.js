@@ -128,8 +128,8 @@ export function buildWhere(filters, search, columns) {
         switch (f.op) {
             case 'is_null': parts.push(`${col} IS NULL`); continue;
             case 'not_null': parts.push(`${col} IS NOT NULL`); continue;
-            case 'contains': parts.push(`${text(f.column)} ILIKE ?`); params.push(`%${escapeLike(v)}%`); break;
-            case 'starts_with': parts.push(`${text(f.column)} ILIKE ?`); params.push(`${escapeLike(v)}%`); break;
+            case 'contains': parts.push(`${text(f.column)} ILIKE ? ${LIKE_ESCAPE}`); params.push(`%${escapeLike(v)}%`); break;
+            case 'starts_with': parts.push(`${text(f.column)} ILIKE ? ${LIKE_ESCAPE}`); params.push(`${escapeLike(v)}%`); break;
             case 'equals': parts.push(`${text(f.column)} = ?`); params.push(v); break;
             case 'not_equals': parts.push(`${text(f.column)} IS DISTINCT FROM ?`); params.push(v); break;
             default: {
@@ -146,15 +146,20 @@ export function buildWhere(filters, search, columns) {
     if (q) {
         const searchable = [...columns.entries()].filter(([, t]) => !/^BLOB/i.test(t)).map(([n]) => n);
         if (searchable.length) {
-            parts.push(`(${searchable.map(c => `${text(c)} ILIKE ?`).join(' OR ')})`);
+            parts.push(`(${searchable.map(c => `${text(c)} ILIKE ? ${LIKE_ESCAPE}`).join(' OR ')})`);
             for (let i = 0; i < searchable.length; i++) { params.push(`%${escapeLike(q)}%`); types.push(VARCHAR); }
         }
     }
     return { sql: parts.length ? `WHERE ${parts.join(' AND ')}` : '', params, types };
 }
 
+// DuckDB's LIKE/ILIKE has NO default escape character (unlike Postgres), so
+// every pattern built with escapeLike() needs this clause; without it "\_"
+// means "a backslash, then any character" and values containing _ or % never
+// match.
+const LIKE_ESCAPE = "ESCAPE '\\'";
+
 function escapeLike(v) {
-    // DuckDB ILIKE uses backslash as the default escape character.
     return v.replace(/[\\%_]/g, (m) => `\\${m}`);
 }
 
