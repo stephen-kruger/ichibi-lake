@@ -17,19 +17,24 @@ import {
 
 let passed = 0, failed = 0;
 
+// Tests run in order; an async test is awaited before the next one starts.
+let chain = Promise.resolve();
 function test(name, fn) {
-    try {
-        fn();
-        passed++;
-        console.log(`  \u2713 ${name}`);
-    } catch (err) {
-        failed++;
-        console.error(`  \u2717 ${name}`);
-        console.error(`    ${err.message}`);
-    }
+    chain = chain.then(async () => {
+        try {
+            await fn();
+            passed++;
+            console.log(`  \u2713 ${name}`);
+        } catch (err) {
+            failed++;
+            console.error(`  \u2717 ${name}`);
+            console.error(`    ${err.message}`);
+        }
+    });
 }
+const section = (title) => { chain = chain.then(() => console.log(title)); };
 
-console.log('\n\u25b8 schema-evolution: parseStructType');
+section('\n\u25b8 schema-evolution: parseStructType');
 
 test('parses a flat STRUCT into a field map', () => {
     const fields = parseStructType('STRUCT(a INTEGER, b VARCHAR)');
@@ -48,7 +53,7 @@ test('returns null when the input is not a STRUCT', () => {
     assert.equal(parseStructType('INTEGER[]'), null);
 });
 
-console.log('\n\u25b8 schema-evolution: unionStructTypes');
+section('\n\u25b8 schema-evolution: unionStructTypes');
 
 test('adds missing fields from the new struct without dropping existing ones', () => {
     const merged = unionStructTypes(
@@ -66,10 +71,34 @@ test('recursively merges nested STRUCT fields', () => {
         'STRUCT(p STRUCT(x INTEGER, y DOUBLE))'
     );
     const fields = parseStructType(merged);
-    assert.equal(fields.get('p'), 'STRUCT(x INTEGER, y DOUBLE)');
+    // Field names are always quoted in built types (same type to DuckDB).
+    assert.equal(fields.get('p'), 'STRUCT("x" INTEGER, "y" DOUBLE)');
 });
 
-console.log('\n\u25b8 schema-evolution: resolveTypeConflict');
+test('field names with quotes, commas, parentheses and spaces round-trip', () => {
+    // As DuckDB prints them: names quoted, embedded quotes doubled.
+    const fields = parseStructType('STRUCT("x""y" BIGINT, "a,b" VARCHAR, "temp (C)" DOUBLE, "sp ace" STRUCT("in,ner" INTEGER))');
+    assert.deepEqual([...fields.keys()], ['x"y', 'a,b', 'temp (C)', 'sp ace']);
+    assert.equal(fields.get('temp (C)'), 'DOUBLE');
+    assert.equal(fields.get('sp ace'), 'STRUCT("in,ner" INTEGER)');
+});
+
+test('union of structs with awkward field names quotes every name', () => {
+    const merged = unionStructTypes('STRUCT("x""y" BIGINT, "order" BIGINT, "1st" BIGINT, "a,b" BIGINT)', 'STRUCT("z" BIGINT)');
+    assert.equal(merged, 'STRUCT("x""y" BIGINT, "order" BIGINT, "1st" BIGINT, "a,b" BIGINT, "z" BIGINT)');
+    assert.deepEqual([...parseStructType(merged).keys()], ['x"y', 'order', '1st', 'a,b', 'z']);
+});
+
+test('built STRUCT types with awkward names are valid DuckDB types', async () => {
+    const { DuckDBInstance } = await import('@duckdb/node-api');
+    const conn = await (await DuckDBInstance.create(':memory:')).connect();
+    const merged = unionStructTypes('STRUCT("x""y" BIGINT, "order" BIGINT, "1st" BIGINT, "a,b" BIGINT, "temp (C)" BIGINT)', 'STRUCT("new key" BIGINT)');
+    const r = await conn.runAndReadAll(`SELECT typeof(NULL::${merged})`);
+    assert.equal(parseStructType(r.getRows()[0][0]).size, 6);
+    conn.closeSync();
+});
+
+section('\n\u25b8 schema-evolution: resolveTypeConflict');
 
 test('returns insert when the two types are identical', () => {
     const r = resolveTypeConflict('INTEGER', 'INTEGER');
@@ -119,7 +148,7 @@ test('does not emit widen action with VARCHAR fallback for STRUCT-vs-primitive',
     assert.equal(r.action, 'skip');
 });
 
-console.log('\n\u25b8 schema-evolution: formatSchemaDefinition');
+section('\n\u25b8 schema-evolution: formatSchemaDefinition');
 
 test('renders a CREATE TABLE-like definition from column metadata', () => {
     const out = formatSchemaDefinition('t', [
@@ -131,7 +160,9 @@ test('renders a CREATE TABLE-like definition from column metadata', () => {
     assert.ok(out.includes('"name" VARCHAR'));
 });
 
-console.log('\n\u2500\u2500\u2500 schema-evolution unit tests \u2500\u2500\u2500');
-console.log(`  passed: ${passed}`);
-console.log(`  failed: ${failed}`);
-process.exit(failed === 0 ? 0 : 1);
+chain.then(() => {
+    console.log('\n\u2500\u2500\u2500 schema-evolution unit tests \u2500\u2500\u2500');
+    console.log(`  passed: ${passed}`);
+    console.log(`  failed: ${failed}`);
+    process.exit(failed === 0 ? 0 : 1);
+});

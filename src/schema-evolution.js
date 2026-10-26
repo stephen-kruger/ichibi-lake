@@ -9,8 +9,10 @@
 
 /**
  * Parse a DuckDB STRUCT(...) type string into a Map of field-name -> type-string.
- * Handles nested structs, quoted field names, and commas inside nested
- * parentheses (e.g. DECIMAL(10,2) or MAP(VARCHAR, INTEGER)).
+ * Handles nested structs, commas inside nested parentheses (DECIMAL(10,2),
+ * MAP(VARCHAR, INTEGER)) and quoted field names, whose text is ignored for
+ * structure: a name may contain commas, parentheses, spaces and doubled
+ * quotes ("x""y" is the name x"y), as JSON keys can.
  */
 export function parseStructType(typeStr) {
     typeStr = typeStr.trim();
@@ -19,27 +21,33 @@ export function parseStructType(typeStr) {
 
     const fields = new Map();
     let depth = 0;
+    let inQuote = false;
     let currentField = '';
 
     for (let i = prefix.length; i < typeStr.length; i++) {
         const char = typeStr[i];
-        if (char === '(') {
+        if (inQuote) {
+            currentField += char;
+            if (char === '"') {
+                if (typeStr[i + 1] === '"') { currentField += '"'; i++; } // escaped quote
+                else inQuote = false;
+            }
+        } else if (char === '"') {
+            inQuote = true;
+            currentField += char;
+        } else if (char === '(') {
             depth++;
             currentField += char;
         } else if (char === ')') {
             if (depth === 0) {
                 // closing paren of the outer STRUCT
-                if (currentField.trim()) {
-                    addField(currentField.trim(), fields);
-                }
+                if (currentField.trim()) addField(currentField.trim(), fields);
                 break;
             }
             depth--;
             currentField += char;
         } else if (char === ',' && depth === 0) {
-            if (currentField.trim()) {
-                addField(currentField.trim(), fields);
-            }
+            if (currentField.trim()) addField(currentField.trim(), fields);
             currentField = '';
         } else {
             currentField += char;
@@ -52,9 +60,17 @@ function addField(fieldStr, fields) {
     fieldStr = fieldStr.trim();
     let name, type;
     if (fieldStr.startsWith('"')) {
-        const endQuote = fieldStr.indexOf('"', 1);
-        name = fieldStr.slice(1, endQuote);
-        type = fieldStr.slice(endQuote + 1).trim();
+        // Closing quote: the first '"' not followed by another '"'.
+        let i = 1;
+        name = '';
+        while (i < fieldStr.length) {
+            if (fieldStr[i] === '"') {
+                if (fieldStr[i + 1] === '"') { name += '"'; i += 2; continue; }
+                break;
+            }
+            name += fieldStr[i++];
+        }
+        type = fieldStr.slice(i + 1).trim();
     } else {
         const firstSpace = fieldStr.indexOf(' ');
         name = fieldStr.slice(0, firstSpace);
@@ -63,15 +79,18 @@ function addField(fieldStr, fields) {
     fields.set(name, type);
 }
 
+/** Quote a STRUCT field name. Always quoted: unquoted names would break on
+ * reserved words (order), a leading digit (1st), punctuation or case. */
+export function quoteFieldName(name) {
+    return `"${String(name).replace(/"/g, '""')}"`;
+}
+
 /**
  * Build a DuckDB STRUCT type string from a Map of fields.
  */
 function buildStructType(fields) {
     const entries = [];
-    for (const [name, type] of fields) {
-        const safeName = /[^a-zA-Z0-9_]/.test(name) ? `"${name}"` : name;
-        entries.push(`${safeName} ${type}`);
-    }
+    for (const [name, type] of fields) entries.push(`${quoteFieldName(name)} ${type}`);
     return `STRUCT(${entries.join(', ')})`;
 }
 

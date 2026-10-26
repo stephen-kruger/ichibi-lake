@@ -17,6 +17,9 @@
  *            a temp file under EXPORT_TMP_DIR, which is streamed to the client
  *            and deleted as soon as the response ends (or fails).
  *
+ * CSV text values that a spreadsheet would run as a formula (starting with
+ * =, +, -, @, tab or CR) are prefixed with an apostrophe; see csvField().
+ *
  * BLOB columns are exported base64-encoded in csv/ndjson (as the JSON API
  * returns them) and as raw binary in Parquet.
  *
@@ -72,9 +75,19 @@ async function write(res, chunk) {
     }
 }
 
-function csvField(value) {
+// CSV injection: spreadsheets run a cell that starts with one of these as a
+// formula (=HYPERLINK(...), =cmd|..., +, -, @), so a text value starting with
+// one gets a leading apostrophe (OWASP's recommendation), which spreadsheets
+// display as plain text. Only text values: numbers, dates and other typed
+// values arrive as non-strings, and numeric-looking text such as "-5" cannot
+// be a formula, so both are written unchanged.
+const FORMULA_START_RE = /^[=+\-@\t\r]/;
+const NUMERIC_TEXT_RE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
+export function csvField(value) {
     if (value === null || value === undefined) return '';
-    const text = typeof value === 'string' ? value : String(value);
+    let text = typeof value === 'string' ? value : String(value);
+    if (typeof value === 'string' && FORMULA_START_RE.test(text) && !NUMERIC_TEXT_RE.test(text)) text = `'${text}`;
     return /[",\r\n]|^\s|\s$/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
