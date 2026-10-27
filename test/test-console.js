@@ -1043,6 +1043,9 @@ async function run() {
                         assert(bad.status === 400 && /\{\{n\}\}: .* is not a number/.test(bad.data.error), JSON.stringify(bad.data));
                         assert((await admin('POST', `/ai/functions/${id}/run`, { params: {} })).status === 400, 'list without default is required');
                         assert((await admin('POST', '/ai/functions', { name: `CI bad ${TS}`, sql, params: [{ name: 'n', type: 'number', default: 'ten' }] })).status === 400, 'invalid default');
+                        const inl = await admin('POST', '/ai/inline-params', { sql, params: c.data.function.params, names: ['regions', 'n'], values: { regions: 'North,South' } });
+                        assert(inl.status === 200 && inl.data.sql.includes("IN ('North', 'South')") && inl.data.sql.endsWith('LIMIT 10') && inl.data.sql.includes('{{min}}'), JSON.stringify(inl.data));
+                        assert((await admin('POST', '/ai/inline-params', { sql, params: c.data.function.params, names: ['regions'] })).status === 400, 'no default and no value');
                         const run = await admin('POST', '/ai/run', { sql: 'SELECT {{d}} + 1 AS next', params: { d: '2024-02-28' }, paramDefs: [{ name: 'd', type: 'date' }] });
                         assert(run.status === 200 && String(run.data.rows[0][0]).startsWith('2024-02-29'), JSON.stringify(run.data));
                     } finally {

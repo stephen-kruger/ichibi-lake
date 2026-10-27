@@ -425,3 +425,6 @@ pre.code { font-family: var(--mono); font-size: 12.5px; background: var(--surfac
 .param-table td:first-child { white-space: nowrap; width: 1%; }
 .param-table select, .param-table input { width: 100%; min-width: 0; }
 .param-table td:nth-child(2) { width: 150px; }
+.param-table td.actions { width: 1%; white-space: nowrap; }
+.param-table .param-remove { color: var(--text-muted); }
+.param-table .param-remove:hover { color: var(--danger); }

@@ -919,6 +919,12 @@ export function createConsoleRouter() {
         res.json({ proposal });
     }));
 
+    // Turn parameters back into hard-coded values in SQL being edited
+    // (Remove on the Parameters table). Nothing is saved.
+    api.post('/ai/inline-params', requireAdmin, aiRoute(async (req, res) => {
+        res.json({ sql: ai.inlineParams(req.body?.sql, req.body?.params, req.body?.names, req.body?.values) });
+    }));
+
     api.get('/ai/functions', aiRoute(async (req, res) => {
         res.json({ functions: await ai.listFunctions() });
     }));
