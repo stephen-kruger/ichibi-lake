@@ -150,7 +150,7 @@ td.actions > * + * { margin-left: 6px; }
 .field { margin-bottom: 16px; }
 .field label { display: block; font-weight: 550; margin-bottom: 6px; }
 .field .help { color: var(--text-muted); font-size: 12.5px; margin-top: 5px; }
-input[type=text], input[type=password], input[type=number], input[type=email], select {
+input[type=text], input[type=password], input[type=number], input[type=email], input[type=date], input[type=datetime-local], select {
     width: 100%; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
     color: var(--text); font: inherit; }
 input:focus, select:focus, button:focus-visible { outline: 2px solid var(--lake-soft); outline-offset: 1px; border-color: var(--lake-soft); }
@@ -417,3 +417,11 @@ pre.code { font-family: var(--mono); font-size: 12.5px; background: var(--surfac
 @keyframes spin { to { transform: rotate(360deg); } }
 .params[hidden] { display: none; }
 .params .field { margin-bottom: 0; }
+
+/* Saved-function parameter definitions */
+.param-defs { margin: 4px 0 16px; }
+.param-table { width: 100%; }
+.param-table td { padding: 6px 8px; vertical-align: middle; }
+.param-table td:first-child { white-space: nowrap; width: 1%; }
+.param-table select, .param-table input { width: 100%; min-width: 0; }
+.param-table td:nth-child(2) { width: 150px; }

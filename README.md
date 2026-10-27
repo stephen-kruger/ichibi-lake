@@ -1345,14 +1345,32 @@ Every change (cell edits, inserts, deletes, schema and table changes) is recorde
 
 **Ask AI.** Configure a model on **AI → AI Settings** (or `OPENAI_*` in `docker/.env`) and use **Test connection**: it lists the models, sends a short completion and forces one tool call, since answering needs tool calling. The form is tested with unsaved changes; an empty API key field keeps the saved key. **Save** stores console overrides (shared by every instance, applied immediately); **Revert to docker/.env** removes them.
 
-On **AI → Ask AI**, type a question. The model gets a system prompt describing the lake (DuckDB / DuckLake, the SQL rules, and every user table with its columns, types and row count) and two tools: `run_sql` and `describe_table` (columns, key columns, a few sample rows). It may query several times, fixing its SQL from the error messages, up to `AI_MAX_STEPS`. The page shows the answer, the tool calls (expand **How it was answered**) and the result of its last successful query, whose SQL you can edit and **Run** again. Follow-up questions resend the conversation's earlier questions, answers and SQL. **Save as function** (admins) stores the query.
+On **AI → Ask AI**, type a question. The model gets a system prompt describing the lake (DuckDB / DuckLake, the SQL rules, useful DuckDB functions, and every user table with its columns, types and row count; column names that need quoting are shown quoted) and tools: `run_sql`, `describe_table` (columns, key columns, a few sample rows) and, when saved functions exist, `run_function`. It may query several times, fixing its SQL from the error messages, up to `AI_MAX_STEPS`. The page shows the answer, the tool calls (expand **How it was answered**) and the result of its last successful query, whose SQL you can edit and **Run** again. Follow-up questions resend the conversation's earlier questions, answers and SQL. **Save as function** (admins) stores the query.
 
-**Saved functions** run with the same checks as the model's SQL and can be opened, edited, run and deleted on **AI → Saved Functions**. Put `{{name}}` where a value should be filled in at each run; the page asks for it and inserts it as a quoted SQL literal, so it stands for a whole value: `WHERE region = {{region}}`, `WHERE created >= {{since}}`, `WHERE name ILIKE '%' || {{q}} || '%'` (not `'%{{q}}%'`). Results show up to 1,000 rows; **Download CSV** streams the full result, up to `EXPORT_MAX_ROWS`.
+- **Worked examples.** Saved functions double as examples: up to 4 of them are added to the system prompt as *question → SQL* pairs, those sharing the most words with the question first, then the most recently updated. This teaches the model your tables' conventions. Functions over tables that no longer exist, or with more than 1,500 characters of SQL, are left out. Saving good answers as functions therefore improves later answers.
+- **Large schemas.** When the full table list would exceed about 24,000 characters, the tables whose table and column names best match the question (and the conversation's last three questions) keep their column lists within that budget, and the rest are listed by name for the model to look up with `describe_table`. The matching is plain word matching in the gateway: no extra model call.
+
+**Saved functions** run with the same checks as the model's SQL and can be opened, edited, run and deleted on **AI → Saved Functions**. Put `{{name}}` where a value should be filled in at each run. A placeholder stands for a whole value, quotes included: `WHERE region = {{region}}`, `WHERE created >= {{since}}`, `LIMIT {{n}}`, `WHERE id IN ({{ids}})`, `WHERE name ILIKE '%' || {{q}} || '%'` (not `'%{{q}}%'`). Results show up to 1,000 rows; **Download CSV** streams the full result, up to `EXPORT_MAX_ROWS`.
+
+- **Parameter types.** Each placeholder gets a type, an optional default and a description in the function's **Parameters** table. The value is checked against the type and inserted as a typed SQL literal, so a value can never change the statement:
+
+  | Type | Value | Inserted as | Run input |
+  | :--- | :--- | :--- | :--- |
+  | Text (default) | anything | `'it''s'` | text box |
+  | Number | `10`, `-2.5`, `1e3` | `10` (works in `LIMIT`) | number box |
+  | Date | `YYYY-MM-DD` | `DATE '2024-02-29'` | date picker |
+  | Timestamp | `YYYY-MM-DD HH:MM[:SS]`, optional `Z` / `+HH:MM` | `TIMESTAMP '…'` / `TIMESTAMPTZ '…'` | date-time picker |
+  | Yes / no | `true` / `false` (also `1`/`0`, `yes`/`no`) | `TRUE` / `FALSE` | drop-down |
+  | List | `a, b, c` | `'a', 'b', 'c'` (for `IN (…)`) | text box |
+
+  A parameter with a default is optional; one without is required. Invalid values (e.g. `1; DROP TABLE x` for a number, `2023-02-29` for a date) are rejected with a message naming the parameter. Functions saved before types existed keep working as text parameters.
+- **Suggest parameters** (admins, with a model configured), in **Save as function** and on a function's page: the model rewrites the query with `{{parameters}}` for the values you would want to change (dates, ids, names, thresholds, limits), using each original value as the default, and proposes a name and description. The proposal is checked like any saved query (one retry with the error if it is invalid) and only fills in the form: review it, then save. The model sees the query, the question and the columns of the tables it uses, no data.
+- **Ask AI can run them.** Up to 25 saved functions relevant to the question (whose tables still exist) are listed for the model with their parameters, e.g. `Top meters(meters list = "m1, m2", top_n number = "10")`, and it can call one with the `run_function` tool instead of writing SQL. The result then links to the function.
 
 What is enforced, for the model and for people alike:
 
 - **Read-only, user tables only.** Every statement goes through the read-only guard and is parsed by DuckDB with the same table-scoped policy as non-superuser `POST /query` ([§9.3](#93-raw-sql-query)): a single `SELECT`, no table functions (`read_csv`, `read_parquet`, ...), only `ducklake.main` tables, never system tables. It runs on the isolated user-query instance with `USER_QUERY_TIMEOUT_MS` and the user-query concurrency limit.
-- **What leaves the gateway.** The model API receives table and column names and types, row counts and at most `AI_SAMPLE_ROWS` rows of each result (long values cut to 200 characters); with `AI_SAMPLE_ROWS=0` it receives no data values. It never receives system tables, API keys or console data. Pick a provider whose data handling suits your data, or a local model.
+- **What leaves the gateway.** The model API receives table and column names and types, row counts and at most `AI_SAMPLE_ROWS` rows of each result (long values cut to 200 characters); with `AI_SAMPLE_ROWS=0` it receives no data values. It also receives the question and SQL of up to 4 saved functions as worked examples (any literal values written in that SQL included). It never receives system tables, API keys or other console data. Pick a provider whose data handling suits your data, or a local model.
 - **Roles.** Every console user can ask questions and run functions (read-only, like browsing tables); saving, editing and deleting functions and changing AI settings need an admin. Questions, function runs, downloads and changes are audited (questions with their text, never result values).
 
 **Retention & Pruning.** A rule deletes rows that meet **any** of its ticked criteria (age, row count, match conditions), like Kafka's time- and size-based retention:
@@ -1485,7 +1503,7 @@ npm run test:unit              # Unit tests only (schema evolution, graph DDL, t
 npm run test:graphs-unit       # Graph DDL generation unit tests (no Docker needed)
 npm run test:pgq-grammar       # DuckDB 2.0 SQL/PGQ grammar opt-in tests (no Docker needed)
 npm run test:console-unit      # Admin console auth, settings, data browser, pruning and cron unit tests (no Docker needed)
-npm run test:ai                # Ask AI: parameters, settings and the connection test against a mock model API (no Docker needed)
+npm run test:ai                # Ask AI: parameters, settings, table selection, worked examples and the connection test against a mock model API (no Docker needed)
 npm run test:sql-guard         # Read-only / introspection guard for user-supplied SQL (no Docker needed)
 npm run test:sql-tables        # Table extraction for table-scoped SQL, against DuckDB's parser (no Docker needed)
 npm run test:storage           # Object-storage config, S3 secret SQL and maintenance settings (no Docker needed)

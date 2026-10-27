@@ -38,7 +38,10 @@ const AI_KEYS = new Set(AI_SETTINGS.map(s => s.key));
 
 const DISPLAY_MAX_ROWS = 1000;       // rows returned to the browser per result
 const MODEL_CELL_CHARS = 200;        // characters per cell sent to the model
-const SCHEMA_PROMPT_CHARS = 24000;   // full column lists up to this size, else names only
+const SCHEMA_PROMPT_CHARS = 24000;   // budget for the table list in the system prompt
+const EXAMPLE_COUNT = 4;             // saved functions shown as worked examples
+const EXAMPLE_SQL_CHARS = 1500;      // per example; longer ones are skipped
+const CALLABLE_COUNT = 25;           // saved functions offered to the model as run_function targets
 const HISTORY_TURNS = 10;
 const HISTORY_CHARS = 4000;
 const QUESTION_CHARS = 4000;
@@ -342,19 +345,109 @@ export function extractParams(sql) {
     return names;
 }
 
+// Parameter types. Each value becomes a SQL literal of that type (validated
+// first, so it can only ever be a literal), which makes LIMIT {{n}}, date
+// arithmetic and IN ({{ids}}) work. Untyped parameters are text.
+export const PARAM_TYPES = ['text', 'number', 'date', 'timestamp', 'boolean', 'list'];
+const NUMBER_RE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const TIMESTAMP_RE = /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?)?(Z|[+-]\d{2}:?\d{2})?$/;
+const MAX_VALUE_CHARS = 1000;
+const MAX_LIST_ITEMS = 1000;
+
+function validDate(y, m, d) {
+    const dt = new Date(Date.UTC(+y, +m - 1, +d));
+    return dt.getUTCFullYear() === +y && dt.getUTCMonth() === +m - 1 && dt.getUTCDate() === +d;
+}
+
+/** The SQL literal for one parameter value; throws 400 naming the parameter. */
+export function paramLiteral(def, raw) {
+    const bad = (msg) => httpError(400, `{{${def.name}}}: ${msg}`);
+    const text = Array.isArray(raw) ? raw.map(String).join(',') : String(raw);
+    if (text.length > MAX_VALUE_CHARS * (def.type === 'list' ? 10 : 1)) throw bad('the value is too long');
+    const v = text.trim();
+    switch (def.type || 'text') {
+        case 'text': return quoteLiteral(String(raw));
+        case 'number':
+            if (!NUMBER_RE.test(v)) throw bad(`"${v}" is not a number`);
+            return v;
+        case 'date': {
+            const m = v.match(DATE_RE);
+            if (!m || !validDate(m[1], m[2], m[3])) throw bad(`"${v}" is not a date (YYYY-MM-DD)`);
+            return `DATE '${v}'`;
+        }
+        case 'timestamp': {
+            const m = v.match(TIMESTAMP_RE);
+            const [y, mo, d] = m ? m[1].split('-') : [];
+            if (!m || !validDate(y, mo, d) || +(m[2] || 0) > 23 || +(m[3] || 0) > 59 || +(m[4] || 0) > 59) {
+                throw bad(`"${v}" is not a timestamp (YYYY-MM-DD HH:MM[:SS], optionally with Z or +HH:MM)`);
+            }
+            return `${m[6] ? 'TIMESTAMPTZ' : 'TIMESTAMP'} '${v.replace('T', ' ')}'`;
+        }
+        case 'boolean':
+            if (/^(true|1|yes|on)$/i.test(v)) return 'TRUE';
+            if (/^(false|0|no|off)$/i.test(v)) return 'FALSE';
+            throw bad(`"${v}" is not true or false`);
+        case 'list': {
+            const items = (Array.isArray(raw) ? raw.map(String) : v.split(',')).map(x => x.trim()).filter(x => x !== '');
+            if (!items.length) throw bad('the list is empty');
+            if (items.length > MAX_LIST_ITEMS) throw bad(`more than ${MAX_LIST_ITEMS} items`);
+            return items.map(quoteLiteral).join(', ');
+        }
+        default: throw bad(`unknown type ${def.type}`);
+    }
+}
+
+const isEmptyValue = (v) => v === undefined || v === null || (typeof v === 'string' && v.trim() === '') || (Array.isArray(v) && v.length === 0);
+
 /**
- * Replace {{name}} with the value as an escaped SQL string literal (DuckDB
- * casts it implicitly where a number or date is compared). A placeholder
- * stands for a whole value: write `name ILIKE '%' || {{q}} || '%'`, not
- * `'%{{q}}%'`. `values === null` substitutes NULL, for validating the SQL.
+ * Definitions for the {{parameters}} used in `sql`, in order of first use:
+ * [{ name, type, default (string or null), description }]. Definitions for
+ * names the SQL does not use are dropped; parameters without one are text
+ * without a default. With `strict`, invalid definitions throw 400 (saving);
+ * otherwise they fall back to text (reading stored functions).
  */
-export function bindParams(sql, values) {
+export function normaliseParamDefs(sql, defs, { strict = true } = {}) {
+    const given = new Map();
+    for (const d of Array.isArray(defs) ? defs : []) if (d && typeof d.name === 'string') given.set(d.name, d);
+    return extractParams(sql).map(name => {
+        const d = given.get(name) || {};
+        const type = PARAM_TYPES.includes(d.type) ? d.type : 'text';
+        if (d.type !== undefined && d.type !== null && d.type !== '' && !PARAM_TYPES.includes(d.type) && strict) {
+            throw httpError(400, `{{${name}}}: type must be one of ${PARAM_TYPES.join(', ')}`);
+        }
+        const description = String(d.description ?? '').trim().slice(0, 300);
+        let dflt = isEmptyValue(d.default) ? null : (Array.isArray(d.default) ? d.default.join(', ') : String(d.default));
+        if (dflt !== null) {
+            try { paramLiteral({ name, type }, dflt); } catch (err) {
+                if (strict) throw httpError(400, `${err.message} (default value)`);
+                dflt = null;
+            }
+        }
+        return { name, type, default: dflt, description };
+    });
+}
+
+/**
+ * Replace each {{name}} with a literal: the given value, else the parameter's
+ * default; a parameter with neither is a 400. A placeholder stands for a
+ * whole value: write `name ILIKE '%' || {{q}} || '%'`, not `'%{{q}}%'`, and
+ * `IN ({{ids}})` for a list. `values === null` substitutes a neutral literal
+ * of each type, for validating the SQL.
+ */
+export function bindParams(sql, values, defs = []) {
+    const byName = new Map((Array.isArray(defs) ? defs : []).map(d => [d.name, d]));
     return String(sql ?? '').replace(PARAM_RE, (_, name) => {
-        if (values === null) return 'NULL';
-        const v = values?.[name];
-        if (v === undefined || v === null || v === '') throw httpError(400, `A value for {{${name}}} is required`);
-        if (String(v).length > 1000) throw httpError(400, `The value for {{${name}}} is too long`);
-        return quoteLiteral(v);
+        const def = byName.get(name) || { name, type: 'text', default: null };
+        if (values === null) {
+            return { number: '1', boolean: 'TRUE', date: "DATE '2000-01-01'", timestamp: "TIMESTAMP '2000-01-01 00:00:00'" }[def.type] || 'NULL';
+        }
+        let v = values?.[name];
+        if (isEmptyValue(v)) {
+            if (def.default === null || def.default === undefined) throw httpError(400, `A value for {{${name}}} is required`);
+            v = def.default;
+        }
+        return paramLiteral(def, v);
     });
 }
 
@@ -366,7 +459,11 @@ function normaliseFunction(body) {
     const sql = String(body?.sql ?? '').trim().replace(/;\s*$/, '');
     if (!name || name.length > 100) throw httpError(400, 'A name of 1-100 characters is required');
     if (description.length > 1000) throw httpError(400, 'The description is longer than 1000 characters');
-    return { name, description, sql, question: String(body?.question ?? '').trim().slice(0, QUESTION_CHARS) };
+    return {
+        name, description, sql,
+        question: String(body?.question ?? '').trim().slice(0, QUESTION_CHARS),
+        paramDefs: normaliseParamDefs(sql, body?.params),
+    };
 }
 
 async function assertUniqueName(name, exceptId = null) {
@@ -374,7 +471,7 @@ async function assertUniqueName(name, exceptId = null) {
     if (clash) throw httpError(409, `A function named "${clash.name}" already exists`);
 }
 
-const withParams = (fn) => ({ ...fn, params: extractParams(fn.sql) });
+const withParams = ({ paramDefs, ...fn }) => ({ ...fn, params: normaliseParamDefs(fn.sql, paramDefs, { strict: false }) });
 
 export async function listFunctions() {
     return (await store.listAiFunctions()).map(withParams);
@@ -388,7 +485,7 @@ export async function getFunction(id) {
 
 export async function createFunction(body, username) {
     const fn = normaliseFunction(body);
-    await checkSql(bindParams(fn.sql, null));
+    await checkSql(bindParams(fn.sql, null, fn.paramDefs));
     await assertUniqueName(fn.name);
     const id = randomBytes(8).toString('hex');
     await store.createAiFunction({ ...fn, id, user: username });
@@ -398,7 +495,7 @@ export async function createFunction(body, username) {
 export async function updateFunction(id, body, username) {
     await getFunction(id);
     const fn = normaliseFunction(body);
-    await checkSql(bindParams(fn.sql, null));
+    await checkSql(bindParams(fn.sql, null, fn.paramDefs));
     await assertUniqueName(fn.name, id);
     await store.updateAiFunction(id, { ...fn, user: username });
     return getFunction(id);
@@ -412,7 +509,7 @@ export async function deleteFunction(id) {
 
 export async function runFunction(id, params, { signal } = {}) {
     const fn = await getFunction(id);
-    return { function: fn, ...(await runReadOnlySql(bindParams(fn.sql, params || {}), { signal })) };
+    return { function: fn, ...(await runReadOnlySql(bindParams(fn.sql, params || {}, fn.params), { signal })) };
 }
 
 function csvCell(v) {
@@ -424,7 +521,7 @@ function csvCell(v) {
 /** Stream a function's full result as CSV, up to EXPORT_MAX_ROWS rows. */
 export async function exportFunctionCsv(id, params, res) {
     const fn = await getFunction(id);
-    const { sql } = await checkSql(bindParams(fn.sql, params || {}));
+    const { sql } = await checkSql(bindParams(fn.sql, params || {}, fn.params));
     const maxRows = Math.max(1, parseInt(process.env.EXPORT_MAX_ROWS || '5000000', 10) || 5000000);
     const abort = new AbortController();
     res.on('close', () => { if (!res.writableFinished) abort.abort(); });
@@ -468,21 +565,133 @@ async function lakeSchema() {
     for (const c of cols) {
         if (isSystemTable(c.table_name)) continue;
         if (!tables.has(c.table_name)) tables.set(c.table_name, { name: c.table_name, rows: counts.get(c.table_name) ?? null, columns: [] });
-        tables.get(c.table_name).columns.push(`${c.column_name} ${c.data_type}`);
+        // Written as they must appear in SQL: quoted unless a plain lowercase word.
+        const col = /^[a-z_][a-z0-9_]*$/.test(c.column_name) ? c.column_name : quoteIdent(c.column_name);
+        tables.get(c.table_name).columns.push(`${col} ${c.data_type}`);
     }
     return [...tables.values()];
 }
 
-function schemaText(tables) {
-    if (!tables.length) return 'There are no user tables yet.';
-    const rows = (t) => (t.rows === null ? '' : ` (${Number(t.rows).toLocaleString('en-US')} rows)`);
-    const full = tables.map(t => `- ${t.name}${rows(t)}: ${t.columns.join(', ')}`).join('\n');
-    if (full.length <= SCHEMA_PROMPT_CHARS) return full;
-    return 'The schema is too large to list in full; call describe_table for the columns of a table.\n' +
-        tables.map(t => `- ${t.name}${rows(t)}, ${t.columns.length} columns`).join('\n');
+// --- Relevance (table selection and worked examples) --------------------------------
+//
+// Deterministic word matching, no extra model call: names are split into words
+// (snake_case, camelCase, digits), lower-cased and singularised, and common
+// English words are dropped.
+
+const STOP_WORDS = new Set(('a an and are as at be by can do does did for from has have how i in is it its many me much my ' +
+    'of on or per show than that the their them there these this to was were what when where which who why with ' +
+    'all any each every give get list find tell count total number average avg sum top most least last first ' +
+    'over under between since before after about into out up down day days week weeks month months year years ' +
+    'hour hours minute minutes today yesterday time times value values data table tables row rows column columns').split(' '));
+
+export function terms(text) {
+    const out = new Set();
+    const words = String(text ?? '')
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .toLowerCase()
+        .split(/[^a-z0-9]+/);
+    for (let w of words) {
+        if (w.length < 2 || STOP_WORDS.has(w) || /^\d+$/.test(w)) continue;
+        if (w.length > 3 && w.endsWith('ies')) w = `${w.slice(0, -3)}y`;
+        else if (w.length > 3 && w.endsWith('s') && !/(ss|us|is)$/.test(w)) w = w.slice(0, -1);
+        out.add(w);
+    }
+    return out;
 }
 
-function systemPrompt(tables, cfg) {
+/** How well a table matches the question's words: table-name words count most. */
+export function scoreTable(table, qTerms, questionText = '') {
+    if (!qTerms.size) return 0;
+    let score = 0;
+    for (const t of terms(table.name)) if (qTerms.has(t)) score += 3;
+    const colTerms = new Set();
+    for (const c of table.columns) for (const t of terms(String(c).split(' ')[0])) colTerms.add(t);
+    for (const t of colTerms) if (qTerms.has(t)) score += 1;
+    if (questionText && String(questionText).toLowerCase().includes(table.name.toLowerCase())) score += 5;
+    return score;
+}
+
+/**
+ * Table list for the system prompt. Everything with full column lists when it
+ * fits SCHEMA_PROMPT_CHARS; otherwise the tables that best match the question
+ * (and recent follow-ups) get their columns within the budget and the rest are
+ * listed by name for describe_table.
+ */
+export function schemaText(tables, question = '') {
+    if (!tables.length) return 'There are no user tables yet.';
+    const rows = (t) => (t.rows === null ? '' : ` (${Number(t.rows).toLocaleString('en-US')} rows)`);
+    const fullLine = (t) => `- ${t.name}${rows(t)}: ${t.columns.join(', ')}`;
+    const nameLine = (t) => `- ${t.name}${rows(t)}, ${t.columns.length} columns`;
+    const full = tables.map(fullLine).join('\n');
+    if (full.length <= SCHEMA_PROMPT_CHARS) return full;
+
+    const qTerms = terms(question);
+    const ranked = tables.map((t, i) => ({ t, i, score: scoreTable(t, qTerms, question) }))
+        .sort((a, b) => b.score - a.score || a.i - b.i);
+    const detailed = [];
+    const rest = [];
+    let used = tables.reduce((n, t) => n + nameLine(t).length + 1, 0);   // every table appears at least by name
+    for (const r of ranked) {
+        const extra = fullLine(r.t).length - nameLine(r.t).length;
+        if (r.score > 0 && used + extra <= SCHEMA_PROMPT_CHARS) { detailed.push(r.t); used += extra; }
+        else rest.push(r.t);
+    }
+    const parts = ['The schema is too large to list in full.'];
+    if (detailed.length) parts.push('Tables that look relevant to the question, with their columns:', detailed.map(fullLine).join('\n'));
+    if (rest.length) parts.push(`${detailed.length ? 'Other tables' : 'Tables'} (call describe_table for their columns):`, rest.sort((a, b) => a.name.localeCompare(b.name)).map(nameLine).join('\n'));
+    return parts.join('\n');
+}
+
+/**
+ * Saved functions as worked question -> SQL examples: those sharing the most
+ * words with the question first, topped up with the most recently updated.
+ * Functions over tables that no longer exist, and very long ones, are left out.
+ */
+export function pickExamples(functions, question, tables, count = EXAMPLE_COUNT, { maxSqlChars = EXAMPLE_SQL_CHARS } = {}) {
+    const tableNames = tables.map(t => t.name.toLowerCase());
+    const usable = (Array.isArray(functions) ? functions : []).filter(f => {
+        const sql = String(f.sql || '');
+        if (!sql || sql.length > maxSqlChars) return false;
+        const lower = sql.toLowerCase();
+        return tableNames.some(n => new RegExp(`(^|[^a-z0-9_])"?${n.replace(/[^a-z0-9_]/g, '.')}"?([^a-z0-9_]|$)`).test(lower));
+    });
+    const qTerms = terms(question);
+    const scored = usable.map(f => {
+        const fTerms = terms(`${f.question || ''} ${f.name || ''} ${f.description || ''}`);
+        let score = 0;
+        for (const t of fTerms) if (qTerms.has(t)) score++;
+        return { f, score };
+    });
+    const relevant = scored.filter(x => x.score > 0).sort((a, b) => b.score - a.score || (b.f.updatedMs || 0) - (a.f.updatedMs || 0));
+    const recent = scored.filter(x => x.score === 0).sort((a, b) => (b.f.updatedMs || 0) - (a.f.updatedMs || 0));
+    return [...relevant, ...recent].slice(0, count).map(x => x.f);
+}
+
+/** "name(region text, since date = '2024-01-01')" for the prompt. */
+export function functionSignature(fn) {
+    const params = (fn.params || []).map(p => `${p.name} ${p.type}${p.default !== null && p.default !== undefined ? ` = ${JSON.stringify(p.default)}` : ''}`);
+    return `${fn.name}(${params.join(', ')})`;
+}
+
+function callableText(functions) {
+    if (!functions.length) return '';
+    const lines = functions.map(f => `- ${functionSignature(f)}${f.description ? `: ${f.description}` : ''}`);
+    return `\nSaved functions you can call with run_function (pass parameters by name; ones with a default are optional). ` +
+        `Prefer a function when it answers the question as asked; otherwise write SQL.\n${lines.join('\n')}\n`;
+}
+
+function examplesText(examples) {
+    if (!examples.length) return '';
+    const blocks = examples.map(f => {
+        const q = f.question || [f.name, f.description].filter(Boolean).join(': ');
+        return `Question: ${q}\nSQL:\n${f.sql}`;
+    });
+    return `\nWorked examples: queries saved by the users of this lake (as reusable functions), with the question each answers. ` +
+        `Use them for the conventions of these tables, not as answers to copy. {{name}} marks a parameter of a saved function; ` +
+        `in run_sql write the actual value instead.\n\n${blocks.join('\n\n')}\n`;
+}
+
+function systemPrompt(tables, cfg, { question = '', examples = [], callable = [] } = {}) {
     const data = cfg.sampleRows > 0
         ? `Tool results show you at most ${cfg.sampleRows} rows of each result, with long values cut short; use aggregates, ORDER BY and LIMIT rather than reading raw rows.`
         : 'For privacy you are never shown data values: tool results give only column names and row counts. Write the query that answers the question; the user sees its result.';
@@ -495,6 +704,7 @@ Rules for SQL:
 - A guard rejects these words anywhere outside string literals and quoted identifiers: CREATE DROP INSERT UPDATE DELETE ALTER ATTACH DETACH COPY TRUNCATE MERGE REPLACE GRANT REVOKE VACUUM CHECKPOINT INSTALL LOAD EXPORT IMPORT CALL PRAGMA SET RESET USE. For example use regexp_replace() instead of replace(), and quote a column called "set".
 - Tables filled through the REST API usually have a "created" timestamp (when the row was written) and keyed tables an "updated" timestamp. BLOB columns hold binary data or a file path; leave them out unless asked.
 - If a query fails, read the error, fix the SQL and try again. Do not invent tables or columns; call describe_table when unsure.
+- Useful DuckDB functions: date_trunc('day', ts) for grouping by period, ts >= now() - INTERVAL 7 DAY for recent rows, epoch_ms(n) / to_timestamp(n) for numeric epochs, strftime() for formatting, regexp_matches() and ILIKE for text, json_extract_string() for JSON text.
 
 ${data}
 
@@ -502,9 +712,26 @@ When you have the answer, reply briefly in plain text: the answer itself, then o
 
 Current time (UTC): ${new Date().toISOString()}
 
+${examplesText(examples)}${callableText(callable)}
 Tables in the lake:
-${schemaText(tables)}`;
+${schemaText(tables, question)}`;
 }
+
+const RUN_FUNCTION_TOOL = {
+    type: 'function',
+    function: {
+        name: 'run_function',
+        description: 'Run one of the saved functions listed in the instructions, with parameter values, and return the column names, row count and the first rows.',
+        parameters: {
+            type: 'object',
+            properties: {
+                name: { type: 'string', description: 'The function name, exactly as listed' },
+                params: { type: 'object', description: 'Parameter values by name, e.g. {"region": "eu", "since": "2024-01-01"}', additionalProperties: true },
+            },
+            required: ['name'],
+        },
+    },
+};
 
 const TOOLS = [
     {
@@ -591,8 +818,18 @@ export async function ask({ question, history }, { signal = null } = {}) {
     if (!q) throw httpError(400, 'Ask a question');
     if (q.length > QUESTION_CHARS) throw httpError(400, `Questions are limited to ${QUESTION_CHARS} characters`);
 
+    // Relevance uses the question plus recent follow-up questions, so "and per
+    // week?" keeps the tables the conversation is about.
+    const context = [...(Array.isArray(history) ? history : []).slice(-3).map(t => String(t?.question ?? '')), q].join(' ');
+    const tables = await lakeSchema();
+    let functions = [];
+    try { functions = (await store.listAiFunctions()).map(withParams); } catch { /* functions are optional */ }
+    const examples = pickExamples(functions, context, tables);
+    // Callable: the most relevant functions whose tables exist, any length.
+    const callable = pickExamples(functions, context, tables, CALLABLE_COUNT, { maxSqlChars: Infinity });
+    const tools = callable.length ? [...TOOLS, RUN_FUNCTION_TOOL] : TOOLS;
     const messages = [
-        { role: 'system', content: systemPrompt(await lakeSchema(), cfg) },
+        { role: 'system', content: systemPrompt(tables, cfg, { question: context, examples, callable }) },
         ...historyMessages(history),
         { role: 'user', content: q },
     ];
@@ -604,7 +841,7 @@ export async function ask({ question, history }, { signal = null } = {}) {
     for (let round = 0; ; round++) {
         const lastRound = round >= cfg.maxSteps;
         if (lastRound) messages.push({ role: 'user', content: 'You have used all your tool calls. Answer now with what you have.' });
-        const data = await chat(cfg, { messages, tools: TOOLS, tool_choice: lastRound ? 'none' : 'auto' }, signal);
+        const data = await chat(cfg, { messages, tools, tool_choice: lastRound ? 'none' : 'auto' }, signal);
         model = data.model || model;
         usage.prompt += data.usage?.prompt_tokens || 0;
         usage.completion += data.usage?.completion_tokens || 0;
@@ -629,6 +866,17 @@ export async function ask({ question, history }, { signal = null } = {}) {
                     Object.assign(stepInfo, { sql: r.sql, rowCount: r.rowCount, truncated: r.truncated });
                     result = r;
                     content = forModel(r, cfg);
+                } else if (name === 'run_function' && callable.length) {
+                    const wanted = String(args.name ?? '').trim().toLowerCase();
+                    const fn = functions.find(f => f.name.toLowerCase() === wanted);
+                    stepInfo.function = String(args.name ?? '');
+                    stepInfo.params = args.params && typeof args.params === 'object' ? args.params : {};
+                    if (!fn) throw httpError(404, `No saved function named "${args.name}"`);
+                    stepInfo.function = fn.name;
+                    const r = await runReadOnlySql(bindParams(fn.sql, stepInfo.params, fn.params), { signal });
+                    Object.assign(stepInfo, { sql: r.sql, rowCount: r.rowCount, truncated: r.truncated });
+                    result = { ...r, functionId: fn.id, functionName: fn.name };
+                    content = forModel(r, cfg);
                 } else if (name === 'describe_table') {
                     stepInfo.table = String(args.table ?? '');
                     content = await describeTable(args.table, cfg, signal);
@@ -646,4 +894,95 @@ export async function ask({ question, history }, { signal = null } = {}) {
             messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(content) });
         }
     }
+}
+
+// --- Suggesting parameters for a query --------------------------------------------------
+
+const PROPOSE_TOOL = {
+    type: 'function',
+    function: {
+        name: 'propose_function',
+        description: 'The query rewritten as a reusable function with {{parameters}}.',
+        parameters: {
+            type: 'object',
+            properties: {
+                name: { type: 'string', description: 'Short name, e.g. "Daily orders by region"' },
+                description: { type: 'string', description: 'One sentence: what it returns' },
+                sql: { type: 'string', description: 'The query with {{name}} placeholders' },
+                params: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            name: { type: 'string' },
+                            type: { type: 'string', enum: PARAM_TYPES },
+                            default: { type: 'string', description: 'The value the original query used' },
+                            description: { type: 'string' },
+                        },
+                        required: ['name', 'type', 'default'],
+                    },
+                },
+            },
+            required: ['name', 'sql', 'params'],
+        },
+    },
+};
+
+const SUGGEST_PROMPT = `You turn a DuckDB SQL query into a reusable saved function with parameters.
+
+Replace the hard-coded values a user would want to change between runs (dates and times, ids, names, categories, thresholds, LIMIT counts) with {{name}} placeholders. Leave everything else exactly as it is: the same tables, columns, joins, grouping and ordering. Do not parameterise identifiers (table or column names), keywords or SQL functions, and do not add parameters the query does not need; a query with no such values gets no parameters.
+
+A placeholder replaces a whole value including its quotes, so 'eu' becomes {{region}} and DATE '2024-01-01' or '2024-01-01' becomes {{since}}. Inside a pattern use concatenation: name ILIKE '%' || {{q}} || '%'. A list of values becomes IN ({{ids}}) with type list.
+
+Parameter names: lowercase snake_case. Types: text, number, date (YYYY-MM-DD), timestamp (YYYY-MM-DD HH:MM:SS), boolean, list (comma-separated values). Give each the value from the original query as its default, so running the function with no values returns the original result, and a short description.
+
+Also give the function a short name and a one-sentence description. Answer by calling propose_function.`;
+
+/**
+ * Ask the model to parameterise `sql` (Save as function). Returns
+ * { name, description, sql, params } after checking the proposal is valid
+ * read-only SQL; one retry with the error when it is not. The model only
+ * sees the query, the question and the referenced tables' columns.
+ */
+export async function suggestFunction({ sql, question }, { signal = null } = {}) {
+    const cfg = aiConfig();
+    if (!isConfigured(cfg)) throw httpError(400, 'AI is not configured. Set the API base URL and model on the AI Settings page.');
+    const checked = await checkSql(bindParams(sql, null, normaliseParamDefs(sql, [], { strict: false })));
+    const cols = [];
+    for (const name of checked.tables) {
+        const t = await findLakeTable(name);
+        if (!t) continue;
+        const rows = await execute(`SELECT column_name, data_type FROM information_schema.columns
+            WHERE table_catalog = 'ducklake' AND table_schema = 'main' AND table_name = ${quoteLiteral(t.name)} ORDER BY ordinal_position`);
+        cols.push(`- ${t.name}: ${rows.map(r => `${r.column_name} ${r.data_type}`).join(', ')}`);
+    }
+    const messages = [
+        { role: 'system', content: SUGGEST_PROMPT },
+        { role: 'user', content: `${question ? `The query answers: ${String(question).slice(0, QUESTION_CHARS)}\n\n` : ''}Tables:\n${cols.join('\n') || '(none)'}\n\nQuery:\n${String(sql).slice(0, SQL_CHARS)}` },
+    ];
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const data = await chat(cfg, { messages, tools: [PROPOSE_TOOL], tool_choice: { type: 'function', function: { name: 'propose_function' } } }, signal);
+        const msg = data.choices?.[0]?.message;
+        const call = (msg?.tool_calls || []).find(c => c.function?.name === 'propose_function');
+        if (!call) throw modelError(502, 'The model did not propose a function. Try again or choose a model with tool calling.');
+        const p = parseArgs(call);
+        try {
+            const proposal = {
+                name: String(p.name ?? '').trim().slice(0, 100),
+                description: String(p.description ?? '').trim().slice(0, 1000),
+                sql: String(p.sql ?? '').trim().replace(/;\s*$/, ''),
+            };
+            proposal.params = normaliseParamDefs(proposal.sql, p.params);
+            await checkSql(bindParams(proposal.sql, null, proposal.params));
+            if (proposal.params.every(d => d.default !== null)) await checkSql(bindParams(proposal.sql, {}, proposal.params));
+            return proposal;
+        } catch (err) {
+            lastError = err;
+            messages.push({ role: 'assistant', content: msg.content ?? null, tool_calls: [call] },
+                { role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: String(err.message || err).slice(0, 500) }) },
+                { role: 'user', content: 'That proposal is not valid. Fix it and call propose_function again.' });
+        }
+    }
+    throw httpError(502, `The model's proposal was not valid: ${String(lastError?.message || lastError).slice(0, 300)}`);
 }

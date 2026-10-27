@@ -905,8 +905,18 @@ export function createConsoleRouter() {
 
     // Run SQL edited in the console (from an answer or a function being edited).
     api.post('/ai/run', aiRoute(async (req, res) => {
-        const sql = ai.bindParams(req.body?.sql, parseParams(req.body?.params));
+        // Unsaved SQL from the editor: typed with the definitions being edited.
+        const defs = ai.normaliseParamDefs(req.body?.sql, req.body?.paramDefs);
+        const sql = ai.bindParams(req.body?.sql, parseParams(req.body?.params), defs);
         res.json(await ai.runReadOnlySql(sql, { signal: abortOnClose(res) }));
+    }));
+
+    // Ask the model to turn a query's hard-coded values into {{parameters}}
+    // (Save as function). Nothing is saved; the admin reviews the proposal.
+    api.post('/ai/functions/suggest', requireAdmin, aiRoute(async (req, res) => {
+        const proposal = await ai.suggestFunction({ sql: req.body?.sql, question: req.body?.question }, { signal: abortOnClose(res) });
+        await audit(req, 'ai.function_suggest', `${proposal.params.length} parameter(s) proposed`);
+        res.json({ proposal });
     }));
 
     api.get('/ai/functions', aiRoute(async (req, res) => {
