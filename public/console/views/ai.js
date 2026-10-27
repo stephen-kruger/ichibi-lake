@@ -53,36 +53,119 @@
                     h('tbody', {}, body))));
     }
 
-    /** Inputs for the {{parameters}} of `sql`; sync() follows edits to the SQL. */
-    function paramForm(initialSql) {
-        const inputs = new Map();
+    const PARAM_TYPES = [
+        ['text', 'Text'], ['number', 'Number'], ['date', 'Date'], ['timestamp', 'Timestamp'], ['boolean', 'Yes / no'], ['list', 'List (for IN)'],
+    ];
+    const DEFAULT_HINT = { text: 'value', number: 'e.g. 10', date: 'YYYY-MM-DD', timestamp: 'YYYY-MM-DD HH:MM:SS', boolean: 'true or false', list: 'a, b, c' };
+    const SQL_HELP = 'One read-only SELECT over lake tables. Use {{name}} for a value to fill in at each run, e.g. WHERE region = {{region}}, created >= {{since}}, LIMIT {{n}}, ' +
+        'id IN ({{ids}}) or name ILIKE \'%\' || {{q}} || \'%\'. A placeholder is replaced by the whole value, quotes included.';
+
+    /**
+     * Type, default and description for each {{parameter}} of the SQL.
+     * sync(sql) follows edits to the SQL (keeping what was entered for names
+     * that stay); set(defs) replaces everything (a suggestion).
+     */
+    function paramDefsEditor(sql, defs, { readOnly = false, onChange = () => {} } = {}) {
+        const state = new Map((defs || []).map(d => [d.name, { ...d }]));
         let names = [];
-        const el = h('div', { class: 'form-grid params' });
-        const sync = (sql) => {
-            names = paramsOf(sql);
-            for (const n of names) if (!inputs.has(n)) inputs.set(n, h('input', { type: 'text', placeholder: 'value' }));
-            el.replaceChildren(...names.map(n => field(`{{${n}}}`, inputs.get(n))));
+        let currentSql = sql;
+        const el = h('div', { class: 'param-defs' });
+        const render = () => {
+            names = paramsOf(currentSql);
+            for (const n of names) if (!state.has(n)) state.set(n, { name: n, type: 'text', default: null, description: '' });
+            const rows = names.map(n => {
+                const d = state.get(n);
+                const type = h('select', { disabled: readOnly }, PARAM_TYPES.map(([v, l]) => h('option', { value: v, selected: v === d.type }, l)));
+                const dflt = h('input', { type: 'text', value: d.default ?? '', readOnly, placeholder: `none: required (${DEFAULT_HINT[d.type] || 'value'})` });
+                const desc = h('input', { type: 'text', value: d.description || '', readOnly, maxlength: 300, placeholder: 'shown next to the input' });
+                type.addEventListener('change', () => { d.type = type.value; dflt.placeholder = `none: required (${DEFAULT_HINT[d.type]})`; onChange(); });
+                dflt.addEventListener('input', () => { d.default = dflt.value === '' ? null : dflt.value; onChange(); });
+                desc.addEventListener('input', () => { d.description = desc.value; onChange(); });
+                return h('tr', {}, h('td', { class: 'mono' }, `{{${n}}}`), h('td', {}, type), h('td', {}, dflt), h('td', {}, desc));
+            });
+            el.replaceChildren(h('label', { class: 'label' }, 'Parameters'),
+                h('div', { class: 'table-wrap' }, h('table', { class: 'param-table' },
+                    h('thead', {}, h('tr', {}, h('th', {}, 'Placeholder'), h('th', {}, 'Type'), h('th', {}, 'Default'), h('th', {}, 'Description'))),
+                    h('tbody', {}, rows))),
+                h('div', { class: 'help' }, 'Values are checked against the type and inserted as typed SQL literals. A parameter with a default is optional when running.'));
             el.hidden = names.length === 0;
         };
-        sync(initialSql);
-        return { el, sync, values: () => Object.fromEntries(names.map(n => [n, inputs.get(n).value])) };
+        render();
+        return {
+            el,
+            sync: (sqlText) => { currentSql = sqlText; render(); },
+            set: (sqlText, newDefs) => { state.clear(); for (const d of newDefs || []) state.set(d.name, { ...d }); currentSql = sqlText; render(); },
+            defs: () => names.map(n => ({ ...state.get(n) })),
+        };
     }
 
-    async function saveFunctionDialog({ sql, question }) {
+    /** Typed inputs to run a function; sync(defs) follows the definitions. */
+    function paramForm(defs) {
+        const inputs = new Map();   // name -> { type, input }
+        let current = [];
+        const el = h('div', { class: 'form-grid params' });
+        const make = (d) => {
+            if (d.type === 'boolean') {
+                return h('select', {}, h('option', { value: '' }, d.default !== null ? `default (${d.default})` : 'choose…'),
+                    h('option', { value: 'true' }, 'true'), h('option', { value: 'false' }, 'false'));
+            }
+            const type = { number: 'number', date: 'date', timestamp: 'datetime-local' }[d.type] || 'text';
+            const input = h('input', { type, placeholder: d.default !== null ? `default: ${d.default}` : (d.type === 'list' ? 'a, b, c' : 'required') });
+            if (type === 'number') input.step = 'any';
+            if (type === 'datetime-local') input.step = '1';
+            return input;
+        };
+        const sync = (newDefs) => {
+            current = newDefs || [];
+            el.replaceChildren(...current.map(d => {
+                let entry = inputs.get(d.name);
+                if (!entry || entry.type !== d.type) { entry = { type: d.type, input: make(d) }; inputs.set(d.name, entry); }
+                const help = [d.description, d.default !== null && d.default !== undefined ? `Default: ${d.default}` : 'Required'].filter(Boolean).join(' · ');
+                return field(h('span', {}, `{{${d.name}}} `, h('span', { class: 'badge' }, d.type)), entry.input, help);
+            }));
+            el.hidden = current.length === 0;
+        };
+        sync(defs);
+        return { el, sync, values: () => Object.fromEntries(current.map(d => [d.name, inputs.get(d.name).input.value])) };
+    }
+
+    /** "Suggest parameters": the model's proposal, applied to the form for review. */
+    async function suggestInto({ button, editor, defsEditor, name, description, question, onApplied }) {
+        await withBusy(button, async () => {
+            const { proposal } = await api('POST', '/ai/functions/suggest', { sql: editor.value, question });
+            editor.value = proposal.sql;
+            defsEditor.set(proposal.sql, proposal.params);
+            if (name && !name.value.trim() && proposal.name) name.value = proposal.name;
+            if (description && (!description.value.trim() || description.value === question) && proposal.description) description.value = proposal.description;
+            onApplied?.();
+            toast(proposal.params.length
+                ? `Suggested ${proposal.params.length} parameter(s). Review them before saving.`
+                : 'The model found no values worth turning into parameters.', 'success');
+        });
+    }
+
+    async function saveFunctionDialog({ sql, question, aiConfigured }) {
         const name = h('input', { type: 'text', maxlength: 100, required: true, placeholder: 'e.g. Daily orders by region' });
         const description = h('input', { type: 'text', maxlength: 1000, value: question || '' });
         const editor = sqlEditor(sql, { rows: 8 });
+        const defsEditor = paramDefsEditor(sql, []);
+        editor.addEventListener('input', () => defsEditor.sync(editor.value));
+        const suggest = h('button', { class: 'btn small', type: 'button', hidden: !aiConfigured, title: 'Let the model turn hard-coded values (dates, ids, names, limits) into parameters' },
+            icon('sparkle'), 'Suggest parameters');
+        suggest.addEventListener('click', () => suggestInto({ button: suggest, editor, defsEditor, name, description, question }));
         const ok = await modal({
             title: 'Save as function', wide: true,
             body: h('div', {},
                 field('Name', name),
                 field('Description', description),
-                field('SQL', editor, 'Use {{name}} for a value to fill in at each run, e.g. WHERE region = {{region}} or name ILIKE \'%\' || {{q}} || \'%\'.')),
+                field('SQL', editor, SQL_HELP),
+                h('div', { class: 'action-row' }, suggest),
+                defsEditor.el),
             actions: [{ label: 'Cancel', value: false }, { label: 'Save function', value: true, primary: true }],
         });
         if (!ok) return null;
         try {
-            const res = await api('POST', '/ai/functions', { name: name.value, description: description.value, sql: editor.value, question });
+            const res = await api('POST', '/ai/functions', { name: name.value, description: description.value, sql: editor.value, question, params: defsEditor.defs() });
             toast(`Saved function "${res.function.name}"`, 'success');
             return res.function;
         } catch (err) {
@@ -111,9 +194,10 @@
             h('summary', {}, `How it was answered: ${steps.length} tool call(s)`),
             h('ol', { class: 'steps' }, steps.map(s => h('li', {},
                 h('span', { class: `badge ${s.ok ? 'ok' : 'off'}` }, s.ok ? 'ok' : 'failed'), ' ',
-                h('strong', {}, s.tool === 'describe_table' ? `describe_table ${s.table}` : 'run_sql'),
+                h('strong', {}, s.tool === 'describe_table' ? `describe_table ${s.table}` : s.tool === 'run_function' ? `run_function ${s.function || ''}` : 'run_sql'),
+                s.tool === 'run_function' && s.params && Object.keys(s.params).length ? h('span', { class: 'mono small muted' }, ` ${JSON.stringify(s.params)}`) : null,
                 s.purpose ? h('span', { class: 'muted' }, ` — ${s.purpose}`) : null,
-                s.ok && s.tool === 'run_sql' ? h('span', { class: 'muted' }, ` · ${s.rowCount}${s.truncated ? '+' : ''} row(s) · ${s.ms} ms`) : null,
+                s.ok && (s.tool === 'run_sql' || s.tool === 'run_function') ? h('span', { class: 'muted' }, ` · ${s.rowCount}${s.truncated ? '+' : ''} row(s) · ${s.ms} ms`) : null,
                 s.sql ? h('pre', { class: 'code' }, s.sql) : null,
                 s.error ? h('div', { class: 'error-text small' }, s.error) : null))));
     }
@@ -151,11 +235,12 @@
         const save = h('button', { class: 'btn small primary', type: 'button', disabled: !ctx.isAdmin, title: ctx.isAdmin ? undefined : 'Admins can save functions' },
             icon('bolt'), 'Save as function');
         save.addEventListener('click', async () => {
-            const fn = await saveFunctionDialog({ sql: editor.value, question: turn.question });
+            const fn = await saveFunctionDialog({ sql: editor.value, question: turn.question, aiConfigured: ctx.aiConfigured });
             if (fn) turn.savedAs = fn;
             if (fn) note.replaceChildren('Saved as ', h('a', { href: `#/ai-functions/${enc(fn.id)}` }, fn.name), '.');
         });
-        const note = h('span', { class: 'muted small' }, turn.savedAs ? ['Saved as ', h('a', { href: `#/ai-functions/${enc(turn.savedAs.id)}` }, turn.savedAs.name), '.'] : '');
+        const note = h('span', { class: 'muted small' }, turn.savedAs ? ['Saved as ', h('a', { href: `#/ai-functions/${enc(turn.savedAs.id)}` }, turn.savedAs.name), '.']
+            : turn.result.functionId ? ['From saved function ', h('a', { href: `#/ai-functions/${enc(turn.result.functionId)}` }, turn.result.functionName), '.'] : '');
         return h('div', { class: 'ai-result' },
             h('div', { class: 'label-row' }, h('span', { class: 'label' }, 'Result query'), h('div', { class: 'action-row' }, note, run, save)),
             editor, out);
@@ -163,6 +248,7 @@
 
     registerView('ai-query', async (ctx) => {
         const cfg = await api('GET', '/ai/settings');
+        ctx.aiConfigured = cfg.configured;
         const thread = h('div', { class: 'ai-thread' }, conversation.map(t => turnView(t, ctx)));
         const input = h('textarea', { class: 'ai-input', rows: 3, placeholder: 'e.g. Which 10 customers ordered the most last month, and how much did they spend?' });
         const askBtn = h('button', { class: 'btn primary', type: 'submit', disabled: !cfg.configured }, icon('sparkle'), 'Ask');
@@ -211,7 +297,9 @@
         const add = h('button', { class: 'btn primary', type: 'button', disabled: !ctx.isAdmin, onclick: () => ctx.navigate('ai-functions', 'new') }, icon('plus'), 'New function');
         const rows = data.functions.map(f => h('tr', { class: 'clickable', onclick: () => ctx.navigate('ai-functions', f.id) },
             h('td', {}, h('div', { class: 'rule-name' }, f.name), f.description ? h('div', { class: 'muted small' }, f.description) : null),
-            h('td', { class: 'mono small' }, f.params.length ? f.params.map(p => `{{${p}}}`).join(' ') : h('span', { class: 'muted' }, '—')),
+            h('td', { class: 'mono small' }, f.params.length
+                ? f.params.map(p => h('div', {}, `{{${p.name}}} `, h('span', { class: 'muted' }, `${p.type}${p.default !== null ? ' (optional)' : ''}`)))
+                : h('span', { class: 'muted' }, '—')),
             h('td', { class: 'muted small' }, fmtDate(new Date(f.updatedMs).toISOString()), h('div', {}, f.updatedBy || '')),
             h('td', { class: 'actions' }, h('button', { class: 'btn small', type: 'button' }, icon('play'), 'Open'))));
         return [
@@ -226,20 +314,22 @@
     async function functionDetail(ctx, id) {
         const isNew = id === 'new';
         const fn = isNew ? { name: '', description: '', sql: 'SELECT ', params: [], question: '' } : (await api('GET', `/ai/functions/${enc(id)}`)).function;
+        const aiSettings = await api('GET', '/ai/settings');
         const ro = !ctx.isAdmin;
         const name = h('input', { type: 'text', value: fn.name, maxlength: 100, readOnly: ro });
         const description = h('input', { type: 'text', value: fn.description, maxlength: 1000, readOnly: ro });
         const editor = sqlEditor(fn.sql, { readOnly: ro, rows: 10 });
-        const params = paramForm(fn.sql);
+        const params = paramForm(fn.params);
+        const defsEditor = paramDefsEditor(fn.sql, fn.params, { readOnly: ro, onChange: () => { params.sync(defsEditor.defs()); syncDownload(); } });
         const out = h('div');
-        const unsaved = () => isNew || editor.value.trim() !== fn.sql.trim();
+        const unsaved = () => isNew || editor.value.trim() !== fn.sql.trim() || JSON.stringify(defsEditor.defs()) !== JSON.stringify(fn.params);
 
         const download = h('a', { class: 'btn', download: '' }, icon('download'), 'Download CSV');
         const syncDownload = () => {
             download.hidden = unsaved();
             download.href = `api/ai/functions/${enc(id)}/export?params=${enc(JSON.stringify(params.values()))}`;
         };
-        editor.addEventListener('input', () => { params.sync(editor.value); syncDownload(); });
+        editor.addEventListener('input', () => { defsEditor.sync(editor.value); params.sync(defsEditor.defs()); syncDownload(); });
         params.el.addEventListener('input', syncDownload);
         syncDownload();
 
@@ -247,14 +337,20 @@
         run.addEventListener('click', () => withBusy(run, async () => {
             const body = { params: params.values() };
             const r = unsaved()
-                ? await api('POST', '/ai/run', { sql: editor.value, ...body })
+                ? await api('POST', '/ai/run', { sql: editor.value, paramDefs: defsEditor.defs(), ...body })
                 : await api('POST', `/ai/functions/${enc(id)}/run`, body);
             out.replaceChildren(resultView(r));
         }));
 
+        const suggest = h('button', { class: 'btn', type: 'button', hidden: ro || !aiSettings.configured, title: 'Let the model turn hard-coded values (dates, ids, names, limits) into parameters' },
+            icon('sparkle'), 'Suggest parameters');
+        suggest.addEventListener('click', () => suggestInto({
+            button: suggest, editor, defsEditor, name, description, question: fn.question,
+            onApplied: () => { params.sync(defsEditor.defs()); syncDownload(); },
+        }));
         const save = h('button', { class: 'btn primary', type: 'button', hidden: ro }, isNew ? 'Create function' : 'Save changes');
         save.addEventListener('click', () => withBusy(save, async () => {
-            const body = { name: name.value, description: description.value, sql: editor.value, question: fn.question };
+            const body = { name: name.value, description: description.value, sql: editor.value, question: fn.question, params: defsEditor.defs() };
             const res = isNew ? await api('POST', '/ai/functions', body) : await api('PUT', `/ai/functions/${enc(id)}`, body);
             toast(`Saved "${res.function.name}"`, 'success');
             if (isNew) ctx.navigate('ai-functions', res.function.id);
@@ -278,9 +374,10 @@
                     isNew ? null : h('span', { class: 'hint' }, `Updated ${fmtDate(new Date(fn.updatedMs).toISOString())} by ${fn.updatedBy || '?'}`)),
                 h('div', { class: 'card-body' },
                     h('div', { class: 'form-grid' }, field('Name', name), field('Description', description)),
-                    field('SQL', editor, 'One read-only SELECT over lake tables. Use {{name}} for a value to fill in at each run; it is inserted as a quoted literal, e.g. WHERE region = {{region}} or created >= {{since}}.'),
+                    field('SQL', editor, SQL_HELP),
                     fn.question ? h('p', { class: 'muted small card-intro' }, `Saved from the question: “${fn.question}”`) : null,
-                    h('div', { class: 'action-row' }, save))),
+                    defsEditor.el,
+                    h('div', { class: 'action-row' }, suggest, h('span', { class: 'spacer' }), save))),
             h('div', { class: 'card' },
                 h('div', { class: 'card-header' }, h('h2', {}, 'Run'), h('span', { class: 'hint' }, 'Results show up to 1,000 rows; Download CSV returns them all (up to EXPORT_MAX_ROWS).')),
                 h('div', { class: 'card-body row-gap' }, params.el, h('div', { class: 'action-row' }, run, download), out)),

@@ -158,6 +158,8 @@ export async function initConsoleTables() {
         updated_ms BIGINT,
         updated_by VARCHAR
     )`);
+    // Parameter definitions (JSON array of { name, type, default, description }).
+    await execute(`ALTER TABLE ${AI_FUNCTIONS} ADD COLUMN IF NOT EXISTS params VARCHAR`);
     await migrateFromMainCatalog();
     await migrateLegacyRetention();
 }
@@ -699,8 +701,11 @@ export async function listAudit(limit = 200) {
 // --- Saved AI functions -------------------------------------------------------------
 
 function aiFunctionFromRow(r) {
+    let paramDefs = [];
+    try { paramDefs = r.params ? JSON.parse(r.params) : []; } catch { /* treated as untyped */ }
     return {
         id: r.id, name: r.name, description: r.description || '', sql: r.sql, question: r.question || '',
+        paramDefs: Array.isArray(paramDefs) ? paramDefs : [],
         createdMs: num(r.created_ms), createdBy: r.created_by, updatedMs: num(r.updated_ms), updatedBy: r.updated_by,
     };
 }
@@ -717,17 +722,17 @@ export async function getAiFunction(id) {
 export async function createAiFunction(fn) {
     const now = BigInt(Date.now());
     await executeWithParams(
-        `INSERT INTO ${AI_FUNCTIONS} (id, name, description, sql, question, created_ms, created_by, updated_ms, updated_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [fn.id, fn.name, fn.description, fn.sql, fn.question, now, fn.user, now, fn.user],
-        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, VARCHAR]);
+        `INSERT INTO ${AI_FUNCTIONS} (id, name, description, sql, question, params, created_ms, created_by, updated_ms, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [fn.id, fn.name, fn.description, fn.sql, fn.question, JSON.stringify(fn.paramDefs || []), now, fn.user, now, fn.user],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, VARCHAR]);
 }
 
 export async function updateAiFunction(id, fn) {
     await executeWithParams(
-        `UPDATE ${AI_FUNCTIONS} SET name = ?, description = ?, sql = ?, updated_ms = ?, updated_by = ? WHERE id = ?`,
-        [fn.name, fn.description, fn.sql, BigInt(Date.now()), fn.user, id],
-        [VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR]);
+        `UPDATE ${AI_FUNCTIONS} SET name = ?, description = ?, sql = ?, params = ?, updated_ms = ?, updated_by = ? WHERE id = ?`,
+        [fn.name, fn.description, fn.sql, JSON.stringify(fn.paramDefs || []), BigInt(Date.now()), fn.user, id],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR]);
 }
 
 export async function deleteAiFunction(id) {

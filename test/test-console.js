@@ -917,8 +917,23 @@ async function run() {
                     const reply = (message) => res.end(JSON.stringify({ model: 'mock-model', choices: [{ message }], usage: { total_tokens: 10 } }));
                     res.setHeader('Content-Type', 'application/json');
                     if (req.url.endsWith('/models')) return res.end(JSON.stringify({ data: [{ id: 'mock-model' }] }));
+                    if (b.tool_choice?.function?.name === 'propose_function') {
+                        const proposal = {
+                            name: 'Totals for regions', description: 'Sum per region',
+                            sql: `SELECT region, sum(amount) AS total FROM ${AIT} WHERE region IN ({{regions}}) GROUP BY region`,
+                            params: [{ name: 'regions', type: 'list', default: 'North, South', description: 'Regions' }],
+                        };
+                        return reply({ role: 'assistant', tool_calls: [{ id: 'f', type: 'function', function: { name: 'propose_function', arguments: JSON.stringify(proposal) } }] });
+                    }
                     if (b.tool_choice && typeof b.tool_choice === 'object') {
                         return reply({ role: 'assistant', tool_calls: [{ id: 'p', type: 'function', function: { name: 'ping', arguments: '{}' } }] });
+                    }
+                    const lastUser = [...(b.messages || [])].reverse().find(m => m.role === 'user')?.content;
+                    if (lastUser === 'USE_FUNCTION') {
+                        const used = (b.messages || []).some(m => m.role === 'tool');
+                        if (used) return reply({ role: 'assistant', content: 'From the saved function.' });
+                        return reply({ role: 'assistant', content: null, tool_calls: [{ id: 'r', type: 'function', function: {
+                            name: 'run_function', arguments: JSON.stringify({ name: `ci totals ${TS}`, params: { region: 'North' } }) } }] });
                     }
                     if (b.messages?.at(-1)?.content === 'FAIL') {
                         res.statusCode = 502;
@@ -999,7 +1014,7 @@ async function run() {
                 await test('a result query is saved as a function with a parameter and run', async () => {
                     const sql = `SELECT region, sum(amount) AS total FROM ${AIT} WHERE region = {{region}} GROUP BY region`;
                     const c = await admin('POST', '/ai/functions', { name: `CI totals ${TS}`, description: 'per region', sql, question: 'q' });
-                    assert(c.status === 200 && c.data.function.params[0] === 'region', JSON.stringify(c.data));
+                    assert(c.status === 200 && c.data.function.params[0].name === 'region' && c.data.function.params[0].type === 'text', JSON.stringify(c.data));
                     fnId = c.data.function.id;
                     assert((await admin('POST', '/ai/functions', { name: `ci TOTALS ${TS}`, sql })).status === 409, 'duplicate name');
                     assert((await admin('POST', '/ai/functions', { name: 'bad', sql: `DROP TABLE ${AIT}` })).status === 403, 'unsafe sql');
@@ -1008,6 +1023,50 @@ async function run() {
                     const inject = await admin('POST', `/ai/functions/${fnId}/run`, { params: { region: "x' OR '1'='1" } });
                     assert(inject.status === 200 && inject.data.rowCount === 0, 'parameter values are literals');
                     assert((await admin('POST', `/ai/functions/${fnId}/run`, {})).status === 400, 'missing parameter');
+                });
+                await test('typed parameters: defaults, LIMIT numbers, lists and rejected values', async () => {
+                    const sql = `SELECT region, sum(amount) AS total FROM ${AIT} WHERE region IN ({{regions}}) AND amount >= {{min}} GROUP BY region ORDER BY total DESC LIMIT {{n}}`;
+                    const params = [
+                        { name: 'regions', type: 'list', description: 'Regions' },
+                        { name: 'min', type: 'number', default: '0' },
+                        { name: 'n', type: 'number', default: '10' },
+                    ];
+                    const c = await admin('POST', '/ai/functions', { name: `CI typed ${TS}`, sql, params });
+                    assert(c.status === 200 && c.data.function.params.map(p => `${p.name}:${p.type}:${p.default}`).join(',') === 'regions:list:null,min:number:0,n:number:10', JSON.stringify(c.data));
+                    const id = c.data.function.id;
+                    try {
+                        const all = await admin('POST', `/ai/functions/${id}/run`, { params: { regions: "North, O'Hare" } });
+                        assert(all.status === 200 && all.data.rowCount === 2, JSON.stringify(all.data));
+                        const one = await admin('POST', `/ai/functions/${id}/run`, { params: { regions: "North,O'Hare", n: '1' } });
+                        assert(one.status === 200 && one.data.rowCount === 1 && / LIMIT 1$/.test(one.data.sql), JSON.stringify(one.data));
+                        const bad = await admin('POST', `/ai/functions/${id}/run`, { params: { regions: 'North', n: '1; DROP TABLE x' } });
+                        assert(bad.status === 400 && /\{\{n\}\}: .* is not a number/.test(bad.data.error), JSON.stringify(bad.data));
+                        assert((await admin('POST', `/ai/functions/${id}/run`, { params: {} })).status === 400, 'list without default is required');
+                        assert((await admin('POST', '/ai/functions', { name: `CI bad ${TS}`, sql, params: [{ name: 'n', type: 'number', default: 'ten' }] })).status === 400, 'invalid default');
+                        const run = await admin('POST', '/ai/run', { sql: 'SELECT {{d}} + 1 AS next', params: { d: '2024-02-28' }, paramDefs: [{ name: 'd', type: 'date' }] });
+                        assert(run.status === 200 && String(run.data.rows[0][0]).startsWith('2024-02-29'), JSON.stringify(run.data));
+                    } finally {
+                        await admin('DELETE', `/ai/functions/${id}`);
+                    }
+                });
+                await test('the model can call a saved function with parameter values', async () => {
+                    modelCalls.length = 0;
+                    const r = await admin('POST', '/ai/ask', { question: 'USE_FUNCTION' });
+                    assert(r.status === 200 && r.data.answer === 'From the saved function.', JSON.stringify(r.data));
+                    const step = r.data.steps[0];
+                    assert(step.tool === 'run_function' && step.ok && step.function === `CI totals ${TS}`, JSON.stringify(step));
+                    assert(r.data.result.functionId === fnId && r.data.result.rows[0][1] === 30, JSON.stringify(r.data.result));
+                    const offered = modelCalls[0].body.tools.map(t => t.function.name);
+                    assert(offered.includes('run_function'), offered.join(','));
+                    assert(modelCalls[0].body.messages[0].content.includes(`CI totals ${TS}(region text)`), 'signature in the prompt');
+                });
+                await test('parameters are suggested for a query and validated', async () => {
+                    const r = await admin('POST', '/ai/functions/suggest', { sql: `SELECT region, sum(amount) AS total FROM ${AIT} WHERE region IN ('North','South') GROUP BY region`, question: 'totals' });
+                    assert(r.status === 200, JSON.stringify(r.data));
+                    const p = r.data.proposal;
+                    assert(p.name === 'Totals for regions' && /IN \(\{\{regions\}\}\)/.test(p.sql), JSON.stringify(p));
+                    assert(p.params.length === 1 && p.params[0].type === 'list' && p.params[0].default === 'North, South', JSON.stringify(p.params));
+                    assert((await admin('POST', '/ai/functions', { name: `ci totals ${TS}`, sql: p.sql, params: p.params })).status === 409, 'proposal saves like any function (name clash here)');
                 });
                 await test('a function downloads as CSV and can be edited', async () => {
                     const res = await admin('GET', `/ai/functions/${fnId}/export?params=${encodeURIComponent(JSON.stringify({ region: 'North' }))}`, undefined, { raw: true });

@@ -9,7 +9,7 @@ import http from 'node:http';
 
 // Settings snapshot docker/.env values at import time, so set the key first.
 process.env.OPENAI_API_KEY = 'sk-test-1234567890abcdef';
-const { extractParams, bindParams, plainValue, aiConfig, isConfigured, testSettings, settingsView, AI_SETTINGS } = await import('../src/console/ai.js');
+const { extractParams, bindParams, plainValue, aiConfig, isConfigured, testSettings, settingsView, AI_SETTINGS, terms, scoreTable, schemaText, pickExamples, paramLiteral, normaliseParamDefs, functionSignature, PARAM_TYPES } = await import('../src/console/ai.js');
 const { SECTIONS, getSettingDef, normaliseSettingValue } = await import('../src/console/registry.js');
 
 let passed = 0, failed = 0;
@@ -69,6 +69,56 @@ async function run() {
     await test('a missing or empty value is a 400', () => {
         assert.throws(() => bindParams('a = {{x}}', {}), (e) => e.statusCode === 400 && /\{\{x\}\}/.test(e.message));
         assert.throws(() => bindParams('a = {{x}}', { x: '' }), (e) => e.statusCode === 400);
+    });
+
+    console.log('\n▸ ai: typed parameters');
+    const lit = (type, v) => paramLiteral({ name: 'p', type }, v);
+    const rejects = (type, v, re) => assert.throws(() => lit(type, v), (e) => e.statusCode === 400 && /\{\{p\}\}/.test(e.message) && re.test(e.message), `${type} ${v}`);
+    await test('each type becomes a validated SQL literal', () => {
+        assert.equal(lit('text', "it's"), "'it''s'");
+        assert.equal(lit('number', ' 10 '), '10');
+        assert.equal(lit('number', '-2.5e3'), '-2.5e3');
+        assert.equal(lit('date', '2024-02-29'), "DATE '2024-02-29'");
+        assert.equal(lit('timestamp', '2024-02-03T04:05'), "TIMESTAMP '2024-02-03 04:05'");
+        assert.equal(lit('timestamp', '2024-02-03 04:05:06.123Z'), "TIMESTAMPTZ '2024-02-03 04:05:06.123Z'");
+        assert.equal(lit('boolean', 'Yes'), 'TRUE');
+        assert.equal(lit('boolean', '0'), 'FALSE');
+        assert.equal(lit('list', "eu, us ,o'x,"), "'eu', 'us', 'o''x'");
+        assert.equal(lit('list', ['a', 'b']), "'a', 'b'");
+        assert.deepEqual(PARAM_TYPES, ['text', 'number', 'date', 'timestamp', 'boolean', 'list']);
+    });
+    await test('values that do not match the type are rejected, so they can never inject SQL', () => {
+        rejects('number', '1; DROP TABLE x', /not a number/);
+        rejects('number', '1 OR 1=1', /not a number/);
+        rejects('date', '2023-02-29', /not a date/);
+        rejects('date', "2024-01-01' OR '1'='1", /not a date/);
+        rejects('timestamp', '2024-01-01 25:00', /not a timestamp/);
+        rejects('boolean', 'maybe', /true or false/);
+        rejects('list', ' , ', /empty/);
+    });
+    await test('defaults make parameters optional; a missing value without one is required', () => {
+        const defs = [{ name: 'n', type: 'number', default: '10' }, { name: 'region', type: 'text', default: null }];
+        assert.equal(bindParams('SELECT * FROM t WHERE r = {{region}} LIMIT {{n}}', { region: 'eu' }, defs), "SELECT * FROM t WHERE r = 'eu' LIMIT 10");
+        assert.equal(bindParams('SELECT {{n}}', { n: '5' }, defs), 'SELECT 5');
+        assert.throws(() => bindParams('SELECT {{region}}', {}, defs), /A value for \{\{region\}\} is required/);
+        assert.equal(bindParams('SELECT {{n}}, {{d}}, {{b}}, {{l}}', null, [{ name: 'n', type: 'number' }, { name: 'd', type: 'date' }, { name: 'b', type: 'boolean' }, { name: 'l', type: 'list' }]),
+            "SELECT 1, DATE '2000-01-01', TRUE, NULL", 'validation literals parse in every position');
+        assert.equal(bindParams('SELECT * FROM t WHERE id IN ({{ids}})', { ids: '1,2' }, [{ name: 'ids', type: 'list' }]), "SELECT * FROM t WHERE id IN ('1', '2')");
+    });
+    await test('definitions follow the SQL; invalid ones are rejected when saving, ignored when reading', () => {
+        const sql = 'SELECT * FROM t WHERE a = {{a}} AND b = {{b}}';
+        const defs = normaliseParamDefs(sql, [{ name: 'b', type: 'date', default: '2024-01-01', description: ' since ' }, { name: 'gone', type: 'number' }]);
+        assert.deepEqual(defs, [
+            { name: 'a', type: 'text', default: null, description: '' },
+            { name: 'b', type: 'date', default: '2024-01-01', description: 'since' },
+        ]);
+        assert.throws(() => normaliseParamDefs(sql, [{ name: 'a', type: 'money' }]), /type must be one of/);
+        assert.throws(() => normaliseParamDefs(sql, [{ name: 'a', type: 'number', default: 'ten' }]), /not a number \(default value\)/);
+        assert.deepEqual(normaliseParamDefs(sql, [{ name: 'a', type: 'number', default: 'ten' }], { strict: false })[0], { name: 'a', type: 'number', default: null, description: '' });
+    });
+    await test('function signatures for the model show types and defaults', () => {
+        assert.equal(functionSignature({ name: 'Orders', params: [{ name: 'region', type: 'text', default: null }, { name: 'n', type: 'number', default: '10' }] }), 'Orders(region text, n number = "10")');
+        assert.equal(functionSignature({ name: 'All', params: [] }), 'All()');
     });
 
     console.log('\n▸ ai: result values');
@@ -183,6 +233,52 @@ async function run() {
     await test('invalid form values are rejected before any request', async () => {
         await assert.rejects(testSettings({ OPENAI_BASE_URL: 'not a url' }), (e) => e.statusCode === 400);
         await assert.rejects(testSettings({ SOMETHING_ELSE: 'x' }), (e) => e.statusCode === 400);
+    });
+
+    console.log('\n▸ ai: table selection and worked examples');
+    const table = (name, columns, rows = 10) => ({ name, rows, columns: columns.map(c => `${c} VARCHAR`) });
+    await test('names are split into singular words without common English words', () => {
+        assert.deepEqual([...terms('How many sensor_readings per deviceId in the last 7 days?')].sort(), ['device', 'id', 'reading', 'sensor']);
+        assert.deepEqual([...terms('batteries status')].sort(), ['battery', 'status']);
+    });
+    await test('table-name matches outweigh column matches', () => {
+        const q = terms('average temperature per device');
+        assert.ok(scoreTable(table('device_temperature', ['id']), q) > scoreTable(table('events', ['device', 'temperature']), q));
+        assert.equal(scoreTable(table('orders', ['id', 'total']), q), 0);
+        assert.ok(scoreTable(table('ha_states', ['x']), terms('rows in ha_states'), 'rows in ha_states') >= 5, 'exact table name in the question');
+    });
+    await test('a schema that fits is listed in full', () => {
+        const text = schemaText([table('a', ['x', 'y']), table('b', ['z'])], 'anything');
+        assert.match(text, /^- a \(10 rows\): x VARCHAR, y VARCHAR\n- b \(10 rows\): z VARCHAR$/);
+    });
+    await test('a large schema keeps columns for the relevant tables and names for the rest', () => {
+        const wide = (name) => table(name, Array.from({ length: 300 }, (_, i) => `column_number_${i}`));
+        const tables = [wide('orders'), wide('customers'), ...Array.from({ length: 30 }, (_, i) => wide(`filler_${i}`)), table('energy_meter', ['kwh', 'meter_id'])];
+        const text = schemaText(tables, 'total kwh per energy meter');
+        assert.ok(text.length < 26000, `length ${text.length}`);
+        assert.match(text, /Tables that look relevant to the question, with their columns:\n- energy_meter \(10 rows\): kwh VARCHAR, meter_id VARCHAR/);
+        assert.match(text, /call describe_table for their columns\):[\s\S]*- orders \(10 rows\), 300 columns/);
+        for (const t of tables) assert.ok(text.includes(`- ${t.name} `), `${t.name} is listed`);
+    });
+    await test('without a matching table, a large schema lists names only', () => {
+        const wide = (name) => table(name, Array.from({ length: 300 }, (_, i) => `c_${i}`));
+        const text = schemaText(Array.from({ length: 20 }, (_, i) => wide(`t${i}`)), 'hello');
+        assert.match(text, /^The schema is too large to list in full.\nTables \(call describe_table/);
+    });
+    await test('worked examples: relevant first, then recent; stale and long ones skipped', () => {
+        const tables = [table('energy_meter', ['kwh']), table('orders', ['total'])];
+        const fns = [
+            { name: 'Orders per day', question: 'orders per day', sql: 'SELECT date_trunc(\'day\', created) d, count(*) FROM orders GROUP BY d', updatedMs: 1 },
+            { name: 'Energy use', question: 'daily kwh used by each energy meter', sql: 'SELECT sum(kwh) FROM energy_meter', updatedMs: 2 },
+            { name: 'Old', question: 'kwh from the old table', sql: 'SELECT * FROM dropped_table', updatedMs: 9 },
+            { name: 'Huge', question: 'kwh', sql: `SELECT ${'1 + '.repeat(600)}1 FROM energy_meter`, updatedMs: 8 },
+            { name: 'Recent', question: 'something else', sql: 'SELECT count(*) FROM "orders"', updatedMs: 5 },
+        ];
+        const picked = pickExamples(fns, 'how much kwh did each meter use this week?', tables, 2).map(f => f.name);
+        assert.deepEqual(picked, ['Energy use', 'Recent']);
+        assert.deepEqual(pickExamples(fns, 'x', tables, 4).map(f => f.name), ['Recent', 'Energy use', 'Orders per day']);
+        assert.deepEqual(pickExamples([], 'kwh', tables), []);
+        assert.deepEqual(pickExamples([{ name: 'n', sql: 'SELECT 1 FROM orders_archive' }], 'x', tables), [], 'a longer name is not a match');
     });
 
     console.log('\n─── ai unit tests ───');
