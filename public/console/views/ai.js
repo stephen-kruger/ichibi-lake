@@ -65,11 +65,40 @@
      * sync(sql) follows edits to the SQL (keeping what was entered for names
      * that stay); set(defs) replaces everything (a suggestion).
      */
-    function paramDefsEditor(sql, defs, { readOnly = false, onChange = () => {} } = {}) {
+    function paramDefsEditor(sql, defs, { readOnly = false, onChange = () => {}, editor = null } = {}) {
         const state = new Map((defs || []).map(d => [d.name, { ...d }]));
         let names = [];
         let currentSql = sql;
         const el = h('div', { class: 'param-defs' });
+
+        /**
+         * Remove parameters: put hard-coded values back into the SQL (each
+         * one's default, or a value asked for here), as the server would
+         * insert them at run time.
+         */
+        const removeParams = async (list, button) => {
+            if (!editor || !list.length) return;
+            const values = {};
+            const needs = list.filter(n => state.get(n).default === null || state.get(n).default === '');
+            if (needs.length) {
+                const inputs = new Map(needs.map(n => [n, h('input', { type: 'text', placeholder: DEFAULT_HINT[state.get(n).type] || 'value' })]));
+                const ok = await modal({
+                    title: needs.length === 1 ? `Value for {{${needs[0]}}}` : 'Values to put back',
+                    body: h('div', {},
+                        h('p', { class: 'muted' }, `${needs.length === 1 ? 'This parameter has' : 'These parameters have'} no default. Enter the value to write into the SQL instead.`),
+                        ...needs.map(n => field(h('span', {}, `{{${n}}} `, h('span', { class: 'badge' }, state.get(n).type)), inputs.get(n)))),
+                    actions: [{ label: 'Cancel', value: false }, { label: 'Put values back', value: true, primary: true }],
+                });
+                if (!ok) return;
+                for (const [n, input] of inputs) values[n] = input.value;
+            }
+            await withBusy(button, async () => {
+                const res = await api('POST', '/ai/inline-params', { sql: editor.value, params: names.map(n => state.get(n)), names: list, values });
+                editor.value = res.sql;
+                editor.dispatchEvent(new Event('input'));   // the page re-syncs parameters and run inputs
+                toast(list.length === 1 ? `Removed {{${list[0]}}}; its value is back in the SQL` : `Removed ${list.length} parameters; their values are back in the SQL`, 'success');
+            });
+        };
         const render = () => {
             names = paramsOf(currentSql);
             for (const n of names) if (!state.has(n)) state.set(n, { name: n, type: 'text', default: null, description: '' });
@@ -81,13 +110,21 @@
                 type.addEventListener('change', () => { d.type = type.value; dflt.placeholder = `none: required (${DEFAULT_HINT[d.type]})`; onChange(); });
                 dflt.addEventListener('input', () => { d.default = dflt.value === '' ? null : dflt.value; onChange(); });
                 desc.addEventListener('input', () => { d.description = desc.value; onChange(); });
-                return h('tr', {}, h('td', { class: 'mono' }, `{{${n}}}`), h('td', {}, type), h('td', {}, dflt), h('td', {}, desc));
+                const remove = readOnly || !editor ? null : h('button', {
+                    class: 'icon-btn param-remove', type: 'button',
+                    title: 'Remove this parameter: write its default (or a value you enter) back into the SQL', 'aria-label': `Remove {{${n}}}`,
+                }, icon('trash'));
+                remove?.addEventListener('click', () => removeParams([n], remove));
+                return h('tr', {}, h('td', { class: 'mono' }, `{{${n}}}`), h('td', {}, type), h('td', {}, dflt), h('td', {}, desc), h('td', { class: 'actions' }, remove));
             });
-            el.replaceChildren(h('label', { class: 'label' }, 'Parameters'),
+            const removeAll = readOnly || !editor || names.length < 2 ? null : h('button', { class: 'btn small', type: 'button' }, 'Remove all');
+            removeAll?.addEventListener('click', () => removeParams([...names], removeAll));
+            el.replaceChildren(h('div', { class: 'label-row' }, h('label', { class: 'label' }, 'Parameters'), removeAll),
                 h('div', { class: 'table-wrap' }, h('table', { class: 'param-table' },
-                    h('thead', {}, h('tr', {}, h('th', {}, 'Placeholder'), h('th', {}, 'Type'), h('th', {}, 'Default'), h('th', {}, 'Description'))),
+                    h('thead', {}, h('tr', {}, h('th', {}, 'Placeholder'), h('th', {}, 'Type'), h('th', {}, 'Default'), h('th', {}, 'Description'), h('th', {}, ''))),
                     h('tbody', {}, rows))),
-                h('div', { class: 'help' }, 'Values are checked against the type and inserted as typed SQL literals. A parameter with a default is optional when running.'));
+                h('div', { class: 'help' }, 'Values are checked against the type and inserted as typed SQL literals. A parameter with a default is optional when running. ' +
+                    (readOnly || !editor ? '' : 'Remove a parameter to write its default back into the SQL as a fixed value.')));
             el.hidden = names.length === 0;
         };
         render();
@@ -148,7 +185,7 @@
         const name = h('input', { type: 'text', maxlength: 100, required: true, placeholder: 'e.g. Daily orders by region' });
         const description = h('input', { type: 'text', maxlength: 1000, value: question || '' });
         const editor = sqlEditor(sql, { rows: 8 });
-        const defsEditor = paramDefsEditor(sql, []);
+        const defsEditor = paramDefsEditor(sql, [], { editor });
         editor.addEventListener('input', () => defsEditor.sync(editor.value));
         const suggest = h('button', { class: 'btn small', type: 'button', hidden: !aiConfigured, title: 'Let the model turn hard-coded values (dates, ids, names, limits) into parameters' },
             icon('sparkle'), 'Suggest parameters');
@@ -320,7 +357,7 @@
         const description = h('input', { type: 'text', value: fn.description, maxlength: 1000, readOnly: ro });
         const editor = sqlEditor(fn.sql, { readOnly: ro, rows: 10 });
         const params = paramForm(fn.params);
-        const defsEditor = paramDefsEditor(fn.sql, fn.params, { readOnly: ro, onChange: () => { params.sync(defsEditor.defs()); syncDownload(); } });
+        const defsEditor = paramDefsEditor(fn.sql, fn.params, { readOnly: ro, editor, onChange: () => { params.sync(defsEditor.defs()); syncDownload(); } });
         const out = h('div');
         const unsaved = () => isNew || editor.value.trim() !== fn.sql.trim() || JSON.stringify(defsEditor.defs()) !== JSON.stringify(fn.params);
 

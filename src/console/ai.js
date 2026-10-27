@@ -451,6 +451,31 @@ export function bindParams(sql, values, defs = []) {
     });
 }
 
+/**
+ * The reverse of a parameter: replace the {{placeholders}} in `names` with
+ * hard-coded literals (the value given, else the parameter's default), as a
+ * run would insert them. Other placeholders are left as they are. Used to
+ * undo a suggested or unwanted parameter in the editor; nothing is saved.
+ */
+export function inlineParams(sql, defs, names, values = {}) {
+    const wanted = new Set(Array.isArray(names) ? names.map(String) : []);
+    const byName = new Map((Array.isArray(defs) ? defs : []).filter(d => d && typeof d.name === 'string').map(d => [d.name, d]));
+    const missing = [];
+    const out = String(sql ?? '').replace(PARAM_RE, (match, name) => {
+        if (!wanted.has(name)) return match;
+        const d = byName.get(name) || {};
+        const def = { name, type: PARAM_TYPES.includes(d.type) ? d.type : 'text' };
+        let v = values?.[name];
+        if (isEmptyValue(v)) v = d.default;
+        if (isEmptyValue(v)) { missing.push(name); return match; }
+        return paramLiteral(def, v);
+    });
+    if (missing.length) {
+        throw httpError(400, `${[...new Set(missing)].map(n => `{{${n}}}`).join(', ')} ha${missing.length > 1 ? 've' : 's'} no default: enter the value to put back`);
+    }
+    return out;
+}
+
 // --- Saved functions -----------------------------------------------------------------
 
 function normaliseFunction(body) {

@@ -9,7 +9,7 @@ import http from 'node:http';
 
 // Settings snapshot docker/.env values at import time, so set the key first.
 process.env.OPENAI_API_KEY = 'sk-test-1234567890abcdef';
-const { extractParams, bindParams, plainValue, aiConfig, isConfigured, testSettings, settingsView, AI_SETTINGS, terms, scoreTable, schemaText, pickExamples, paramLiteral, normaliseParamDefs, functionSignature, PARAM_TYPES } = await import('../src/console/ai.js');
+const { extractParams, bindParams, plainValue, aiConfig, isConfigured, testSettings, settingsView, AI_SETTINGS, terms, scoreTable, schemaText, pickExamples, paramLiteral, normaliseParamDefs, functionSignature, PARAM_TYPES, inlineParams } = await import('../src/console/ai.js');
 const { SECTIONS, getSettingDef, normaliseSettingValue } = await import('../src/console/registry.js');
 
 let passed = 0, failed = 0;
@@ -115,6 +115,21 @@ async function run() {
         assert.throws(() => normaliseParamDefs(sql, [{ name: 'a', type: 'money' }]), /type must be one of/);
         assert.throws(() => normaliseParamDefs(sql, [{ name: 'a', type: 'number', default: 'ten' }]), /not a number \(default value\)/);
         assert.deepEqual(normaliseParamDefs(sql, [{ name: 'a', type: 'number', default: 'ten' }], { strict: false })[0], { name: 'a', type: 'number', default: null, description: '' });
+    });
+    await test('removing parameters puts typed hard-coded values back', () => {
+        const sql = 'SELECT * FROM t WHERE region IN ({{regions}}) AND d >= {{since}} AND x = {{keep}} LIMIT {{n}}';
+        const defs = [
+            { name: 'regions', type: 'list', default: "eu, o'x" },
+            { name: 'since', type: 'date', default: '2024-01-01' },
+            { name: 'keep', type: 'text', default: 'k' },
+            { name: 'n', type: 'number', default: null },
+        ];
+        assert.equal(inlineParams(sql, defs, ['regions', 'since', 'n'], { n: '5' }),
+            "SELECT * FROM t WHERE region IN ('eu', 'o''x') AND d >= DATE '2024-01-01' AND x = {{keep}} LIMIT 5");
+        assert.equal(inlineParams('SELECT {{a}}, {{a}}', [{ name: 'a', type: 'text', default: 'z' }], ['a']), "SELECT 'z', 'z'", 'every occurrence');
+        assert.throws(() => inlineParams(sql, defs, ['n']), /\{\{n\}\} has no default/);
+        assert.throws(() => inlineParams(sql, defs, ['n'], { n: 'five' }), /not a number/);
+        assert.equal(inlineParams(sql, defs, []), sql, 'nothing selected: unchanged');
     });
     await test('function signatures for the model show types and defaults', () => {
         assert.equal(functionSignature({ name: 'Orders', params: [{ name: 'region', type: 'text', default: null }, { name: 'n', type: 'number', default: '10' }] }), 'Orders(region text, n number = "10")');
