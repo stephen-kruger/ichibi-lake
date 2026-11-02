@@ -2,11 +2,15 @@ name: ichibi-lake
 
 services:
   app:
-    build:
-      # Build from the repo root so the Dockerfile can COPY package.json
-      # and src/ directly.
-      context: ..
-      dockerfile: docker/Dockerfile
+    # The published gateway image (built by .github/workflows/docker-publish.yml).
+    # Pin a release with ICHIBI_LAKE_IMAGE=ghcr.io/stephen-kruger/ichibi-lake:<version>.
+    # Inside a checkout of the repository, compose.override.yaml (loaded
+    # automatically) builds this image from source instead.
+    #
+    # The image also runs on its own (bundled Postgres and Kafka, data in
+    # /data); this file is the split setup, with Postgres and Kafka as the
+    # db and kafka services below, so the bundled ones are switched off.
+    image: ${ICHIBI_LAKE_IMAGE:-ghcr.io/stephen-kruger/ichibi-lake:latest}
     container_name: ichibi-lake
     hostname: ichibi-lake
     # The Node gateway listens on ${PORT:-3000}. This is the only port that is
@@ -20,6 +24,8 @@ services:
     cap_drop: [ "ALL" ]
     security_opt: [ "no-new-privileges:true" ]
     environment:
+      - EMBEDDED_POSTGRES=0
+      - EMBEDDED_KAFKA=0
       # DuckLake metadata Postgres (consumed by src/db.js).
       - DUCKLAKE_PG_HOST=db
       - DUCKLAKE_PG_PORT=5432
@@ -62,6 +68,8 @@ services:
       # Directory where BLOB files are written. Persisted via the bind mount
       # to docker/data/blobs so files survive container restarts.
       - BLOBS_PATH=/app/blobs
+      # Storage settings saved on the console's Storage page (see volumes below).
+      - STORAGE_CONFIG_FILE=/app/config/storage.json
       # Gateway API key(s). Comma-separate multiple keys. The default matches
       # the test key baked into swagger.yaml / test-graphs.js.
       - API_KEYS=${API_KEYS:-ICHIBI_LAKE_TEST_7a96c3e2-b1fe-4705-9064-fc1882674b13}

@@ -1,0 +1,14 @@
+# Loaded automatically by `docker compose` next to compose.yaml: inside a
+# checkout of the repository the gateway is built from source rather than
+# pulled from ghcr.io. To run the published image from here instead, use
+#   docker compose -f compose.yaml pull && docker compose -f compose.yaml up -d
+# A compose.yaml copied on its own (without this file) uses the published image.
+services:
+  app:
+    # A local tag, so a build never overwrites a pulled ghcr.io image.
+    image: ichibi-lake:dev
+    build:
+      # Build from the repo root so the Dockerfile can COPY package.json
+      # and src/ directly.
+      context: ..
+      dockerfile: docker/Dockerfile
