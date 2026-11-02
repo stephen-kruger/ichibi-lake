@@ -3,8 +3,9 @@
  * model that writes and runs read-only SQL), Saved Functions (named SQL with
  * optional {{parameters}}, run on demand or downloaded as CSV) and AI Settings
  * (model endpoint, key and limits, with a connection test). Server side:
- * src/console/ai.js. Loaded after app.js and uses its helpers (h, api, icon,
- * modal, toast, withBusy, field, pageHeader, sourceBadge, fmtDate).
+ * src/console/ai.js. Loaded after app.js and chart.js and uses their helpers (h,
+ * api, icon, modal, toast, withBusy, field, pageHeader, sourceBadge, fmtDate,
+ * LakeChart).
  */
 'use strict';
 
@@ -32,8 +33,12 @@
         return typeof v === 'object' ? JSON.stringify(v) : String(v);
     }
 
-    /** Result grid for { columns, rows (arrays), rowCount, truncated, ms }. */
-    function resultView(r) {
+    /**
+     * Result for { columns, rows (arrays), rowCount, truncated, ms }: a chart
+     * (when one fits) and the grid, with a switch between them. `state` keeps
+     * the chosen chart ({ chart, initial }) and view across reruns.
+     */
+    function resultView(r, state = { chart: null, initial: null }) {
         if (!r) return h('div');
         const summary = h('div', { class: 'muted small result-summary' },
             `${r.rowCount.toLocaleString()} row(s)`, r.truncated ? ` (first ${r.rowCount.toLocaleString()} shown; more available)` : '',
@@ -46,11 +51,22 @@
                 return h('td', { class: `cell ${typeof v === 'number' ? 'num' : ''}`, title: t && t.length > 60 ? t.slice(0, 2000) : undefined },
                     t === null ? h('span', { class: 'null' }, 'NULL') : t.length > 300 ? `${t.slice(0, 300)}…` : t);
             })));
-        return h('div', {}, summary,
-            h('div', { class: 'grid-wrap result-grid' },
-                h('table', { class: 'grid' },
-                    h('thead', {}, h('tr', {}, h('th', { class: 'rownum' }, '#'), r.columns.map(c => h('th', {}, c)))),
-                    h('tbody', {}, body))));
+        const grid = h('div', { class: 'grid-wrap result-grid' },
+            h('table', { class: 'grid' },
+                h('thead', {}, h('tr', {}, h('th', { class: 'rownum' }, '#'), r.columns.map(c => h('th', {}, c)))),
+                h('tbody', {}, body)));
+        const chart = LakeChart.chartView(r, state);
+        if (!chart) return h('div', {}, summary, grid);
+        const buttons = [['chart', 'chart', 'Chart'], ['table', 'table', 'Table']].map(([view, ic, label]) =>
+            h('button', { type: 'button', dataset: { view }, onclick: () => { state.view = view; show(); } }, icon(ic), label));
+        const show = () => {
+            const view = state.view || 'chart';
+            chart.hidden = view !== 'chart';
+            grid.hidden = view !== 'table';
+            for (const b of buttons) b.classList.toggle('active', b.dataset.view === view);
+        };
+        show();
+        return h('div', {}, h('div', { class: 'result-bar' }, summary, h('div', { class: 'seg', role: 'group', 'aria-label': 'Result view' }, buttons)), chart, grid);
     }
 
     const PARAM_TYPES = [
@@ -181,7 +197,7 @@
         });
     }
 
-    async function saveFunctionDialog({ sql, question, aiConfigured }) {
+    async function saveFunctionDialog({ sql, question, chart, aiConfigured }) {
         const name = h('input', { type: 'text', maxlength: 100, required: true, placeholder: 'e.g. Daily orders by region' });
         const description = h('input', { type: 'text', maxlength: 1000, value: question || '' });
         const editor = sqlEditor(sql, { rows: 8 });
@@ -202,7 +218,7 @@
         });
         if (!ok) return null;
         try {
-            const res = await api('POST', '/ai/functions', { name: name.value, description: description.value, sql: editor.value, question, params: defsEditor.defs() });
+            const res = await api('POST', '/ai/functions', { name: name.value, description: description.value, sql: editor.value, question, params: defsEditor.defs(), chart: chart || null });
             toast(`Saved function "${res.function.name}"`, 'success');
             return res.function;
         } catch (err) {
@@ -231,7 +247,9 @@
             h('summary', {}, `How it was answered: ${steps.length} tool call(s)`),
             h('ol', { class: 'steps' }, steps.map(s => h('li', {},
                 h('span', { class: `badge ${s.ok ? 'ok' : 'off'}` }, s.ok ? 'ok' : 'failed'), ' ',
-                h('strong', {}, s.tool === 'describe_table' ? `describe_table ${s.table}` : s.tool === 'run_function' ? `run_function ${s.function || ''}` : 'run_sql'),
+                h('strong', {}, s.tool === 'describe_table' ? `describe_table ${s.table}` : s.tool === 'run_function' ? `run_function ${s.function || ''}`
+                    : s.tool === 'chart' ? `chart ${s.chart?.type || ''}` : 'run_sql'),
+                s.tool === 'chart' && s.chart ? h('span', { class: 'muted' }, ` — ${s.chart.y.join(', ')} by ${s.chart.x}${s.chart.series ? `, split by ${s.chart.series}` : ''}`) : null,
                 s.tool === 'run_function' && s.params && Object.keys(s.params).length ? h('span', { class: 'mono small muted' }, ` ${JSON.stringify(s.params)}`) : null,
                 s.purpose ? h('span', { class: 'muted' }, ` — ${s.purpose}`) : null,
                 s.ok && (s.tool === 'run_sql' || s.tool === 'run_function') ? h('span', { class: 'muted' }, ` · ${s.rowCount}${s.truncated ? '+' : ''} row(s) · ${s.ms} ms`) : null,
@@ -262,17 +280,18 @@
 
     function resultPanel(turn, ctx) {
         const editor = sqlEditor(turn.result.sql);
-        const out = h('div', {}, resultView(turn.result));
+        turn.chartState ??= { chart: turn.result.chart || null, initial: turn.result.chart || null };
+        const out = h('div', {}, resultView(turn.result, turn.chartState));
         const run = h('button', { class: 'btn small', type: 'button' }, icon('play'), 'Run');
         run.addEventListener('click', () => withBusy(run, async () => {
             const r = await api('POST', '/ai/run', { sql: editor.value });
             turn.result = r;
-            out.replaceChildren(resultView(r));
+            out.replaceChildren(resultView(r, turn.chartState));
         }));
         const save = h('button', { class: 'btn small primary', type: 'button', disabled: !ctx.isAdmin, title: ctx.isAdmin ? undefined : 'Admins can save functions' },
             icon('bolt'), 'Save as function');
         save.addEventListener('click', async () => {
-            const fn = await saveFunctionDialog({ sql: editor.value, question: turn.question, aiConfigured: ctx.aiConfigured });
+            const fn = await saveFunctionDialog({ sql: editor.value, question: turn.question, chart: turn.chartState.chart, aiConfigured: ctx.aiConfigured });
             if (fn) turn.savedAs = fn;
             if (fn) note.replaceChildren('Saved as ', h('a', { href: `#/ai-functions/${enc(fn.id)}` }, fn.name), '.');
         });
@@ -359,6 +378,7 @@
         const params = paramForm(fn.params);
         const defsEditor = paramDefsEditor(fn.sql, fn.params, { readOnly: ro, editor, onChange: () => { params.sync(defsEditor.defs()); syncDownload(); } });
         const out = h('div');
+        const chartState = { chart: fn.chart || null, initial: fn.chart || null };
         const unsaved = () => isNew || editor.value.trim() !== fn.sql.trim() || JSON.stringify(defsEditor.defs()) !== JSON.stringify(fn.params);
 
         const download = h('a', { class: 'btn', download: '' }, icon('download'), 'Download CSV');
@@ -376,7 +396,7 @@
             const r = unsaved()
                 ? await api('POST', '/ai/run', { sql: editor.value, paramDefs: defsEditor.defs(), ...body })
                 : await api('POST', `/ai/functions/${enc(id)}/run`, body);
-            out.replaceChildren(resultView(r));
+            out.replaceChildren(resultView(r, chartState));
         }));
 
         const suggest = h('button', { class: 'btn', type: 'button', hidden: ro || !aiSettings.configured, title: 'Let the model turn hard-coded values (dates, ids, names, limits) into parameters' },
@@ -387,7 +407,7 @@
         }));
         const save = h('button', { class: 'btn primary', type: 'button', hidden: ro }, isNew ? 'Create function' : 'Save changes');
         save.addEventListener('click', () => withBusy(save, async () => {
-            const body = { name: name.value, description: description.value, sql: editor.value, question: fn.question, params: defsEditor.defs() };
+            const body = { name: name.value, description: description.value, sql: editor.value, question: fn.question, params: defsEditor.defs(), chart: chartState.chart };
             const res = isNew ? await api('POST', '/ai/functions', body) : await api('PUT', `/ai/functions/${enc(id)}`, body);
             toast(`Saved "${res.function.name}"`, 'success');
             if (isNew) ctx.navigate('ai-functions', res.function.id);

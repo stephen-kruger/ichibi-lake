@@ -160,6 +160,8 @@ export async function initConsoleTables() {
     )`);
     // Parameter definitions (JSON array of { name, type, default, description }).
     await execute(`ALTER TABLE ${AI_FUNCTIONS} ADD COLUMN IF NOT EXISTS params VARCHAR`);
+    // Chart shown with the result (JSON { type, x, y, series, title }), or NULL for automatic.
+    await execute(`ALTER TABLE ${AI_FUNCTIONS} ADD COLUMN IF NOT EXISTS chart VARCHAR`);
     await migrateFromMainCatalog();
     await migrateLegacyRetention();
 }
@@ -703,9 +705,11 @@ export async function listAudit(limit = 200) {
 function aiFunctionFromRow(r) {
     let paramDefs = [];
     try { paramDefs = r.params ? JSON.parse(r.params) : []; } catch { /* treated as untyped */ }
+    let chart = null;
+    try { chart = r.chart ? JSON.parse(r.chart) : null; } catch { /* automatic chart */ }
     return {
         id: r.id, name: r.name, description: r.description || '', sql: r.sql, question: r.question || '',
-        paramDefs: Array.isArray(paramDefs) ? paramDefs : [],
+        paramDefs: Array.isArray(paramDefs) ? paramDefs : [], chart,
         createdMs: num(r.created_ms), createdBy: r.created_by, updatedMs: num(r.updated_ms), updatedBy: r.updated_by,
     };
 }
@@ -722,17 +726,17 @@ export async function getAiFunction(id) {
 export async function createAiFunction(fn) {
     const now = BigInt(Date.now());
     await executeWithParams(
-        `INSERT INTO ${AI_FUNCTIONS} (id, name, description, sql, question, params, created_ms, created_by, updated_ms, updated_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [fn.id, fn.name, fn.description, fn.sql, fn.question, JSON.stringify(fn.paramDefs || []), now, fn.user, now, fn.user],
-        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, VARCHAR]);
+        `INSERT INTO ${AI_FUNCTIONS} (id, name, description, sql, question, params, chart, created_ms, created_by, updated_ms, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [fn.id, fn.name, fn.description, fn.sql, fn.question, JSON.stringify(fn.paramDefs || []), fn.chart ? JSON.stringify(fn.chart) : null, now, fn.user, now, fn.user],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, BIGINT, VARCHAR]);
 }
 
 export async function updateAiFunction(id, fn) {
     await executeWithParams(
-        `UPDATE ${AI_FUNCTIONS} SET name = ?, description = ?, sql = ?, params = ?, updated_ms = ?, updated_by = ? WHERE id = ?`,
-        [fn.name, fn.description, fn.sql, JSON.stringify(fn.paramDefs || []), BigInt(Date.now()), fn.user, id],
-        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR]);
+        `UPDATE ${AI_FUNCTIONS} SET name = ?, description = ?, sql = ?, params = ?, chart = ?, updated_ms = ?, updated_by = ? WHERE id = ?`,
+        [fn.name, fn.description, fn.sql, JSON.stringify(fn.paramDefs || []), fn.chart ? JSON.stringify(fn.chart) : null, BigInt(Date.now()), fn.user, id],
+        [VARCHAR, VARCHAR, VARCHAR, VARCHAR, VARCHAR, BIGINT, VARCHAR, VARCHAR]);
 }
 
 export async function deleteAiFunction(id) {
