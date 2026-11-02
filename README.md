@@ -29,6 +29,7 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
   - [4.5 Upgrading](#45-upgrading)
   - [4.6 Object Storage (S3 / MinIO)](#46-object-storage-s3--minio)
   - [4.7 Lake Maintenance (Small Files)](#47-lake-maintenance-small-files)
+  - [4.8 Published Docker Image](#48-published-docker-image)
 - [5. Authentication & Authorization](#5-authentication--authorization)
   - [5.1 API Key Authentication](#51-api-key-authentication)
   - [5.2 Per-Table Access Control (ACL)](#52-per-table-access-control-acl)
@@ -304,7 +305,7 @@ cd ichibi-lake
 cp docker/.env.example docker/.env
 # Edit docker/.env to set API_KEYS, KAFKA_BROKERS, etc.
 
-# 3. Start all services
+# 3. Start all services (builds the gateway from this checkout)
 cd docker
 docker compose up --build -d
 
@@ -478,6 +479,60 @@ Many small writes (one row per REST request or Kafka message) would otherwise cr
 Runs are coordinated across gateway instances. A due run is claimed with a write-token-and-verify step and a lease (6 hours, released when the run ends, or when the instance that held it restarts), so exactly one instance runs it and runs never overlap. **Run now** is refused (HTTP 409) while a run is in progress anywhere. Every run is logged on the card with before/after data-file counts and sizes, and in the **Audit Log** (`maintenance.run`; settings changes as `maintenance.update`). Merge and rewrite use a fresh connection per table to avoid the DuckLake schema-cache issue duckdb/ducklake#1108 (see `package.json` `_comments`). `DISABLE_DUCKLAKE_COMPACTION=1` stops all runs.
 
 Console API (admin session): `GET /console/api/maintenance` (settings, recent runs, current file counts), `PUT /console/api/maintenance` (`{ enabled, schedule, steps: { flush, merge, rewrite, expire, cleanup }, deleteThreshold, runAtStartup }`) and `POST /console/api/maintenance/run`.
+
+### 4.8 Published Docker Image
+
+The image is **self-contained**: besides the gateway it bundles Postgres 17 (the DuckLake catalog) and a single-node Kafka, so one container is a complete lake. Every push to `main` and every `v*` tag builds it for `linux/amd64` and `linux/arm64` and publishes it to the GitHub Container Registry ([.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)):
+
+| Tag | Published for |
+| :--- | :--- |
+| `ghcr.io/stephen-kruger/ichibi-lake:latest` | the latest commit on `main` |
+| `ghcr.io/stephen-kruger/ichibi-lake:1.6.25.1` | the git tag `v1.6.25.1` (releases) |
+| `ghcr.io/stephen-kruger/ichibi-lake:sha-<commit>` | every published commit |
+
+**Standalone.** Mount a volume at `/data`: lake files, blobs, console storage settings, Postgres and Kafka all live there.
+
+```sh
+docker run -d --name ichibi-lake -p 3000:3000 -v ichibi-lake:/data \
+  -e API_KEYS=change-me ghcr.io/stephen-kruger/ichibi-lake:latest
+```
+
+or in a compose file:
+
+```yaml
+services:
+  ichibi-lake:
+    image: ghcr.io/stephen-kruger/ichibi-lake:1.6.25.1
+    ports: [ "3000:3000" ]
+    environment:
+      - API_KEYS=change-me
+      # - DUCKLAKE_PG_PASSWORD=...   # bundled Postgres password (only reachable inside the container)
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+```
+
+All the gateway settings of [§3](#3-environment-variables) apply. The bundled services listen on `127.0.0.1` inside the container only, start before the gateway and are stopped after it; if any of the three exits, the container exits (and `restart:` brings it back). Kafka logs warnings only; Postgres logs to `/data/postgres/log`.
+
+**Scaling out: external Postgres and Kafka.** The bundled services switch themselves off when the gateway is pointed at other servers:
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `EMBEDDED_POSTGRES` | `auto` | `auto`: run the bundled Postgres unless `DUCKLAKE_PG_HOST` names another host. `1` / `0`: always / never. |
+| `EMBEDDED_KAFKA` | `auto` | `auto`: run the bundled Kafka unless `KAFKA_BROKERS` is set. `0` with `KAFKA_BROKERS` empty: no Kafka at all. |
+
+So several gateways can share one Postgres catalog (and Kafka) by setting `DUCKLAKE_PG_*` and `KAFKA_BROKERS` in your own compose file. [docker/compose.yaml](docker/compose.yaml) is that setup, with Postgres and Kafka as separate services ([§4.1](#41-docker-recommended)); it can be used on its own too:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/stephen-kruger/ichibi-lake/main/docker/compose.yaml
+docker compose up -d
+```
+
+Pin a release with `ICHIBI_LAKE_IMAGE=ghcr.io/stephen-kruger/ichibi-lake:<version>`, and upgrade with `docker compose pull && docker compose up -d` (read [§4.5](#45-upgrading) first). Moving from standalone to external services means moving the catalog: `pg_dump` it from the container (`docker exec ichibi-lake pg_dump -h /var/run/postgresql -U postgres ducklake`) into the new Postgres, and keep the lake files at the same `DUCKLAKE_DATA_PATH`.
+
+**Inside a checkout** `docker/compose.override.yaml` is loaded automatically and builds the image from source (tagged `ichibi-lake:dev`), so `docker compose up --build` keeps running your local code. Run `docker compose -f compose.yaml up -d` to use the published image instead.
+
+**Publishing a release:** set the version in `package.json`, commit, then `git tag v<version> && git push origin v<version>`. The first published image is private: make it public once on GitHub under the repository's **Packages → ichibi-lake → Package settings → Change visibility**.
 
 ## 5. Authentication & Authorization
 
