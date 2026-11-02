@@ -9,7 +9,7 @@ import http from 'node:http';
 
 // Settings snapshot docker/.env values at import time, so set the key first.
 process.env.OPENAI_API_KEY = 'sk-test-1234567890abcdef';
-const { extractParams, bindParams, plainValue, aiConfig, isConfigured, testSettings, settingsView, AI_SETTINGS, terms, scoreTable, schemaText, pickExamples, paramLiteral, normaliseParamDefs, functionSignature, PARAM_TYPES, inlineParams } = await import('../src/console/ai.js');
+const { extractParams, bindParams, plainValue, aiConfig, isConfigured, testSettings, settingsView, AI_SETTINGS, terms, scoreTable, schemaText, pickExamples, paramLiteral, normaliseParamDefs, functionSignature, PARAM_TYPES, inlineParams, normaliseChart } = await import('../src/console/ai.js');
 const { SECTIONS, getSettingDef, normaliseSettingValue } = await import('../src/console/registry.js');
 
 let passed = 0, failed = 0;
@@ -294,6 +294,27 @@ async function run() {
         assert.deepEqual(pickExamples(fns, 'x', tables, 4).map(f => f.name), ['Recent', 'Energy use', 'Orders per day']);
         assert.deepEqual(pickExamples([], 'kwh', tables), []);
         assert.deepEqual(pickExamples([{ name: 'n', sql: 'SELECT 1 FROM orders_archive' }], 'x', tables), [], 'a longer name is not a match');
+    });
+
+    console.log('\n▸ ai: chart specs');
+    await test('a valid chart keeps its columns and fills the defaults', () => {
+        assert.deepEqual(normaliseChart({ type: 'Line', x: 'day', y: ['orders', 'revenue'] }, ['day', 'orders', 'revenue']),
+            { type: 'line', x: 'day', y: ['orders', 'revenue'], series: null, title: '' });
+        assert.deepEqual(normaliseChart({ type: 'bar', x: 'day', y: 'orders', series: 'region', title: 'Orders' }, ['day', 'region', 'orders']),
+            { type: 'bar', x: 'day', y: ['orders'], series: 'region', title: 'Orders' });
+        assert.equal(normaliseChart(null), null);
+    });
+    await test('unknown columns and types are refused with a message the model can use', () => {
+        assert.throws(() => normaliseChart({ type: 'bar', x: 'day', y: ['total'] }, ['day', 'orders']), /"total" is not in the result; its columns are "day", "orders"/);
+        assert.throws(() => normaliseChart({ type: 'radar', x: 'a', y: ['b'] }), /Chart type must be one of/);
+        assert.throws(() => normaliseChart({ type: 'bar', x: 'a', y: [] }), /at least one y column/);
+        assert.throws(() => normaliseChart({ type: 'bar', x: 'a', y: ['a'] }), /cannot also be a y column/);
+        assert.throws(() => normaliseChart({ type: 'pie', x: 'a', y: ['b', 'c'] }), /pie chart takes one y column/);
+        assert.throws(() => normaliseChart({ type: 'line', x: 'a', y: ['b', 'c'], series: 'd' }), /either a series column or several y columns/);
+        assert.throws(() => normaliseChart('bar'), /must be an object/);
+    });
+    await test('without columns only the shape is checked (stored specs)', () => {
+        assert.deepEqual(normaliseChart({ type: 'pie', x: 'region', y: ['n'] }).y, ['n']);
     });
 
     console.log('\n─── ai unit tests ───');

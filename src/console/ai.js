@@ -23,6 +23,13 @@
  *   AI_SAMPLE_ROWS rows per result (0: no data values at all).
  * - Parameters in saved functions are substituted as escaped string literals
  *   before the checks above, so a value can never change the statement.
+ *
+ * Charts
+ * ------
+ * The model never draws anything: its chart tool only names a chart type and
+ * columns of the last result (normaliseChart() checks them), and the console
+ * draws the chart from the full result (public/console/chart.js), which also
+ * picks a chart itself when the model gives none.
  */
 import { randomBytes } from 'crypto';
 import { execute, serializeSql, findLakeTable, streamUserSql } from '../db.js';
@@ -476,6 +483,44 @@ export function inlineParams(sql, defs, names, values = {}) {
     return out;
 }
 
+// --- Charts ------------------------------------------------------------------------
+
+export const CHART_TYPES = ['bar', 'line', 'area', 'pie', 'scatter'];
+const CHART_MAX_Y = 8;
+
+/**
+ * Validated chart spec { type, x, y: [...], series, title }, or throws a 400
+ * with a message the model can act on. With `columns`, every named column must
+ * be one of them. null/undefined input gives null (no chart).
+ */
+export function normaliseChart(spec, columns = null) {
+    if (spec === null || spec === undefined) return null;
+    if (typeof spec !== 'object' || Array.isArray(spec)) throw httpError(400, 'The chart must be an object');
+    const type = String(spec.type ?? '').trim().toLowerCase();
+    if (!CHART_TYPES.includes(type)) throw httpError(400, `Chart type must be one of ${CHART_TYPES.join(', ')}`);
+    const col = (v) => String(v ?? '').trim().slice(0, 200);
+    const known = (name, what) => {
+        if (columns && !columns.includes(name)) throw httpError(400, `${what} column "${name}" is not in the result; its columns are ${columns.map(c => `"${c}"`).join(', ')}`);
+        return name;
+    };
+    const x = col(spec.x);
+    if (!x) throw httpError(400, 'The chart needs an x column');
+    known(x, 'The x');
+    const y = [...new Set((Array.isArray(spec.y) ? spec.y : [spec.y]).map(col).filter(Boolean))];
+    if (!y.length) throw httpError(400, 'The chart needs at least one y column');
+    if (y.length > CHART_MAX_Y) throw httpError(400, `A chart takes at most ${CHART_MAX_Y} y columns`);
+    for (const c of y) known(c, 'The y');
+    if (y.includes(x)) throw httpError(400, 'The x column cannot also be a y column');
+    const series = col(spec.series) || null;
+    if (series) {
+        known(series, 'The series');
+        if (series === x || y.includes(series)) throw httpError(400, 'The series column must differ from the x and y columns');
+        if (y.length > 1) throw httpError(400, 'Use either a series column or several y columns, not both');
+    }
+    if ((type === 'pie') && (y.length > 1 || series)) throw httpError(400, 'A pie chart takes one y column and no series');
+    return { type, x, y, series, title: String(spec.title ?? '').trim().slice(0, 120) };
+}
+
 // --- Saved functions -----------------------------------------------------------------
 
 function normaliseFunction(body) {
@@ -488,6 +533,7 @@ function normaliseFunction(body) {
         name, description, sql,
         question: String(body?.question ?? '').trim().slice(0, QUESTION_CHARS),
         paramDefs: normaliseParamDefs(sql, body?.params),
+        chart: normaliseChart(body?.chart),
     };
 }
 
@@ -496,7 +542,11 @@ async function assertUniqueName(name, exceptId = null) {
     if (clash) throw httpError(409, `A function named "${clash.name}" already exists`);
 }
 
-const withParams = ({ paramDefs, ...fn }) => ({ ...fn, params: normaliseParamDefs(fn.sql, paramDefs, { strict: false }) });
+function storedChart(chart) {
+    try { return normaliseChart(chart); } catch { return null; }
+}
+
+const withParams = ({ paramDefs, chart, ...fn }) => ({ ...fn, params: normaliseParamDefs(fn.sql, paramDefs, { strict: false }), chart: storedChart(chart) });
 
 export async function listFunctions() {
     return (await store.listAiFunctions()).map(withParams);
@@ -735,6 +785,8 @@ ${data}
 
 When you have the answer, reply briefly in plain text: the answer itself, then one or two sentences on how it was computed and any caveats. The result of your last successful run_sql is shown to the user as a table and can be saved as a reusable function, so make that last query the one that best answers the question, and do not repeat its rows in your reply. If the question cannot be answered from these tables, say so.
 
+Charts: the console can also draw the last result as a chart. When a chart shows the answer better than a table (a trend over time, a comparison across categories, a share of a total, the relationship between two numbers), call the chart tool after your last query, naming its columns. Shape the query for the chart: one row per x value (or per x value and series), x sorted (by time for trends, by value for rankings), at most about 30 categories for bars and 8 slices for a pie. Pick the type by the data's job: line (or area) for change over time, bar for comparing categories or rankings, pie only for a few parts of one whole, scatter for two measures per row. Put measures of very different scale (a count and a revenue) in separate questions rather than one chart. Skip the chart for single values, lists of records and text-heavy results.
+
 Current time (UTC): ${new Date().toISOString()}
 
 ${examplesText(examples)}${callableText(callable)}
@@ -771,6 +823,24 @@ const TOOLS = [
                     purpose: { type: 'string', description: 'What this query is for, in a few words' },
                 },
                 required: ['sql'],
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'chart',
+            description: 'Show the result of the last run_sql or run_function as a chart. Names columns of that result; the console draws it from all of its rows.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    type: { type: 'string', enum: CHART_TYPES, description: 'line/area: change over x (usually time); bar: compare categories; pie: parts of one whole; scatter: two measures per row' },
+                    x: { type: 'string', description: 'Column for the x axis (the categories for bar and pie)' },
+                    y: { type: 'array', items: { type: 'string' }, description: 'Numeric column(s) to plot, one series each (one column for pie)' },
+                    series: { type: 'string', description: 'Optional column whose values split a single y column into several series (long format), e.g. region' },
+                    title: { type: 'string', description: 'Short chart title' },
+                },
+                required: ['type', 'x', 'y'],
             },
         },
     },
@@ -861,6 +931,7 @@ export async function ask({ question, history }, { signal = null } = {}) {
     const steps = [];
     const usage = { prompt: 0, completion: 0, total: 0 };
     let result = null;
+    let chart = null;
     let model = cfg.model;
 
     for (let round = 0; ; round++) {
@@ -875,7 +946,11 @@ export async function ask({ question, history }, { signal = null } = {}) {
         if (!msg) throw modelError(502, `The model API returned no message (finish reason: ${data.choices?.[0]?.finish_reason || 'none'}). Try again or choose another model.`);
         const calls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
         if (!calls.length || lastRound) {
-            return { answer: String(msg.content ?? '').trim(), steps, result, model, usage };
+            // A chart drawn for an earlier query only stands if its columns survived.
+            if (chart && result) {
+                try { chart = normaliseChart(chart, result.columns); } catch { chart = null; }
+            }
+            return { answer: String(msg.content ?? '').trim(), steps, result: result && { ...result, chart }, model, usage };
         }
         messages.push({ role: 'assistant', content: msg.content ?? null, tool_calls: calls });
         for (const call of calls) {
@@ -902,6 +977,11 @@ export async function ask({ question, history }, { signal = null } = {}) {
                     Object.assign(stepInfo, { sql: r.sql, rowCount: r.rowCount, truncated: r.truncated });
                     result = { ...r, functionId: fn.id, functionName: fn.name };
                     content = forModel(r, cfg);
+                } else if (name === 'chart') {
+                    if (!result) throw httpError(400, 'Run a query first; a chart draws the last result');
+                    chart = normaliseChart(args, result.columns);
+                    Object.assign(stepInfo, { chart });
+                    content = { ok: true, chart };
                 } else if (name === 'describe_table') {
                     stepInfo.table = String(args.table ?? '');
                     content = await describeTable(args.table, cfg, signal);
