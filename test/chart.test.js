@@ -96,6 +96,14 @@ async function run() {
         assert.deepEqual(plain(d.xs.map(x => x.label)), ['2024-01-01', '2024-01-02']);
         assert.deepEqual(plain(d.series), [{ name: 'eu', values: [3, 4] }, { name: 'us', values: [5, null] }]);
     });
+    await test('timestamp labels are browser-local; DATE labels stay calendar days', () => {
+        const rows = [['2024-01-02 12:30:00', 4]];
+        const d = chartData({ type: 'line', x: 'at', y: ['n'] }, ['at', 'n'], rows);
+        assert.equal(d.dateOnly, false);
+        const expected = new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'medium' })
+            .format(new Date(Date.UTC(2024, 0, 2, 12, 30)));
+        assert.equal(d.xs[0].label, expected);
+    });
     await test('more than eight series fold the smallest into Other', () => {
         const rows = Array.from({ length: 10 }, (_, i) => ['a', `s${i}`, i + 1]);
         const d = chartData({ type: 'bar', x: 'k', y: ['v'], series: 's' }, ['k', 's', 'v'], rows);
@@ -136,6 +144,16 @@ async function run() {
         assert.deepEqual(plain(days.map(t => t.label)), ['1 Jan', '2 Jan', '3 Jan', '4 Jan', '5 Jan']);
         const years = timeTicks(Date.UTC(2010, 0, 1), Date.UTC(2024, 0, 1), 6);
         assert.ok(years.every(t => /^\d{4}$/.test(t.label)) && years.length <= 6);
+    });
+    await test('timeTicks can follow the browser time zone for timestamps', () => {
+        const days = timeTicks(new Date(2024, 0, 1).getTime(), new Date(2024, 0, 5).getTime(), 6, true);
+        assert.ok(days.length >= 4);
+        for (const tick of days) {
+            const d = new Date(tick.t);
+            assert.equal(d.getHours(), 0, 'tick is local midnight');
+            assert.equal(d.getMinutes(), 0, 'tick is local midnight');
+            assert.ok(tick.label.length > 0);
+        }
     });
 
     console.log('\n─── chart unit tests ───');

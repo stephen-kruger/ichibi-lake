@@ -828,7 +828,8 @@ export async function executeUserSql(sql, { timeoutMs = userQueryTimeoutMs(), pr
  * DuckDB data chunks (~2048 rows each) instead of materialising the result,
  * under the same concurrency gate and deadline as executeUserSql().
  *
- *   onColumns(names)  called once before the first rows
+ *   onColumns(names, types)  called once before the first rows (types are
+ *                     DuckDB type names, e.g. "DATE", "TIMESTAMP WITH TIME ZONE")
  *   onRows(rows)      called per chunk with plain objects (values converted
  *                     exactly as executeUserSql() converts them); awaited, so
  *                     the caller can apply backpressure (e.g. wait for the
@@ -841,13 +842,14 @@ export async function executeUserSql(sql, { timeoutMs = userQueryTimeoutMs(), pr
  * that blocking operators (ORDER BY, GROUP BY, ...) still need DuckDB's own
  * working memory before the first chunk is produced.
  *
- * Resolves to { columns, rowCount, truncated }.
+ * Resolves to { columns, columnTypes, rowCount, truncated }.
  */
 export async function streamUserSql(sql, { maxRows = Infinity, onColumns = null, onRows, timeoutMs = userQueryTimeoutMs(), signal = null } = {}) {
     return withUserConnection({ timeoutMs, signal }, async (conn, isCancelled) => {
         const result = await conn.stream(sql);
         const columns = result.columnNames();
-        if (onColumns) await onColumns(columns);
+        const columnTypes = result.columnTypes().map(t => t.toString());
+        if (onColumns) await onColumns(columns, columnTypes);
         let rowCount = 0;
         let truncated = false;
         while (!isCancelled()) {
@@ -868,7 +870,7 @@ export async function streamUserSql(sql, { maxRows = Infinity, onColumns = null,
             await onRows(objects);
             if (truncated) break;
         }
-        return { columns, rowCount, truncated };
+        return { columns, columnTypes, rowCount, truncated };
     });
 }
 

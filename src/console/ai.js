@@ -321,18 +321,19 @@ export async function checkSql(sql) {
 
 /**
  * Check and run read-only SQL on the user-query instance. Returns
- * { sql, columns, rows (arrays), rowCount, truncated, ms }.
+ * { sql, columns, columnTypes, rows (arrays), rowCount, truncated, ms }.
  */
 export async function runReadOnlySql(sql, { maxRows = DISPLAY_MAX_ROWS, signal = null } = {}) {
     const checked = await checkSql(sql);
     const started = Date.now();
     const rows = [];
     let columns = [];
+    let columnTypes = [];
     let truncated = false;
     try {
         const r = await streamUserSql(checked.sql, {
             maxRows, signal,
-            onColumns: (c) => { columns = c; },
+            onColumns: (c, t) => { columns = c; columnTypes = t; },
             onRows: (batch) => { for (const o of batch) rows.push(columns.map(c => plainValue(o[c]))); },
         });
         truncated = r.truncated;
@@ -340,7 +341,7 @@ export async function runReadOnlySql(sql, { maxRows = DISPLAY_MAX_ROWS, signal =
         if (err.statusCode && err.statusCode !== 500) throw err;
         throw httpError(400, cleanDuckDbError(err));
     }
-    return { sql: checked.sql, columns, rows, rowCount: rows.length, truncated, ms: Date.now() - started };
+    return { sql: checked.sql, columns, columnTypes, rows, rowCount: rows.length, truncated, ms: Date.now() - started };
 }
 
 // --- Saved-function parameters ------------------------------------------------------

@@ -32,6 +32,17 @@
     const ID_RE = /^id$|_id$|^id_/i;
     const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+    // Browser-local axis/tooltip labels for timestamp results.
+    const TICK_FMT = {
+        y: new Intl.DateTimeFormat(undefined, { year: 'numeric' }),
+        mo: new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric' }),
+        d: new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' }),
+        h: new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }),
+        m: new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' }),
+        s: new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    };
+    const DATE_TIME_FMT = new Intl.DateTimeFormat(undefined, { dateStyle: 'short', timeStyle: 'medium' });
+
     // --- Values ---------------------------------------------------------------------
 
     /** Number for a numeric cell (DECIMAL and HUGEINT arrive as strings), else null. */
@@ -229,7 +240,7 @@
         series = series.map(s => ({ ...s, values: order.map(k => s.values[k]) }));
         if (series.length > MAX_SERIES) notes.push(`${series.length - MAX_SERIES + 1} smaller series grouped as "${OTHER}"`);
         series = foldSeries(series, MAX_SERIES);
-        return { type: spec.type, xKind, xIsTime: xCol.kind === 'time' || PERIOD_RE.test(spec.x), xs: outXs, series, note: notes.join(' · ') };
+        return { type: spec.type, xKind, xIsTime: xCol.kind === 'time' || PERIOD_RE.test(spec.x), dateOnly, xs: outXs, series, note: notes.join(' · ') };
     }
 
     // --- Scales and formats ---------------------------------------------------------
@@ -266,11 +277,56 @@
         ...[1, 2, 5, 10, 20, 50, 100, 200, 500].map(n => ['y', n, n * 365 * DAY]),
     ];
 
-    /** Calendar-aligned UTC ticks over [lo, hi]: [{ t, label }]. */
-    function timeTicks(lo, hi, count = 6) {
+    /**
+     * Calendar-aligned ticks over [lo, hi]: [{ t, label }]. Without `local`
+     * ticks are UTC (stable for DATE values); with it they follow the
+     * browser's time zone and locale, for TIMESTAMP results.
+     */
+    function timeTicks(lo, hi, count = 6, local = false) {
         const span = Math.max(hi - lo, SEC);
         const [unit, n] = TIME_STEPS.find(([, , ms]) => span / ms <= count) || TIME_STEPS[TIME_STEPS.length - 1];
         const ticks = [];
+        if (local) {
+            if (unit === 'mo' || unit === 'y') {
+                const d = new Date(lo);
+                let y = d.getFullYear();
+                let m = unit === 'y' ? 0 : d.getMonth();
+                if (unit === 'y') y = Math.ceil(y / n) * n; else m = Math.ceil(m / n) * n;
+                for (;;) {
+                    const t = new Date(y, m, 1).getTime();
+                    if (t >= lo && t <= hi) ticks.push(t);
+                    if (t > hi || ticks.length > 50) break;
+                    if (unit === 'y') y += n; else m += n;
+                }
+            } else if (unit === 'd') {
+                const d = new Date(lo);
+                d.setHours(0, 0, 0, 0);
+                if (d.getTime() < lo) d.setDate(d.getDate() + n);
+                for (let t = d.getTime(); t <= hi && ticks.length <= 50; t = d.getTime()) {
+                    ticks.push(t);
+                    d.setDate(d.getDate() + n);
+                }
+            } else {
+                const d = new Date(lo);
+                const step = () => {
+                    if (unit === 'h') d.setHours(d.getHours() + n);
+                    else if (unit === 'm') d.setMinutes(d.getMinutes() + n);
+                    else d.setSeconds(d.getSeconds() + n);
+                };
+                // Round up to the next local boundary so ticks land on whole
+                // hours/minutes/seconds, including across a DST change.
+                if (unit === 'h') { d.setMinutes(0, 0, 0); d.setHours(Math.ceil(d.getHours() / n) * n); }
+                else if (unit === 'm') { d.setSeconds(0, 0); d.setMinutes(Math.ceil(d.getMinutes() / n) * n); }
+                else { d.setMilliseconds(0); d.setSeconds(Math.ceil(d.getSeconds() / n) * n); }
+                while (d.getTime() < lo) step();
+                for (let t = d.getTime(); t <= hi && ticks.length <= 50; t = d.getTime()) {
+                    ticks.push(t);
+                    step();
+                }
+            }
+            const fmt = (t) => (TICK_FMT[unit] || TICK_FMT.h).format(new Date(t));
+            return ticks.map(t => ({ t, label: fmt(t) }));
+        }
         if (unit === 'mo' || unit === 'y') {
             const d = new Date(lo);
             let y = d.getUTCFullYear(), m = unit === 'y' ? 0 : d.getUTCMonth();
@@ -296,8 +352,10 @@
     }
 
     function fmtTime(t, dateOnly) {
-        const iso = new Date(t).toISOString();
-        return dateOnly ? iso.slice(0, 10) : `${iso.slice(0, 10)} ${iso.slice(11, 16)}`;
+        // DATE values are calendar days; keep their ISO day so they do not
+        // move across time zones. Timestamps are instants: show local time.
+        if (dateOnly) return new Date(t).toISOString().slice(0, 10);
+        return DATE_TIME_FMT.format(new Date(t));
     }
 
     function fmtFull(v) {
@@ -415,7 +473,7 @@
             const xs = linear(lo, hi, ml, ml + pw);
             px = (i) => xs(data.xs[i].pos);
             const count = Math.max(2, Math.floor(pw / 90));
-            if (data.xKind === 'time') xScaleTicks = timeTicks(lo, hi, count).map(t => ({ p: xs(t.t), label: t.label }));
+            if (data.xKind === 'time') xScaleTicks = timeTicks(lo, hi, count, !data.dateOnly).map(t => ({ p: xs(t.t), label: t.label }));
             else {
                 const xt = niceTicks(lo, hi, count), xf = tickFormat(xt.ticks, xt.step);
                 xScaleTicks = xt.ticks.filter(t => t >= lo && t <= hi).map(t => ({ p: xs(t), label: xf(t) }));

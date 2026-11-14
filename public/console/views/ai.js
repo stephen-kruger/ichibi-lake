@@ -40,16 +40,19 @@
      */
     function resultView(r, state = { chart: null, initial: null }) {
         if (!r) return h('div');
+        const types = r.columnTypes || [];
         const summary = h('div', { class: 'muted small result-summary' },
             `${r.rowCount.toLocaleString()} row(s)`, r.truncated ? ` (first ${r.rowCount.toLocaleString()} shown; more available)` : '',
             Number.isFinite(r.ms) ? ` · ${r.ms} ms` : '');
         if (!r.columns.length) return h('div', {}, summary);
         const body = r.rows.map((row, i) => h('tr', {},
             h('td', { class: 'rownum' }, String(i + 1)),
-            row.map(v => {
+            row.map((v, ci) => {
                 const t = cellText(v);
-                return h('td', { class: `cell ${typeof v === 'number' ? 'num' : ''}`, title: t && t.length > 60 ? t.slice(0, 2000) : undefined },
-                    t === null ? h('span', { class: 'null' }, 'NULL') : t.length > 300 ? `${t.slice(0, 300)}…` : t);
+                const shown = t === null ? null : displayValue(t, types[ci]);
+                const localized = shown !== t;
+                return h('td', { class: `cell ${typeof v === 'number' ? 'num' : ''}`, title: localized ? t : (t && t.length > 60 ? t.slice(0, 2000) : undefined) },
+                    shown === null ? h('span', { class: 'null' }, 'NULL') : shown.length > 300 ? `${shown.slice(0, 300)}…` : shown);
             })));
         const grid = h('div', { class: 'grid-wrap result-grid' },
             h('table', { class: 'grid' },

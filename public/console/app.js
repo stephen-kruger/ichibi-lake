@@ -84,10 +84,15 @@ function icon(name) {
     return svg;
 }
 
+// DATE/TIMESTAMP display in the browser's locale and time zone. Loaded from
+// dates.js; kept as thin globals because views use them like fmtDate/h.
+function fmtTemporal(value, type) { return window.LakeDates.fmtTemporal(value, type); }
+function displayValue(value, type) { return window.LakeDates.displayValue(value, type); }
+
 function fmtDate(value) {
     if (!value) return '—';
-    const d = new Date(String(value).replace(' ', 'T') + (/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? '' : 'Z'));
-    return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
+    const formatted = fmtTemporal(value, 'TIMESTAMPTZ');
+    return formatted === null ? String(value) : formatted;
 }
 
 function fmtDuration(seconds) {

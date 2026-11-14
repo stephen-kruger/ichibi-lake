@@ -307,6 +307,12 @@
             return truncated ? [value, h('span', { class: 'muted' }, '…')] : value;
         }
 
+        // Show dates and timestamps in the browser's locale/time zone; the
+        // stored text is kept in row.values for editing and the cell title.
+        function shownValue(value, col) {
+            return value === null ? null : displayValue(value, col.type);
+        }
+
         function dataCell(row, col, ci) {
             const value = row.values[ci];
             const truncated = row.truncated.includes(ci);
@@ -315,7 +321,7 @@
                 class: `cell ${editable ? 'editable' : ''}`,
                 title: truncated ? 'Value truncated for display; too long to edit here.' : (value === null ? 'NULL' : value),
                 tabindex: editable ? '0' : undefined,
-            }, cellContent(value, truncated));
+            }, cellContent(shownValue(value, col), truncated));
             if (editable) {
                 const start = () => startEdit(td, row, col, ci);
                 td.addEventListener('dblclick', start);
@@ -350,7 +356,7 @@
             const cancel = () => {
                 if (done) return; done = true;
                 td.classList.remove('editing');
-                td.replaceChildren(cellContent(row.values[ci], false));
+                td.replaceChildren(cellContent(shownValue(row.values[ci], col), false));
                 td.focus();
             };
             async function save({ setNull = false, next = false } = {}) {
@@ -365,7 +371,7 @@
                     const res = await api('PATCH', `/data/tables/${enc(table)}/rows/${row.rowid}`, { column: col.name, value, isNull, original });
                     row.values[ci] = res.value;
                     td.classList.remove('editing');
-                    td.replaceChildren(cellContent(res.value, false));
+                    td.replaceChildren(cellContent(shownValue(res.value, col), false));
                     td.title = res.value === null ? 'NULL' : res.value;
                     td.classList.add('saved');
                     setTimeout(() => td.classList.remove('saved'), 1200);
