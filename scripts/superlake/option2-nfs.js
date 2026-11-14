@@ -49,7 +49,7 @@ async function generateServer() {
 
 services:
   db:
-    image: postgres:17
+    image: postgres:18
     container_name: superlake-postgres
     ports:
       - "5432:5432"          # exposed on the LAN for client gateways
@@ -58,7 +58,7 @@ services:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=ducklake
     volumes:
-      - ${sharePath}/postgres:/var/lib/postgresql/data
+      - ${sharePath}/postgres:/var/lib/postgresql
     networks: [app-network]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -169,7 +169,7 @@ async function generateClient() {
 
     const kafkaService = includeKafka ? `
   kafka:
-    image: apache/kafka:4.3.1
+    image: apache/kafka:4.4.0
     container_name: superlake-kafka
     environment:
       KAFKA_PROCESS_ROLES: broker,controller

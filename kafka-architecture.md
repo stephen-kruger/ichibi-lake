@@ -126,7 +126,7 @@ data: {"error":"<message>"}
 
 `docker/compose.yaml` includes:
 
-- **Kafka service**: `apache/kafka:4.3.1` in KRaft mode (single node, no ZooKeeper)
+- **Kafka service**: `apache/kafka:4.4.0` in KRaft mode (single node, no ZooKeeper)
 - One client listener: `PLAINTEXT` on `9092`, advertised as `kafka:9092`, used by the gateway inside the docker network. The broker has no authentication, so **no port is published on the host**; clients outside Docker produce through the gateway's `POST /kafka-sink`, and subscribe through `GET /kafka-subscribe/:topicName`.
 - Healthcheck via `/opt/kafka/bin/kafka-topics.sh --list`
 - KRaft logs bind-mounted to `./data/kafka` (via `KAFKA_LOG_DIRS=/var/lib/kafka/data`) so retention behaviour is observable on the host.

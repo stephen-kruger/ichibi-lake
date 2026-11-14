@@ -95,6 +95,13 @@ if [ "$run_pg" = 1 ]; then
     chown -R postgres:postgres "$pgdata" /var/run/postgresql
     chmod 700 "$pgdata"
 
+    pg_major=$(postgres -V | awk '{print $3}' | cut -d. -f1)
+    if [ -s "$pgdata/PG_VERSION" ] && [ "$(cat "$pgdata/PG_VERSION")" != "$pg_major" ]; then
+        log "Postgres data in $pgdata is version $(cat "$pgdata/PG_VERSION"), but this image ships Postgres $pg_major."
+        log "major upgrades need a dump/restore or pg_upgrade (README §4.5); refusing to start."
+        exit 1
+    fi
+
     if [ ! -s "$pgdata/PG_VERSION" ]; then
         log "initialising Postgres in $pgdata"
         pwfile=$(mktemp)

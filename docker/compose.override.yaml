@@ -3,6 +3,12 @@
 # pulled from ghcr.io. To run the published image from here instead, use
 #   docker compose -f compose.yaml pull && docker compose -f compose.yaml up -d
 # A compose.yaml copied on its own (without this file) uses the published image.
+#
+# `ichibi-lake:dev` is a local-only tag, so a plain `docker compose pull` also
+# tries to pull it from Docker Hub and fails with "pull access denied ...".
+# Pull only the third-party images with `docker compose pull --ignore-buildable`
+# (or `docker compose pull db kafka`), and build the gateway with
+# `docker compose build app`.
 services:
   app:
     # A local tag, so a build never overwrites a pulled ghcr.io image.

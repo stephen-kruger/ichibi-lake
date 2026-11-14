@@ -36,7 +36,7 @@ export default async function run() {
 
     const kafkaService = includeKafka ? `
   kafka:
-    image: apache/kafka:4.3.1
+    image: apache/kafka:4.4.0
     container_name: superlake-kafka
     environment:
       KAFKA_PROCESS_ROLES: broker,controller
@@ -103,14 +103,14 @@ x-app-base: &app-base
 
 services:
   db:
-    image: postgres:17
+    image: postgres:18
     container_name: superlake-postgres
     environment:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=ducklake
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql
     networks: [app-network]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]

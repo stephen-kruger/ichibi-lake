@@ -146,16 +146,23 @@ services:
     restart: unless-stopped
 
   # One-shot init that fixes ownership and permissions on the bind-mounted
-  # Postgres data dir before the db service starts. The postgres:17 image runs
+  # Postgres data dir before the db service starts. The postgres:18 image runs
   # the server as its internal postgres user (uid 999) and refuses to start
   # unless PGDATA is owned by that user AND has 0700/0750 permissions
   # ("FATAL: data directory ... has invalid permissions"). On host bind mounts
   # those bits can drift across `docker compose down`/`up` cycles, which is
   # what breaks the db service on restart. Runs as root, normalises ownership
-  # to 999:999 and the top-level dir to 0700, then exits. This keeps restarts
+  # to 999:999 and the data dir to 0700, then exits. This keeps restarts
   # deterministic without hard-coding host UIDs into the db service itself.
+  #
+  # Postgres 18 keeps its cluster in /var/lib/postgresql/18/docker (the image's
+  # PGDATA), so the whole /var/lib/postgresql is bind-mounted. The guard fails
+  # loudly if it finds a Postgres 17 data directory in the old location
+  # (PG_VERSION at the mount root) instead of silently initialising an empty
+  # cluster next to it: a major upgrade needs a dump/restore or pg_upgrade
+  # (README §4.5).
   postgres-init:
-    image: postgres:17
+    image: postgres:18
     container_name: ichibi-lake-postgres-init
     user: "0:0"
     # Touches only its bind mount: no network at all.
@@ -163,14 +170,22 @@ services:
     entrypoint:
       - sh
       - -c
-      - mkdir -p /var/lib/postgresql/data && chown -R 999:999 /var/lib/postgresql/data && chmod 700 /var/lib/postgresql/data
+      - |
+        if [ -s /var/lib/postgresql/PG_VERSION ] && [ ! -s /var/lib/postgresql/18/docker/PG_VERSION ]; then
+          echo "ERROR: found a Postgres $(cat /var/lib/postgresql/PG_VERSION) data directory at the bind-mount root;" >&2
+          echo "Postgres 18 cannot start on it directly (see README §4.5)." >&2
+          exit 1
+        fi
+        mkdir -p /var/lib/postgresql/18/docker
+        chown -R 999:999 /var/lib/postgresql
+        chmod 700 /var/lib/postgresql/18/docker
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql
     restart: "no"
 
   db:
     container_name: ichibi-lake-postgres
-    image: postgres:17
+    image: postgres:18
     # No published port: only the gateway talks to Postgres, over db-network,
     # an internal network that nothing else joins and that has no route out.
     # For ad-hoc access use `docker compose exec db psql -U postgres ducklake`.
@@ -182,6 +197,9 @@ services:
       # then set POSTGRES_PASSWORD=<new> and `docker compose up -d`.
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - POSTGRES_DB=ducklake
+      # The official postgres:18 layout (also the image default). The parent
+      # directory is what the postgres-init one-shot mounts and fixes up.
+      - PGDATA=/var/lib/postgresql/18/docker
     depends_on:
       postgres-init:
         condition: service_completed_successfully
@@ -212,7 +230,7 @@ services:
       -c log_rotation_age=1d
       -c log_truncate_on_rotation=on
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql
     networks:
       - db-network
     security_opt: [ "no-new-privileges:true" ]
@@ -230,11 +248,11 @@ services:
     restart: unless-stopped
 
   # One-shot init that fixes ownership on the bind-mounted Kafka log dir.
-  # The apache/kafka:4.3.1 image runs as uid 1000 (appuser); a fresh host
+  # The apache/kafka:4.4.0 image runs as uid 1000 (appuser); a fresh host
   # bind-mount directory is owned by root, which prevents the broker from
   # writing meta.properties on first start. Runs as root, chowns, exits.
   kafka-init:
-    image: apache/kafka:4.3.1
+    image: apache/kafka:4.4.0
     container_name: ichibi-lake-kafka-init
     user: "0:0"
     # Touches only its bind mount: no network at all.
@@ -245,7 +263,7 @@ services:
     restart: "no"
 
   kafka:
-    image: apache/kafka:4.3.1
+    image: apache/kafka:4.4.0
     container_name: ichibi-lake-kafka
     depends_on:
       kafka-init:
@@ -331,7 +349,7 @@ services:
   # built-in SigV4 signing, so no MinIO client image is needed.
   minio-init:
     profiles: [ "minio" ]
-    image: curlimages/curl:8.11.1
+    image: curlimages/curl:8.23.0
     container_name: ichibi-lake-minio-init
     depends_on:
       - minio

@@ -53,7 +53,7 @@ export default async function run() {
 
 services:
   db:
-    image: postgres:17
+    image: postgres:18
     container_name: superlake-${selfName}-postgres
     ports:
       - "5432:5432"   # exposed so peers can ATTACH this catalog read-only
@@ -62,7 +62,7 @@ services:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=ducklake
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql
     networks: [app-network]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]

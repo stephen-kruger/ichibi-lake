@@ -48,7 +48,7 @@ async function generateServer() {
 
 services:
   db:
-    image: postgres:17
+    image: postgres:18
     container_name: superlake-postgres
     ports: ["5432:5432"]
     environment:
@@ -56,7 +56,7 @@ services:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=ducklake
     volumes:
-      - ${sharePath}/postgres:/var/lib/postgresql/data
+      - ${sharePath}/postgres:/var/lib/postgresql
     networks: [app-network]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
