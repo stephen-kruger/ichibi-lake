@@ -1,4 +1,4 @@
-# ichibi-lake Gateway v1.7.1.1
+# ichibi-lake Gateway v1.7.1.2
 
 ![ichibi-lake](graphics/ichibi-lake-2.jpg "iChibi Lake")
 
@@ -435,7 +435,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 - **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (since then, `/query` and GraphQL `sql` accept non-superusers again, scoped to the tables they can read) (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
 - **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
 - **Upgrade the image** with `docker compose pull && docker compose up -d`; add `--remove-orphans` to remove the retired `duckdb-ui` container from older releases. When running from source, rebuild instead (`docker compose -f compose.yaml -f compose.build.yaml up -d --build --remove-orphans`). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
-- **Bundled Postgres 17 → 18 upgrades automatically.** Postgres cannot open a cluster from an older major version, so on first start after the update the stack upgrades it before the gateway runs. `postgres-upgrade` starts the old cluster with the `postgres:17` image and writes a dump to `data/postgres-upgrade/`; `postgres-init` then moves the old directory to `data/postgres/17-before-upgrade/`, initialises a Postgres 18 cluster and restores the dump into it. The self-contained image does the same with the Postgres 17 binaries it ships, keeping the old cluster in `/data/postgres.17`. Both steps only run when a 17 directory is present (a fresh install pulls `postgres:17` once, then skips it), and the old cluster is kept for rollback — remove it once the upgrade is verified. The dump runs with the old cluster's locales generated on demand (`en_US.UTF-8`, the official `postgres:17` image's default, is built in), so clusters initialised with `LANG=en_US.utf8` upgrade without extra packages. Postgres 18 keeps its cluster in `/var/lib/postgresql/18/docker`, so `docker/compose.yaml` now mounts `./data/postgres` at `/var/lib/postgresql` (previously `/var/lib/postgresql/data`). Only 17 → 18 is automatic; to move from an older major, dump and restore it manually:
+- **Bundled Postgres 17 → 18 upgrades automatically.** Postgres cannot open a cluster from an older major version, so on first start after the update the stack upgrades it before the gateway runs. `postgres-upgrade` starts the old cluster with the `postgres:17` image and writes a dump to `data/postgres-upgrade/`; `postgres-init` then moves the old directory to `data/postgres/17-before-upgrade/`, initialises a Postgres 18 cluster and restores the dump into it. The self-contained image does the same with the Postgres 17 binaries it ships, keeping the old cluster in `/data/postgres.17`. Both steps only run when a 17 directory is present (a fresh install pulls `postgres:17` once, then skips it), and the old cluster is kept for rollback — remove it once the upgrade is verified. The dump runs with the old cluster's locales generated on demand (`en_US.UTF-8`, the official `postgres:17` image's default, is built in), so clusters initialised with `LANG=en_US.utf8` upgrade without extra packages. The restored cluster gets the official image's `host all all all scram-sha-256` rule, so the gateway can connect over `db-network`. Postgres 18 keeps its cluster in `/var/lib/postgresql/18/docker`, so `docker/compose.yaml` now mounts `./data/postgres` at `/var/lib/postgresql` (previously `/var/lib/postgresql/data`). Only 17 → 18 is automatic; to move from an older major, dump and restore it manually:
   ```sh
   docker compose exec -T db pg_dumpall -U postgres > postgres-backup.sql
   docker compose down
@@ -506,7 +506,7 @@ The image is **self-contained**: besides the gateway it bundles Postgres 18 (the
 | Tag | Published for |
 | :--- | :--- |
 | `ghcr.io/stephen-kruger/ichibi-lake:latest` | the latest commit on `main` |
-| `ghcr.io/stephen-kruger/ichibi-lake:1.7.1.1` | the git tag `v1.7.1.1` (releases) |
+| `ghcr.io/stephen-kruger/ichibi-lake:1.7.1.2` | the git tag `v1.7.1.2` (releases) |
 | `ghcr.io/stephen-kruger/ichibi-lake:sha-<commit>` | every published commit |
 
 **Standalone.** Mount a volume at `/data`: lake files, blobs, console storage settings, Postgres and Kafka all live there.
@@ -521,7 +521,7 @@ or in a compose file:
 ```yaml
 services:
   ichibi-lake:
-    image: ghcr.io/stephen-kruger/ichibi-lake:1.7.1.1
+    image: ghcr.io/stephen-kruger/ichibi-lake:1.7.1.2
     ports: [ "3000:3000" ]
     environment:
       - API_KEYS=change-me

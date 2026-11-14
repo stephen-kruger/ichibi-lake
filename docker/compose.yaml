@@ -250,6 +250,15 @@ services:
         root=/var/lib/postgresql
         data="$$root/18/docker"
         dump=/migrate/dump.sql.gz
+        # initdb only allows host connections from loopback, but the db service
+        # serves the gateway (and anything else) on db-network. The official
+        # postgres image appends this line when it initialises a cluster; do
+        # the same so an upgraded cluster behaves like a fresh one.
+        allow_remote_auth() {
+          [ -f "$$data/pg_hba.conf" ] || return 0
+          grep -qE '^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+all[[:space:]]' "$$data/pg_hba.conf" \
+            || printf 'host all all all scram-sha-256\n' >> "$$data/pg_hba.conf"
+        }
         if [ -s "$$root/PG_VERSION" ]; then
           major=$$(cat "$$root/PG_VERSION")
           if [ "$$major" != 17 ]; then
@@ -272,6 +281,7 @@ services:
           chmod 700 "$$data"
           gosu postgres initdb -D "$$data" --username=postgres --encoding=UTF8 \
             --auth-local=trust --auth-host=scram-sha-256 > /dev/null
+          allow_remote_auth
           gosu postgres postgres -D "$$data" \
             -c listen_addresses='' -c unix_socket_directories=/var/run/postgresql \
             -c port=5432 -c logging_collector=off &
@@ -305,6 +315,9 @@ services:
           mkdir -p "$$data"
           chown -R 999:999 "$$root"
           chmod 700 "$$data"
+          # Heals clusters initialised by an earlier release (or a failed
+          # upgrade) whose pg_hba.conf only allows loopback.
+          allow_remote_auth
         fi
     volumes:
       - ./data/postgres:/var/lib/postgresql
