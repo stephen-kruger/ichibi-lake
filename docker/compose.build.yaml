@@ -1,0 +1,16 @@
+# Explicit build-from-source layer for docker/compose.yaml. It is NOT loaded
+# automatically: plain `docker compose pull` / `up` in this directory use the
+# published ghcr.io image (pin one with ICHIBI_LAKE_IMAGE in docker/.env).
+#
+# Build and run this checkout's code instead with:
+#   docker compose -f compose.yaml -f compose.build.yaml up -d --build
+#
+# The local tag keeps a source build from overwriting a pulled ghcr.io image.
+services:
+  app:
+    image: ichibi-lake:dev
+    build:
+      # Build from the repo root so the Dockerfile can COPY package.json
+      # and src/ directly.
+      context: ..
+      dockerfile: docker/Dockerfile

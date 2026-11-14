@@ -48,7 +48,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev || npm install --omit=dev
 
 # Copy the rest of the gateway source. The build context is the repo root
-# (see docker/compose.override.yaml), so this picks up src/, swagger.yaml, etc.
+# (see docker/compose.build.yaml), so this picks up src/, swagger.yaml, etc.
 COPY src ./src
 COPY swagger.yaml ./swagger.yaml
 # Admin console static assets (served at /console) and its recovery CLI.

@@ -4,8 +4,8 @@ services:
   app:
     # The published gateway image (built by .github/workflows/docker-publish.yml).
     # Pin a release with ICHIBI_LAKE_IMAGE=ghcr.io/stephen-kruger/ichibi-lake:<version>.
-    # Inside a checkout of the repository, compose.override.yaml (loaded
-    # automatically) builds this image from source instead.
+    # To build the gateway from this checkout instead, add the explicit
+    # build layer: -f compose.yaml -f compose.build.yaml.
     #
     # The image also runs on its own (bundled Postgres and Kafka, data in
     # /data); this file is the split setup, with Postgres and Kafka as the

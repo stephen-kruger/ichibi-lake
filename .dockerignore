@@ -1,4 +1,4 @@
-# The image build context is the repo root (see docker/compose.override.yaml:
+# The image build context is the repo root (see docker/compose.build.yaml:
 # `context: ..`, and .github/workflows/docker-publish.yml). Everything below is excluded from the context sent to the
 # Docker daemon. The Dockerfile only needs package.json, package-lock.json,
 # src/ and swagger.yaml, so we keep those and drop the rest.

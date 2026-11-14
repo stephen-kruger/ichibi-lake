@@ -77,8 +77,11 @@ A feature-rich DuckDB-based data lake gateway with REST API, blob storage, schem
 
 ```sh
 cd docker
-docker compose up --build
+docker compose up -d          # pulls and runs the published image
 ```
+
+To build the gateway from this checkout instead, add the explicit build layer
+(`docker compose -f compose.yaml -f compose.build.yaml up -d --build`).
 
 Once running:
 
@@ -305,9 +308,12 @@ cd ichibi-lake
 cp docker/.env.example docker/.env
 # Edit docker/.env to set API_KEYS, KAFKA_BROKERS, etc.
 
-# 3. Start all services (builds the gateway from this checkout)
+# 3. Start all services (published gateway image; pulls it if missing)
 cd docker
-docker compose up --build -d
+docker compose up -d
+
+# To build the gateway from this checkout instead:
+# docker compose -f compose.yaml -f compose.build.yaml up -d --build
 
 # 4. Verify health
 docker compose ps
@@ -427,7 +433,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 - **The bundled DuckDB web UI was removed** (it had no authentication). Use the console's **Tables & Data** page instead.
 - **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (since then, `/query` and GraphQL `sql` accept non-superusers again, scoped to the tables they can read) (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
 - **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
-- **Rebuild the image** (`docker compose up -d --build --remove-orphans`; `--remove-orphans` also removes the retired `duckdb-ui` container from older releases). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
+- **Rebuild the image** when running from source (`docker compose -f compose.yaml -f compose.build.yaml up -d --build --remove-orphans`; `--remove-orphans` also removes the retired `duckdb-ui` container from older releases). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
 - **Bundled Postgres 17 → 18 (not automatic).** Postgres cannot open a cluster from an older major version, and unlike the DuckLake catalog it is **not** migrated by `AUTOMATIC_MIGRATION`. The `postgres:18` image keeps its cluster in `/var/lib/postgresql/18/docker`, so `docker/compose.yaml` now mounts `./data/postgres` at `/var/lib/postgresql` (previously `/var/lib/postgresql/data`). For an existing compose stack, dump the old cluster and restore it into a fresh one:
   ```sh
   docker compose exec -T db pg_dumpall -U postgres > postgres-backup.sql
@@ -542,7 +548,13 @@ docker compose up -d
 
 Pin a release with `ICHIBI_LAKE_IMAGE=ghcr.io/stephen-kruger/ichibi-lake:<version>`, and upgrade with `docker compose pull && docker compose up -d` (read [§4.5](#45-upgrading) first). Moving from standalone to external services means moving the catalog: `pg_dump` it from the container (`docker exec ichibi-lake pg_dump -h /var/run/postgresql -U postgres ducklake`) into the new Postgres, and keep the lake files at the same `DUCKLAKE_DATA_PATH`.
 
-**Inside a checkout** `docker/compose.override.yaml` is loaded automatically and builds the image from source (tagged `ichibi-lake:dev`), so `docker compose up --build` keeps running your local code. Run `docker compose -f compose.yaml up -d` to use the published image instead.
+**Inside a checkout** plain `docker compose pull` / `up` use the published image, exactly like a downloaded `compose.yaml`. To build the gateway from your local source instead, pass the explicit build layer:
+
+```sh
+docker compose -f compose.yaml -f compose.build.yaml up -d --build
+```
+
+That tags the build `ichibi-lake:dev`, so it never overwrites a pulled release image.
 
 **Publishing a release:** set the version in `package.json`, commit, then `git tag v<version> && git push origin v<version>`. The first published image is private: make it public once on GitHub under the repository's **Packages → ichibi-lake → Package settings → Change visibility**.
 
