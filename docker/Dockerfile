@@ -1,19 +1,25 @@
 # ichibi-lake gateway, self-contained: besides the Node gateway the image ships
 # Postgres 18 (the DuckLake catalog) and a single-node Kafka (KRaft), which
 # docker/entrypoint.sh starts on 127.0.0.1 when DUCKLAKE_PG_HOST / KAFKA_BROKERS
-# point nowhere else. So `docker run -p 3000:3000 -v ichibi-lake:/data <image>`
+# point nowhere else. Postgres 17 is included only to upgrade an existing
+# /data/postgres cluster in place. So `docker run -p 3000:3000 -v ichibi-lake:/data <image>`
 # is a complete lake, while docker/compose.yaml (and any scaled-out setup)
 # runs the same image against separate Postgres and Kafka servers.
 FROM node:lts-trixie-slim
 
 ARG POSTGRES_MAJOR=18
+# The previous major ships only so an existing /data/postgres cluster can be
+# upgraded in place: docker/entrypoint.sh starts it with its own binaries,
+# dumps it, then restores into POSTGRES_MAJOR (README §4.5).
+ARG POSTGRES_UPGRADE_FROM=17
 ARG KAFKA_VERSION=4.4.0
 ARG SCALA_VERSION=2.13
 
 # curl: compose/image healthchecks and downloads. tini: PID 1 (signals,
-# zombies). Postgres from the PGDG repository (Debian trixie ships 17),
-# without the Debian package's default cluster: the entrypoint creates one in
-# /data. Java 21 runs Kafka (Kafka 4.4 supports Java 17, 21 and 25).
+# zombies). Postgres from the PGDG repository, without the Debian package's
+# default cluster: the entrypoint creates one in /data. The previous major is
+# installed only for in-place upgrades. Java 21 runs Kafka (Kafka 4.4 supports
+# Java 17, 21 and 25).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg tini && \
     install -d /usr/share/postgresql-common/pgdg && \
@@ -22,7 +28,7 @@ RUN apt-get update && \
     mkdir -p /etc/postgresql-common/createcluster.d && \
     echo 'create_main_cluster = false' > /etc/postgresql-common/createcluster.d/no-main-cluster.conf && \
     apt-get update && \
-    apt-get install -y --no-install-recommends postgresql-${POSTGRES_MAJOR} openjdk-21-jre-headless && \
+    apt-get install -y --no-install-recommends postgresql-${POSTGRES_UPGRADE_FROM} postgresql-${POSTGRES_MAJOR} openjdk-21-jre-headless && \
     apt-get purge -y gnupg && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 

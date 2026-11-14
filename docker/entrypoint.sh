@@ -9,10 +9,13 @@
 #   EMBEDDED_KAFKA=auto (default):    on unless KAFKA_BROKERS is set.
 #   1 / 0:                            force on / off.
 #
-# Their data lives in /data/postgres and /data/kafka. With neither on, this
-# just execs the command (docker/compose.yaml runs them as separate services).
-# Otherwise every process is supervised: if one exits, the others are stopped
-# and the container exits with its status, for the restart policy to handle.
+# Their data lives in /data/postgres and /data/kafka. An existing Postgres 17
+# data directory is upgraded in place: it is dumped with the bundled 17
+# binaries, archived to /data/postgres.17, and restored into a new 18 cluster.
+# With neither server on, this just execs the command (docker/compose.yaml runs
+# them as separate services). Otherwise every process is supervised: if one
+# exits, the others are stopped and the container exits with its status, for the
+# restart policy to handle.
 set -euo pipefail
 
 log() { echo "[entrypoint] $*"; }
@@ -96,10 +99,60 @@ if [ "$run_pg" = 1 ]; then
     chmod 700 "$pgdata"
 
     pg_major=$(postgres -V | awk '{print $3}' | cut -d. -f1)
+    pg_restore_dump=
+    pg_backup=
     if [ -s "$pgdata/PG_VERSION" ] && [ "$(cat "$pgdata/PG_VERSION")" != "$pg_major" ]; then
-        log "Postgres data in $pgdata is version $(cat "$pgdata/PG_VERSION"), but this image ships Postgres $pg_major."
-        log "major upgrades need a dump/restore or pg_upgrade (README §4.5); refusing to start."
-        exit 1
+        data_major=$(cat "$pgdata/PG_VERSION")
+        old_bin=/usr/lib/postgresql/$data_major/bin
+        if [ "$pg_major" != 18 ] || [ "$data_major" != 17 ] || [ ! -x "$old_bin/postgres" ]; then
+            log "Postgres data in $pgdata is version $data_major, but this image ships Postgres $pg_major."
+            log "only a 17 -> 18 upgrade is automatic (README §4.5); refusing to start."
+            exit 1
+        fi
+        # Start the old cluster on the local socket only, dump it, stop it, then
+        # let a fresh 18 cluster be created below and restore the dump into it.
+        # A cluster created by an image with locales this one lacks refuses to
+        # start ("invalid value for parameter lc_messages"); these settings do
+        # not affect the dumped data, so force them while the old server runs.
+        for f in "$pgdata/postgresql.conf" "$pgdata/postgresql.auto.conf"; do
+            [ -f "$f" ] || continue
+            sed -E -i "s/^(lc_messages|lc_monetary|lc_numeric|lc_time)[[:space:]]*=.*/\1 = 'C'/" "$f"
+        done
+        log "found Postgres $data_major data in $pgdata; upgrading it to Postgres $pg_major"
+        runuser -u postgres -- "$old_bin/postgres" -D "$pgdata" \
+            -c listen_addresses='' -c unix_socket_directories=/var/run/postgresql \
+            -c port="$DUCKLAKE_PG_PORT" -c logging_collector=off \
+            -c lc_messages=C -c lc_monetary=C -c lc_numeric=C -c lc_time=C &
+        old_pid=$!
+        pids[postgres]=$old_pid
+        old_ready=0
+        for _ in $(seq 1 60); do
+            if runuser -u postgres -- pg_isready -q -h /var/run/postgresql -p "$DUCKLAKE_PG_PORT"; then old_ready=1; break; fi
+            kill -0 "$old_pid" 2>/dev/null || { log "Postgres $data_major exited during startup"; exit 1; }
+            sleep 1
+        done
+        if [ "$old_ready" != 1 ]; then
+            log "Postgres $data_major did not become ready; refusing to continue"
+            runuser -u postgres -- "$old_bin/pg_ctl" -D "$pgdata" -m fast -w stop >/dev/null 2>&1 || true
+            exit 1
+        fi
+        pg_restore_dump=/data/postgres-upgrade.sql.gz
+        log "dumping the Postgres $data_major cluster"
+        runuser -u postgres -- "$old_bin/pg_dumpall" -h /var/run/postgresql -p "$DUCKLAKE_PG_PORT" -U "$DUCKLAKE_PG_USER" \
+            | gzip > "$pg_restore_dump"
+        gzip -t "$pg_restore_dump"
+        runuser -u postgres -- "$old_bin/pg_ctl" -D "$pgdata" -m fast -w stop >/dev/null 2>&1 \
+            || kill -INT "$old_pid" 2>/dev/null || true
+        wait "$old_pid" 2>/dev/null || true
+        unset 'pids[postgres]'
+        # Keep the old directory for rollback instead of deleting it.
+        pg_backup="$pgdata.$data_major"
+        if [ -e "$pg_backup" ]; then pg_backup="$pg_backup.$(date +%Y%m%d%H%M%S)"; fi
+        mv "$pgdata" "$pg_backup"
+        mkdir -p "$pgdata"
+        chown postgres:postgres "$pgdata"
+        chmod 700 "$pgdata"
+        log "old cluster kept in $pg_backup; initialising Postgres $pg_major"
     fi
 
     if [ ! -s "$pgdata/PG_VERSION" ]; then
@@ -129,9 +182,29 @@ if [ "$run_pg" = 1 ]; then
         sleep 1
     done
     psql_local() { runuser -u postgres -- psql -q -v ON_ERROR_STOP=1 -h /var/run/postgresql -p "$DUCKLAKE_PG_PORT" -U "$DUCKLAKE_PG_USER" -d postgres "$@"; }
+    psql_restore() { runuser -u postgres -- psql -q -h /var/run/postgresql -p "$DUCKLAKE_PG_PORT" -U "$DUCKLAKE_PG_USER" -d postgres "$@"; }
+    # pg_dumpall repeats the superuser's CREATE ROLE, which already exists in
+    # the fresh cluster; that error is harmless, so ON_ERROR_STOP stays off.
+    if [ -n "$pg_restore_dump" ] && [ -s "$pg_restore_dump" ]; then
+        log "restoring the Postgres dump into the new cluster"
+        set +e
+        gzip -dc "$pg_restore_dump" | psql_restore > /tmp/postgres-restore.log 2>&1
+        restore_status=$?
+        set -e
+        if [ "$restore_status" != 0 ]; then
+            log "restore failed (log: /tmp/postgres-restore.log); the old cluster is in ${pg_backup:-/data/postgres}"
+            exit 1
+        fi
+        rm -f "$pg_restore_dump"
+    fi
     # Keep the password in step with DUCKLAKE_PG_PASSWORD, and create the catalog database.
     psql_local -v pw="$DUCKLAKE_PG_PASSWORD" -v who="$DUCKLAKE_PG_USER" <<< "ALTER ROLE :\"who\" PASSWORD :'pw';"
     if [ -z "$(psql_local -tA -v db="$DUCKLAKE_PG_DB" <<< "SELECT 1 FROM pg_database WHERE datname = :'db';")" ]; then
+        if [ -n "$pg_backup" ]; then
+            log "the restored dump has no $DUCKLAKE_PG_DB database; refusing to start on an incomplete catalog"
+            log "the old cluster is in $pg_backup; keep it until the restore has been checked"
+            exit 1
+        fi
         log "creating database $DUCKLAKE_PG_DB"
         psql_local -v db="$DUCKLAKE_PG_DB" <<< 'CREATE DATABASE :"db";'
     fi

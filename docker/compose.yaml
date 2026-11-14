@@ -145,42 +145,170 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # One-shot upgrade of an existing Postgres 17 data directory to Postgres 18.
+  # The postgres:18 image cannot read a 17 cluster, so this service starts the
+  # old cluster with postgres:17 (pre-18 releases kept it at the bind-mount
+  # root), writes a dump to ./data/postgres-upgrade/dump.sql.gz and exits.
+  # postgres-init below then archives the old cluster and restores the dump
+  # into a fresh 18 cluster. On a fresh install (or after an upgrade) there is
+  # nothing to do and it exits immediately.
+  postgres-upgrade:
+    image: postgres:17
+    container_name: ichibi-lake-postgres-upgrade
+    user: "0:0"
+    # Touches only its bind mounts: no network at all.
+    network_mode: none
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        root=/var/lib/postgresql
+        dump=/migrate/dump.sql.gz
+        if [ ! -s "$$root/PG_VERSION" ]; then
+          echo "No Postgres 17 data directory to migrate."
+          exit 0
+        fi
+        major=$$(cat "$$root/PG_VERSION")
+        if [ "$$major" != 17 ]; then
+          echo "ERROR: found a Postgres $$major data directory at the bind-mount root;" >&2
+          echo "only a 17 -> 18 upgrade is automatic (see README §4.5)." >&2
+          exit 1
+        fi
+        if [ -s "$$root/18/docker/PG_VERSION" ]; then
+          echo "ERROR: found both a Postgres 17 directory at the root and a Postgres 18" >&2
+          echo "cluster in 18/docker; refusing to guess which one to keep (README §4.5)." >&2
+          exit 1
+        fi
+        mkdir -p /var/run/postgresql /migrate
+        chown -R postgres:postgres "$$root" /var/run/postgresql /migrate
+        chmod 700 "$$root"
+        # A cluster created by an image with locales this one lacks refuses to
+        # start ("invalid value for parameter lc_messages"). These settings do
+        # not affect the dumped data, so force them while the old server runs.
+        for f in "$$root/postgresql.conf" "$$root/postgresql.auto.conf"; do
+          [ -f "$$f" ] || continue
+          sed -E -i "s/^(lc_messages|lc_monetary|lc_numeric|lc_time)[[:space:]]*=.*/\1 = 'C'/" "$$f"
+        done
+        echo "Dumping the Postgres 17 cluster"
+        gosu postgres postgres -D "$$root" \
+          -c listen_addresses='' -c unix_socket_directories=/var/run/postgresql \
+          -c port=5432 -c logging_collector=off \
+          -c lc_messages=C -c lc_monetary=C -c lc_numeric=C -c lc_time=C &
+        pid=$$!
+        trap 'kill -INT "$$pid" 2>/dev/null || true' EXIT
+        ready=0
+        for _ in $$(seq 1 60); do
+          if gosu postgres pg_isready -q -h /var/run/postgresql -U postgres; then ready=1; break; fi
+          kill -0 "$$pid" 2>/dev/null || { echo "Postgres 17 exited during startup" >&2; exit 1; }
+          sleep 1
+        done
+        [ "$$ready" = 1 ] || { echo "Postgres 17 did not become ready" >&2; exit 1; }
+        gosu postgres pg_dumpall -h /var/run/postgresql -U postgres | gzip > "$$dump"
+        gzip -t "$$dump"
+        kill -INT "$$pid"
+        wait "$$pid" || true
+        trap - EXIT
+        chown postgres:postgres "$$dump"
+        echo "Wrote $$dump; the Postgres 18 cluster will be restored from it."
+    volumes:
+      - ./data/postgres:/var/lib/postgresql
+      - ./data/postgres-upgrade:/migrate
+    restart: "no"
+
   # One-shot init that fixes ownership and permissions on the bind-mounted
-  # Postgres data dir before the db service starts. The postgres:18 image runs
-  # the server as its internal postgres user (uid 999) and refuses to start
-  # unless PGDATA is owned by that user AND has 0700/0750 permissions
-  # ("FATAL: data directory ... has invalid permissions"). On host bind mounts
-  # those bits can drift across `docker compose down`/`up` cycles, which is
-  # what breaks the db service on restart. Runs as root, normalises ownership
-  # to 999:999 and the data dir to 0700, then exits. This keeps restarts
-  # deterministic without hard-coding host UIDs into the db service itself.
+  # Postgres data dir before the db service starts, and finishes the 17 -> 18
+  # upgrade started by postgres-upgrade. The postgres:18 image runs the server
+  # as its internal postgres user (uid 999) and refuses to start unless PGDATA
+  # is owned by that user AND has 0700/0750 permissions ("FATAL: data
+  # directory ... has invalid permissions"). On host bind mounts those bits can
+  # drift across `docker compose down`/`up` cycles, which is what breaks the db
+  # service on restart. Runs as root, normalises ownership to 999:999 and the
+  # data dir to 0700, restores a pending dump, then exits. This keeps restarts
+  # deterministic without hard-coding host UIDs into db itself.
   #
   # Postgres 18 keeps its cluster in /var/lib/postgresql/18/docker (the image's
-  # PGDATA), so the whole /var/lib/postgresql is bind-mounted. The guard fails
-  # loudly if it finds a Postgres 17 data directory in the old location
-  # (PG_VERSION at the mount root) instead of silently initialising an empty
-  # cluster next to it: a major upgrade needs a dump/restore or pg_upgrade
-  # (README §4.5).
+  # PGDATA), so the whole /var/lib/postgresql is bind-mounted. A 17 cluster at
+  # the mount root is archived to 17-before-upgrade/ and its dump restored, so
+  # an existing lake upgrades with a plain `docker compose up -d`.
   postgres-init:
     image: postgres:18
     container_name: ichibi-lake-postgres-init
     user: "0:0"
-    # Touches only its bind mount: no network at all.
+    # Touches only its bind mounts: no network at all.
     network_mode: none
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+    depends_on:
+      postgres-upgrade:
+        condition: service_completed_successfully
     entrypoint:
-      - sh
+      - bash
       - -c
       - |
-        if [ -s /var/lib/postgresql/PG_VERSION ] && [ ! -s /var/lib/postgresql/18/docker/PG_VERSION ]; then
-          echo "ERROR: found a Postgres $(cat /var/lib/postgresql/PG_VERSION) data directory at the bind-mount root;" >&2
-          echo "Postgres 18 cannot start on it directly (see README §4.5)." >&2
-          exit 1
+        set -euo pipefail
+        root=/var/lib/postgresql
+        data="$$root/18/docker"
+        dump=/migrate/dump.sql.gz
+        if [ -s "$$root/PG_VERSION" ]; then
+          major=$$(cat "$$root/PG_VERSION")
+          if [ "$$major" != 17 ]; then
+            echo "ERROR: found a Postgres $$major data directory at the bind-mount root;" >&2
+            echo "only a 17 -> 18 upgrade is automatic (see README §4.5)." >&2
+            exit 1
+          fi
+          if [ ! -s "$$dump" ]; then
+            echo "ERROR: found a Postgres 17 data directory, but postgres-upgrade left no dump;" >&2
+            echo "run 'docker compose up postgres-upgrade' and then retry (README §4.5)." >&2
+            exit 1
+          fi
+          echo "Upgrading the Postgres 17 data directory to Postgres 18"
+          mkdir -p "$$root/17-before-upgrade"
+          find "$$root" -mindepth 1 -maxdepth 1 ! -name 17-before-upgrade \
+            -exec mv {} "$$root/17-before-upgrade/" \;
+          chown -R 999:999 "$$root" /var/run/postgresql
+          mkdir -p "$$data"
+          chown 999:999 "$$data"
+          chmod 700 "$$data"
+          gosu postgres initdb -D "$$data" --username=postgres --encoding=UTF8 \
+            --auth-local=trust --auth-host=scram-sha-256 > /dev/null
+          gosu postgres postgres -D "$$data" \
+            -c listen_addresses='' -c unix_socket_directories=/var/run/postgresql \
+            -c port=5432 -c logging_collector=off &
+          pid=$$!
+          trap 'kill -INT "$$pid" 2>/dev/null || true' EXIT
+          ready=0
+          for _ in $$(seq 1 60); do
+            if gosu postgres pg_isready -q -h /var/run/postgresql -U postgres; then ready=1; break; fi
+            kill -0 "$$pid" 2>/dev/null || { echo "Postgres 18 exited during the restore" >&2; exit 1; }
+            sleep 1
+          done
+          [ "$$ready" = 1 ] || { echo "Postgres 18 did not become ready" >&2; exit 1; }
+          echo "Restoring the dump (errors about the existing postgres role are expected)"
+          gzip -dc "$$dump" | gosu postgres psql -q -h /var/run/postgresql -U postgres \
+            -d postgres -v ON_ERROR_STOP=0
+          printf "ALTER ROLE postgres PASSWORD :'pw';\n" | \
+            gosu postgres psql -q -v ON_ERROR_STOP=1 -h /var/run/postgresql -U postgres \
+              -d postgres -v pw="$${POSTGRES_PASSWORD:-postgres}"
+          db_exists=$$(gosu postgres psql -tA -h /var/run/postgresql -U postgres -d postgres \
+            -c "SELECT 1 FROM pg_database WHERE datname = 'ducklake'")
+          if [ -z "$$db_exists" ]; then
+            gosu postgres psql -q -h /var/run/postgresql -U postgres -d postgres \
+              -c "CREATE DATABASE ducklake"
+          fi
+          kill -INT "$$pid"
+          wait "$$pid" || true
+          trap - EXIT
+          rm -f "$$dump"
+          echo "Postgres 18 is ready; the old cluster is in $$root/17-before-upgrade."
+        else
+          mkdir -p "$$data"
+          chown -R 999:999 "$$root"
+          chmod 700 "$$data"
         fi
-        mkdir -p /var/lib/postgresql/18/docker
-        chown -R 999:999 /var/lib/postgresql
-        chmod 700 /var/lib/postgresql/18/docker
     volumes:
       - ./data/postgres:/var/lib/postgresql
+      - ./data/postgres-upgrade:/migrate
     restart: "no"
 
   db:

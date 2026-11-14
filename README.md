@@ -1,4 +1,4 @@
-# ichibi-lake Gateway v1.7.0.0
+# ichibi-lake Gateway v1.7.1.0
 
 ![ichibi-lake](graphics/ichibi-lake-2.jpg "iChibi Lake")
 
@@ -336,6 +336,7 @@ docker/data/
 ├── blobs/       # BLOB files (when USE_FILESYSTEM_BLOBS=1)
 ├── ducklake/    # Parquet data files (console data is stored in Postgres, schema ichibi_console)
 ├── postgres/    # Postgres data directory
+├── postgres-upgrade/  # transient dump while a Postgres 17 cluster is upgraded
 ├── kafka/       # Kafka KRaft logs
 └── minio/       # MinIO objects (only with the minio profile)
 ```
@@ -434,7 +435,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 - **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (since then, `/query` and GraphQL `sql` accept non-superusers again, scoped to the tables they can read) (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
 - **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
 - **Upgrade the image** with `docker compose pull && docker compose up -d`; add `--remove-orphans` to remove the retired `duckdb-ui` container from older releases. When running from source, rebuild instead (`docker compose -f compose.yaml -f compose.build.yaml up -d --build --remove-orphans`). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
-- **Bundled Postgres 17 → 18 (not automatic).** Postgres cannot open a cluster from an older major version, and unlike the DuckLake catalog it is **not** migrated by `AUTOMATIC_MIGRATION`. The `postgres:18` image keeps its cluster in `/var/lib/postgresql/18/docker`, so `docker/compose.yaml` now mounts `./data/postgres` at `/var/lib/postgresql` (previously `/var/lib/postgresql/data`). For an existing compose stack, dump the old cluster and restore it into a fresh one:
+- **Bundled Postgres 17 → 18 upgrades automatically.** Postgres cannot open a cluster from an older major version, so on first start after the update the stack upgrades it before the gateway runs. `postgres-upgrade` starts the old cluster with the `postgres:17` image and writes a dump to `data/postgres-upgrade/`; `postgres-init` then moves the old directory to `data/postgres/17-before-upgrade/`, initialises a Postgres 18 cluster and restores the dump into it. The self-contained image does the same with the Postgres 17 binaries it ships, keeping the old cluster in `/data/postgres.17`. Both steps only run when a 17 directory is present (a fresh install pulls `postgres:17` once, then skips it), and the old cluster is kept for rollback — remove it once the upgrade is verified. Postgres 18 keeps its cluster in `/var/lib/postgresql/18/docker`, so `docker/compose.yaml` now mounts `./data/postgres` at `/var/lib/postgresql` (previously `/var/lib/postgresql/data`). Only 17 → 18 is automatic; to move from an older major, dump and restore it manually:
   ```sh
   docker compose exec -T db pg_dumpall -U postgres > postgres-backup.sql
   docker compose down
@@ -443,7 +444,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
   docker compose exec -T db psql -U postgres < postgres-backup.sql
   docker compose up -d
   ```
-  The `database "ducklake" already exists` error from `pg_dumpall` is expected (the service creates it) and harmless. For the self-contained image, dump with `docker exec <old-container> pg_dumpall -h /var/run/postgresql -U postgres > postgres-backup.sql`, then start the new image with an empty `/data` and a command that keeps the gateway idle (`... <image> sleep infinity`), restore the dump the same way (`docker exec -i <container> psql -h /var/run/postgresql -U postgres < postgres-backup.sql`), and re-create the container without the override. Both `postgres-init` and the container entrypoint refuse to start on a data directory from an older major version, instead of silently initialising an empty lake beside the old data.
+  The `database "ducklake" already exists` error from `pg_dumpall` is expected (the service creates it) and harmless.
 
 - **Kafka 4.4 storage is not readable by older brokers (KIP-1170).** Log directories formatted by the bundled 4.4 `kafka-storage` (a fresh `/data` in the self-contained image, or `apache/kafka:4.4.0` in compose) cannot be opened by 4.3.x or earlier. Logs created by 4.3.1 keep working when upgrading, but rolling the image back after 4.4 has formatted a fresh `docker/data/kafka` needs that directory removed (and any unconsumed messages are lost).
 
@@ -505,7 +506,7 @@ The image is **self-contained**: besides the gateway it bundles Postgres 18 (the
 | Tag | Published for |
 | :--- | :--- |
 | `ghcr.io/stephen-kruger/ichibi-lake:latest` | the latest commit on `main` |
-| `ghcr.io/stephen-kruger/ichibi-lake:1.7.0.0` | the git tag `v1.7.0.0` (releases) |
+| `ghcr.io/stephen-kruger/ichibi-lake:1.7.1.0` | the git tag `v1.7.1.0` (releases) |
 | `ghcr.io/stephen-kruger/ichibi-lake:sha-<commit>` | every published commit |
 
 **Standalone.** Mount a volume at `/data`: lake files, blobs, console storage settings, Postgres and Kafka all live there.
@@ -520,7 +521,7 @@ or in a compose file:
 ```yaml
 services:
   ichibi-lake:
-    image: ghcr.io/stephen-kruger/ichibi-lake:1.7.0.0
+    image: ghcr.io/stephen-kruger/ichibi-lake:1.7.1.0
     ports: [ "3000:3000" ]
     environment:
       - API_KEYS=change-me
