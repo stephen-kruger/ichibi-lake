@@ -112,10 +112,22 @@ if [ "$run_pg" = 1 ]; then
         # Start the old cluster on the local socket only, dump it, stop it, then
         # let a fresh 18 cluster be created below and restore the dump into it.
         # A cluster created by an image with locales this one lacks refuses to
-        # start ("invalid value for parameter lc_messages"); these settings do
-        # not affect the dumped data, so force them while the old server runs.
+        # start ("invalid value for parameter lc_messages"), and its databases
+        # cannot be dumped until setlocale() resolves their collation, so
+        # generate the configured locales where possible (en_US.UTF-8, the
+        # official postgres image default, is also generated at build time).
+        # These settings do not affect the dumped data, so force them to C
+        # afterwards while the old server runs.
         for f in "$pgdata/postgresql.conf" "$pgdata/postgresql.auto.conf"; do
             [ -f "$f" ] || continue
+            sed -nE "s/^[[:space:]]*lc_(messages|monetary|numeric|time)[[:space:]]*=[[:space:]]*'([^']*)'.*/\2/p" "$f" | sort -u |
+                while IFS= read -r loc; do
+                    case "$loc" in ''|C|POSIX|C.utf8|C.UTF-8) continue ;; esac
+                    charset=${loc#*.}
+                    if [ "$charset" = "$loc" ]; then charset=UTF-8; fi
+                    case "$charset" in utf8|UTF8|utf-8) charset=UTF-8 ;; esac
+                    localedef -i "${loc%%.*}" -f "$charset" "$loc" 2>/dev/null || true
+                done
             sed -E -i "s/^(lc_messages|lc_monetary|lc_numeric|lc_time)[[:space:]]*=.*/\1 = 'C'/" "$f"
         done
         log "found Postgres $data_major data in $pgdata; upgrading it to Postgres $pg_major"

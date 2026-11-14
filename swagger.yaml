@@ -41,7 +41,7 @@ info:
     a graph from the registry on whichever instance runs a query. The registry is the single
     source of truth; querying a graph that is not registered returns `404`.
     DuckPGQ is pinned to DuckDB 1.5.0 and can be disabled with `DISABLE_DUCKPGQ=1`.
-  version: 1.7.1.0
+  version: 1.7.1.1
 servers:
   - url: http://ichibi-lake:3333
     description: ichibi-lake gateway

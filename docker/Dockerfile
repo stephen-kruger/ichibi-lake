@@ -18,8 +18,11 @@ ARG SCALA_VERSION=2.13
 # curl: compose/image healthchecks and downloads. tini: PID 1 (signals,
 # zombies). Postgres from the PGDG repository, without the Debian package's
 # default cluster: the entrypoint creates one in /data. The previous major is
-# installed only for in-place upgrades. Java 21 runs Kafka (Kafka 4.4 supports
-# Java 17, 21 and 25).
+# installed only for in-place upgrades. en_US.UTF-8 is generated because the
+# official postgres image, which created the clusters being upgraded, defaults
+# to it: a cluster whose database locale setlocale() cannot resolve refuses
+# connections ("database locale is incompatible with operating system").
+# Java 21 runs Kafka (Kafka 4.4 supports Java 17, 21 and 25).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates gnupg tini && \
     install -d /usr/share/postgresql-common/pgdg && \
@@ -29,6 +32,7 @@ RUN apt-get update && \
     echo 'create_main_cluster = false' > /etc/postgresql-common/createcluster.d/no-main-cluster.conf && \
     apt-get update && \
     apt-get install -y --no-install-recommends postgresql-${POSTGRES_UPGRADE_FROM} postgresql-${POSTGRES_MAJOR} openjdk-21-jre-headless && \
+    localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8 && \
     apt-get purge -y gnupg && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
