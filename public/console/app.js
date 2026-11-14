@@ -362,7 +362,7 @@ function showUpdateDialog(info) {
         body: h('div', { class: 'row-gap' },
             h('p', {}, `You are running v${info.current}. Version v${info.latest} is available on `,
                 h('a', { href: info.repoUrl, target: '_blank', rel: 'noopener' }, 'GitHub'), '.'),
-            h('p', {}, 'To update, run this in the repository on the gateway host:'),
+            h('p', {}, 'To update, run this in the docker directory on the gateway host (add -f compose.yaml -f compose.build.yaml when building from source):'),
             h('div', { class: 'secret-box' }, info.updateCommand),
             h('div', { class: 'right' }, copyBtn)),
     });

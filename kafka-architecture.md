@@ -218,4 +218,4 @@ BASE_URL=http://my-gateway:3333 API_KEY=my-key node test-kafka-sse.js
 | Timed out waiting for dump-complete | Kafka broker not reachable; check `docker inspect ichibi-lake-kafka` for health |
 | "This server does not host this topic-partition" | Topic not yet created or partition leader not elected; admin.createTopics with metadata polling should handle this |
 | SSE stream returns `event: error` immediately | `KAFKA_BROKERS` not configured in Docker env |
-| App logs: `Failed parsing message on topic __consumer_offsets` | Running old image without the `__` prefix filter — rebuild with `docker compose build app` |
+| App logs: `Failed parsing message on topic __consumer_offsets` | Running old image without the `__` prefix filter — pull a current image (`docker compose pull app && docker compose up -d app`) or rebuild from source (`docker compose -f compose.yaml -f compose.build.yaml up -d --build`) |

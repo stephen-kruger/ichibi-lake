@@ -433,7 +433,7 @@ Existing data is migrated **automatically** on first start: the gateway attaches
 - **The bundled DuckDB web UI was removed** (it had no authentication). Use the console's **Tables & Data** page instead.
 - **Raw SQL is now superuser-only.** `POST /query`, the GraphQL `sql` query and graph create/delete/query reject non-superuser keys with HTTP 403 (since then, `/query` and GraphQL `sql` accept non-superusers again, scoped to the tables they can read) (default `API_KEYS` keys are superusers, so single-key setups are unaffected). `SQL_READ_ONLY` was removed; user-supplied SQL is always read-only. See [§3.5](#35-sql-enforcement).
 - **Tested path:** 1.5.4 → 2.0.0 (tables, blobs, schema-evolved columns and registered property graphs all survive). Upgrading directly from older releases (DuckDB 1.5.0) passes through additional catalog migrations that have not been verified; take a backup first.
-- **Rebuild the image** when running from source (`docker compose -f compose.yaml -f compose.build.yaml up -d --build --remove-orphans`; `--remove-orphans` also removes the retired `duckdb-ui` container from older releases). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
+- **Upgrade the image** with `docker compose pull && docker compose up -d`; add `--remove-orphans` to remove the retired `duckdb-ui` container from older releases. When running from source, rebuild instead (`docker compose -f compose.yaml -f compose.build.yaml up -d --build --remove-orphans`). DuckDB extensions (`ducklake`, `postgres`, `duckpgq`) are pre-installed at image build time for the pinned DuckDB version, so containers never download them at startup.
 - **Bundled Postgres 17 → 18 (not automatic).** Postgres cannot open a cluster from an older major version, and unlike the DuckLake catalog it is **not** migrated by `AUTOMATIC_MIGRATION`. The `postgres:18` image keeps its cluster in `/var/lib/postgresql/18/docker`, so `docker/compose.yaml` now mounts `./data/postgres` at `/var/lib/postgresql` (previously `/var/lib/postgresql/data`). For an existing compose stack, dump the old cluster and restore it into a fresh one:
   ```sh
   docker compose exec -T db pg_dumpall -U postgres > postgres-backup.sql
@@ -466,7 +466,7 @@ S3_SECRET_KEY=<the same secret>
 S3_USE_SSL=false
 ```
 
-Then `docker compose up -d --build`. MinIO keeps its data in `docker/data/minio/`; its web console is on `http://localhost:9001` (bound to `127.0.0.1`; see `MINIO_BIND_ADDRESS`). The `minio/minio` images are no longer published on Docker Hub or quay.io, so the profile uses Chainguard's build (`cgr.dev/chainguard/minio`, set `MINIO_IMAGE` to use another).
+Then `docker compose --profile minio up -d` (to build the gateway from source instead, use `docker compose -f compose.yaml -f compose.build.yaml --profile minio up -d --build`). MinIO keeps its data in `docker/data/minio/`; its web console is on `http://localhost:9001` (bound to `127.0.0.1`; see `MINIO_BIND_ADDRESS`). The `minio/minio` images are no longer published on Docker Hub or quay.io, so the profile uses Chainguard's build (`cgr.dev/chainguard/minio`, set `MINIO_IMAGE` to use another).
 
 **AWS S3.** Leave `S3_ENDPOINT` empty and set `S3_REGION`. Either set `S3_ACCESS_KEY`/`S3_SECRET_KEY`, or leave them empty to use the credential chain (instance/task role). The IAM policy needs `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `prefix/*`.
 
@@ -478,7 +478,7 @@ Notes:
 - The console's own catalog (`ichibi_console`) keeps every row in Postgres; its data path is `<prefix>_console/`, which stays empty.
 - **BLOB files** (`USE_FILESYSTEM_BLOBS=1`) stay on the local `BLOBS_PATH` directory ([§3.4](#34-blob-storage)).
 - All gateway instances must use the same `DUCKLAKE_DATA_PATH` and catalog. Object storage removes the shared-filesystem requirement of multi-instance deployments.
-- **Manual check** (what the integration run against the minio profile does): `docker compose --profile minio up -d --build`, then `npm test`, and confirm that new files appear under `docker/data/minio/<bucket>/lake/main/<table>/` and that the gateway log shows `data: s3://... on http://minio:9000`.
+- **Manual check** (what the integration run against the minio profile does): `docker compose --profile minio up -d`, then `npm test`, and confirm that new files appear under `docker/data/minio/<bucket>/lake/main/<table>/` and that the gateway log shows `data: s3://... on http://minio:9000`.
 
 ### 4.7 Lake Maintenance (Small Files)
 

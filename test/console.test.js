@@ -440,7 +440,7 @@ async function run() {
         const info = await checkForUpdate('1.6.25.1', { fetchImpl: fakeFetch('1.7.0', { n: 0 }), now: 1000 });
         assert.equal(info.latest, '1.7.0');
         assert.equal(info.updateAvailable, true);
-        assert.equal(info.updateCommand, 'git pull && docker compose up -d --build');
+        assert.equal(info.updateCommand, 'docker compose pull && docker compose up -d');
         assert.match(info.repoUrl, /github\.com\/stephen-kruger\/ichibi-lake$/);
     });
     await test('same or older remote version reports no update', async () => {

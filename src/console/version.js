@@ -1,12 +1,12 @@
 /**
  * Update check for the admin console: compares the running version with the
- * version in package.json on the GitHub repository's main branch (the
- * project publishes no releases or tags). Results are cached so the console
- * contacts GitHub at most once per CACHE_MS, and every failure is reported as
- * "unknown" rather than an error.
+ * version in package.json on the GitHub repository's main branch. Updates are
+ * delivered as the published ghcr.io image, so the suggested command pulls it.
+ * Results are cached so the console contacts GitHub at most once per CACHE_MS,
+ * and every failure is reported as "unknown" rather than an error.
  */
 export const REPO_URL = 'https://github.com/stephen-kruger/ichibi-lake';
-export const UPDATE_COMMAND = 'git pull && docker compose up -d --build';
+export const UPDATE_COMMAND = 'docker compose pull && docker compose up -d';
 const REMOTE_PACKAGE_URL = 'https://raw.githubusercontent.com/stephen-kruger/ichibi-lake/main/package.json';
 const CACHE_MS = 6 * 60 * 60 * 1000;
 const FAILURE_CACHE_MS = 30 * 60 * 1000;
