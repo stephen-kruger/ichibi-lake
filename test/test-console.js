@@ -838,6 +838,22 @@ async function run() {
             assert((await admin('GET', `/data/export?format=csv&tables=no_such_table_${TS}`)).status === 404, 'unknown table');
             assert((await admin('GET', `/data/export?format=xlsx&tables=${IMP}`)).status === 400, 'bad format');
         });
+        await test('multi-table export ZIP re-imports through the console import', async () => {
+            const res = await admin('GET', `/data/export?format=csv&tables=${IMP},${IMP2}`, undefined, { raw: true });
+            assert(res.status === 200, `export status ${res.status}`);
+            const archive = Buffer.from(await res.arrayBuffer());
+            assert((await admin('DELETE', `/data/tables/${IMP2}`, { confirm: IMP2 })).status === 200, 'drop second table');
+            assert((await admin('DELETE', `/data/tables/${IMP}`, { confirm: IMP })).status === 200, 'drop first table');
+            const dry = await admin('POST', '/data/import?filename=restore.zip&mode=create&dryRun=1', undefined, { rawBody: archive });
+            assert(dry.status === 200 && dry.data.archive === true && dry.data.tableCount === 2, JSON.stringify(dry.data));
+            assert(dry.data.tables.map(t => `${t.table}:${t.totalRows}`).join(',') === `${IMP}:5,${IMP2}:2`, JSON.stringify(dry.data.tables));
+            const r = await admin('POST', '/data/import?filename=restore.zip&mode=create', undefined, { rawBody: archive });
+            assert(r.status === 200 && r.data.archive && r.data.inserted === 7 && r.data.tableCount === 2, JSON.stringify(r.data));
+            const a = await admin('GET', `/data/tables/${IMP}/schema`);
+            const b = await admin('GET', `/data/tables/${IMP2}/schema`);
+            assert(a.status === 200 && a.data.rows === 5 && b.status === 200 && b.data.rows === 2,
+                `${a.status}/${a.data.rows} ${b.status}/${b.data.rows}`);
+        });
         await admin('DELETE', `/data/tables/${IMP2}`, { confirm: IMP2 });
         await admin('DELETE', `/data/tables/${IMP}`, { confirm: IMP });
 

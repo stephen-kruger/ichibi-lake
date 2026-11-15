@@ -420,6 +420,7 @@ async function run() {
         assert.equal(detectImportFormat('', 'x.tsv'), 'csv');
         assert.equal(detectImportFormat('', 'x.parquet'), 'parquet');
         assert.equal(detectImportFormat('', 'events.jsonl'), 'json');
+        assert.equal(detectImportFormat('', 'backup.zip'), 'zip');
         assert.equal(detectImportFormat('parquet', 'misnamed.csv'), 'parquet');
         assert.throws(() => detectImportFormat('', 'x.xlsx'), /format/);
         assert.throws(() => detectImportFormat('xlsx', 'x.csv'), /Unsupported/);

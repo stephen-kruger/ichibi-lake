@@ -1,10 +1,14 @@
 /**
- * Unit tests for src/zip.js: the streaming ZIP writer behind multi-table
- * exports. Archives are read back with test/zip-reader.js (central directory,
- * inflate, CRC-32 check).
+ * Unit tests for src/zip.js (the streaming ZIP writer behind multi-table
+ * exports) and src/unzip.js (the reader behind ZIP imports). Archives are read
+ * back through the central directory, with inflate and CRC-32 checks.
  */
 import assert from 'node:assert/strict';
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { ZipWriter } from '../src/zip.js';
+import { listZipEntries, extractZipEntry, readZipEntry } from '../src/unzip.js';
 import { readZip } from './zip-reader.js';
 
 let passed = 0, failed = 0;
@@ -23,6 +27,14 @@ async function build(fn, { slow = false } = {}) {
     await fn(zip);
     await zip.finish();
     return Buffer.concat(parts);
+}
+
+/** Write a built archive to a temp file, run `fn(file, dir)`, then clean up. */
+async function withArchive(buf, fn) {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'ichibi-zip-test-'));
+    const file = path.join(dir, 'archive.zip');
+    await fsp.writeFile(file, buf);
+    try { return await fn(file, dir); } finally { await fsp.rm(dir, { recursive: true, force: true }); }
 }
 
 async function run() {
@@ -69,6 +81,46 @@ async function run() {
         assert.equal(readZip(buf)[0].name, 'données_é.csv');
     });
 
+    await test('import reader lists, reads and extracts stored and deflated entries', async () => {
+        const text = 'id,name\r\n1,one\r\n2,two\r\n';
+        const binary = Buffer.from([0, 1, 2, 3, 255, 254]);
+        const buf = await build(async (zip) => {
+            await zip.add('a.csv', text, { compress: true });
+            await zip.add('b.parquet', binary, { compress: false });
+            await zip.add('empty.csv', '');
+            await zip.add('manifest.json', JSON.stringify({ tables: [] }));
+        });
+        await withArchive(buf, async (file, dir) => {
+            const entries = await listZipEntries(file);
+            assert.deepEqual(entries.map(e => e.name), ['a.csv', 'b.parquet', 'empty.csv', 'manifest.json']);
+            assert.deepEqual(JSON.parse((await readZipEntry(file, entries[3])).toString()), { tables: [] });
+            const csv = path.join(dir, 'a.csv');
+            const pq = path.join(dir, 'b.parquet');
+            const empty = path.join(dir, 'empty.csv');
+            assert.equal(await extractZipEntry(file, entries[0], csv), text.length);
+            assert.equal(await fsp.readFile(csv, 'utf8'), text);
+            assert.equal(await extractZipEntry(file, entries[1], pq), binary.length);
+            assert.deepEqual(await fsp.readFile(pq), binary);
+            assert.equal(await extractZipEntry(file, entries[2], empty), 0);
+            assert.equal((await fsp.readFile(empty)).length, 0);
+        });
+    });
+
+    await test('import reader rejects bad CRCs and oversized extraction', async () => {
+        const text = 'id,name\r\n1,one\r\n';
+        const buf = await build(async (zip) => { await zip.add('a.csv', text, { compress: false }); });
+        await withArchive(buf, async (file, dir) => {
+            const [entry] = await listZipEntries(file);
+            await assert.rejects(extractZipEntry(file, entry, path.join(dir, 'small.csv'), { maxBytes: 2 }), /limit/);
+            const local = Buffer.from(buf.subarray(entry.offset, entry.offset + 30));
+            const start = entry.offset + 30 + local.readUInt16LE(26) + local.readUInt16LE(28);
+            const broken = Buffer.from(buf);
+            broken[start + 2] ^= 0xff;
+            await fsp.writeFile(file, broken);
+            await assert.rejects(extractZipEntry(file, entry, path.join(dir, 'broken.csv')), /CRC|could not extract|wrong size/);
+        });
+    });
+
     await test('more than 65535 entries switch to ZIP64 end records', async () => {
         const n = 65540;
         const buf = await build(async (zip) => {
@@ -78,6 +130,11 @@ async function run() {
         const entries = readZip(buf);
         assert.equal(entries.length, n);
         assert.equal(entries[n - 1].name, `f${n - 1}.txt`);
+        await withArchive(buf, async (file) => {
+            const readEntries = await listZipEntries(file);
+            assert.equal(readEntries.length, n);
+            assert.equal(readEntries[n - 1].name, `f${n - 1}.txt`);
+        });
     });
 
     await test('misuse is rejected', async () => {

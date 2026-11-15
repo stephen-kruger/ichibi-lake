@@ -28,7 +28,7 @@ const ZIP64_EXTRA_ID = 0x0001;
 
 // zlib.crc32 needs Node >= 22.2; keep a table fallback for older runtimes.
 let crcTable = null;
-function crc32(buf, prev = 0) {
+export function crc32(buf, prev = 0) {
     if (typeof zlib.crc32 === 'function') return zlib.crc32(buf, prev);
     if (!crcTable) {
         crcTable = new Uint32Array(256);

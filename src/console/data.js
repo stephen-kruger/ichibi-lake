@@ -28,6 +28,10 @@ import { EXPORT_FORMATS, runExport, runMultiExport } from '../export.js';
 import { resolveTypeConflict } from '../schema-evolution.js';
 import { getTableKeys, setTableKeys, normaliseKeyList, assertKeysMatchColumns, countDuplicateKeys, renameKeyColumn } from '../table-keys.js';
 import { isTransactionConflict } from '../conflict.js';
+import fsp from 'fs/promises';
+import path from 'path';
+import { listZipEntries, extractZipEntry, readZipEntry } from '../unzip.js';
+import { importMaxBytes } from '../import.js';
 
 export const SAFE_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 export const PAGE_SIZES = [25, 50, 100, 250, 500];
@@ -753,11 +757,14 @@ export async function exportTables(tableNames, { format = 'parquet' } = {}, res)
 
 // --- Import ----------------------------------------------------------------------------
 
-export const IMPORT_FORMATS = ['csv', 'parquet', 'json'];
+export const IMPORT_FORMATS = ['csv', 'parquet', 'json', 'zip'];
 const IMPORT_PREVIEW_ROWS = 20;
 const IMPORT_PREVIEW_CHARS = 200;
+const ARCHIVE_MAX_TABLES = 10000;
+const ARCHIVE_MAX_EXPANSION = 10;           // uncompressed bytes allowed per IMPORT_MAX_MB of upload
+const MANIFEST_MAX_BYTES = 4 * 1024 * 1024;
 
-const IMPORT_FORMAT_ALIASES = { ndjson: 'json', jsonl: 'json', tsv: 'csv' };
+const IMPORT_FORMAT_ALIASES = { ndjson: 'json', jsonl: 'json', tsv: 'csv', archive: 'zip' };
 
 /** Format from an explicit choice, else from the file name's extension. */
 export function detectImportFormat(format, filename = '') {
@@ -770,7 +777,8 @@ export function detectImportFormat(format, filename = '') {
     if (ext === 'csv' || ext === 'tsv' || ext === 'txt') return 'csv';
     if (ext === 'parquet' || ext === 'pq') return 'parquet';
     if (ext === 'json' || ext === 'ndjson' || ext === 'jsonl') return 'json';
-    throw httpError(400, 'Could not tell the file format from its name; choose CSV, Parquet or JSON.');
+    if (ext === 'zip') return 'zip';
+    throw httpError(400, 'Could not tell the file format from its name; choose CSV, Parquet, JSON or ZIP.');
 }
 
 /**
@@ -815,6 +823,156 @@ function planAppend(existingCols, incoming, addColumns) {
     return { columns, missing: missing.map(c => c.column_name).filter(n => !autoFill.some(a => a.name === n)), autoFill };
 }
 
+/** Archive member name with Windows separators normalised. */
+function archiveEntryPath(entry) {
+    return String(entry.name || '').replace(/\\/g, '/');
+}
+
+/** Directories and common OS metadata are not tables. */
+function skipArchiveEntry(name) {
+    if (!name || name.endsWith('/')) return true;
+    const parts = name.split('/');
+    if (parts.includes('__MACOSX')) return true;
+    const base = parts[parts.length - 1];
+    return !base || base === '.DS_Store' || base === 'Thumbs.db' || base.startsWith('._');
+}
+
+/** Table name for a file in an archive without a manifest (matches the UI's suggestion). */
+function archiveTableName(name) {
+    const base = String(name).replace(/\\/g, '/').split('/').pop() || '';
+    let table = base.replace(/\.[^.]*$/, '').replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+/, '');
+    if (!/^[A-Za-z_]/.test(table)) table = `t_${table}`;
+    return table.slice(0, 63) || 'imported';
+}
+
+/** Format of one archive member: its extension, else the manifest's export format. */
+function archiveEntryFormat(entry, fallback = '') {
+    let format = '';
+    try { format = detectImportFormat('', archiveEntryPath(entry)); } catch { /* try the manifest's format */ }
+    if (!format && fallback) {
+        try { format = detectImportFormat(fallback); } catch { /* fall through */ }
+    }
+    if (!format) throw httpError(400, `Could not tell the format of "${archiveEntryPath(entry)}"; use .csv, .parquet, .json or .ndjson files`);
+    if (format === 'zip') throw httpError(400, `Entry "${archiveEntryPath(entry)}" is a ZIP archive; nested archives are not supported`);
+    return format;
+}
+
+/**
+ * The archive's manifest, when it has one. Exports write manifest.json last;
+ * its `tables` list maps each file back to the table it came from, including
+ * names the file-name sanitiser would change.
+ */
+async function readArchiveManifest(file, entries) {
+    const candidates = entries.filter(e => archiveEntryPath(e).split('/').pop().toLowerCase() === 'manifest.json');
+    for (let i = candidates.length - 1; i >= 0; i--) {
+        try {
+            const manifest = JSON.parse((await readZipEntry(file, candidates[i], { maxBytes: MANIFEST_MAX_BYTES })).toString('utf8'));
+            if (manifest && typeof manifest === 'object' && Array.isArray(manifest.tables) && typeof manifest.format === 'string') return { entry: candidates[i], manifest };
+        } catch { /* not the export manifest; it may be a table named "manifest" */ }
+    }
+    return { entry: null, manifest: null };
+}
+
+function findArchiveEntry(entries, used, name) {
+    const wanted = String(name).replace(/\\/g, '/');
+    const exact = entries.find(e => !used.has(e) && archiveEntryPath(e) === wanted);
+    if (exact) return exact;
+    const lower = wanted.toLowerCase();
+    return entries.find(e => !used.has(e) && archiveEntryPath(e).toLowerCase() === lower);
+}
+
+/** Files in an archive mapped to target tables and formats. */
+export async function planZipImport(file) {
+    let entries;
+    try {
+        entries = await listZipEntries(file);
+    } catch (err) {
+        if (err.statusCode) throw err;
+        throw httpError(400, `Could not read the ZIP archive: ${cleanDuckDbError(err)}`);
+    }
+    const dataEntries = entries.filter(e => !skipArchiveEntry(archiveEntryPath(e)));
+    const { entry: manifestEntry, manifest } = await readArchiveManifest(file, dataEntries);
+    const used = new Set();
+    if (manifestEntry) used.add(manifestEntry);
+    const picks = [];
+    const seen = new Set();
+    const add = (entry, table, format) => {
+        const key = table.toLowerCase();
+        if (seen.has(key)) throw httpError(400, `The archive maps more than one file to table "${table}"`);
+        seen.add(key);
+        used.add(entry);
+        picks.push({ entry, table, format });
+    };
+
+    if (manifest) {
+        for (const item of manifest.tables) {
+            const table = String(item?.table ?? '').trim();
+            const name = String(item?.file ?? '').trim();
+            if (!table || !name) throw httpError(400, 'manifest.json has a table entry without a table or file name');
+            const entry = findArchiveEntry(dataEntries, used, name);
+            if (!entry) throw httpError(400, `manifest.json lists "${name}" for table "${table}", but the archive has no such file`);
+            add(entry, table, archiveEntryFormat(entry, manifest.format));
+        }
+    }
+    for (const entry of dataEntries) {
+        if (used.has(entry)) continue;
+        add(entry, archiveTableName(archiveEntryPath(entry)), archiveEntryFormat(entry, manifest?.format));
+    }
+    if (!picks.length) throw httpError(400, 'The ZIP archive contains no importable files');
+    if (picks.length > ARCHIVE_MAX_TABLES) throw httpError(400, `The ZIP archive has more than ${ARCHIVE_MAX_TABLES} importable files`);
+    return picks;
+}
+
+/**
+ * Import every file in a ZIP archive as its own table. Exported archives carry
+ * manifest.json, so table names (and the one export format) round-trip; other
+ * archives use each file's name and extension. Each table is imported in its
+ * own transaction, so a failure late in the archive leaves the earlier tables
+ * imported and says which ones they were.
+ */
+async function importArchive(file, { mode = 'create', dryRun = false, addColumns = true } = {}) {
+    if (!IMPORT_MODES.includes(mode)) throw httpError(400, `mode must be one of: ${IMPORT_MODES.join(', ')}`);
+    const picks = await planZipImport(file);
+    const maxBytes = importMaxBytes() * ARCHIVE_MAX_EXPANSION;
+    const declared = picks.reduce((n, p) => n + p.entry.usize, 0);
+    if (declared > maxBytes) throw httpError(400, `The ZIP archive expands to more than ${Math.round(maxBytes / 1048576)} MB (IMPORT_MAX_MB × ${ARCHIVE_MAX_EXPANSION})`);
+
+    const dir = await fsp.mkdtemp(path.join(path.dirname(file), 'zip-'));
+    const results = [];
+    let remaining = maxBytes;
+    try {
+        let index = 0;
+        for (const pick of picks) {
+            const ext = pick.format === 'json' ? 'json' : pick.format;
+            const dest = path.join(dir, `${index++}.${ext}`);
+            try {
+                const bytes = await extractZipEntry(file, pick.entry, dest, { maxBytes: remaining });
+                remaining -= bytes;
+                const result = await importFile(dest, { format: pick.format, table: pick.table, mode, dryRun, addColumns, preview: false });
+                results.push({ file: archiveEntryPath(pick.entry), ...result });
+            } catch (err) {
+                const where = `Entry "${archiveEntryPath(pick.entry)}" (table "${pick.table}")`;
+                if (results.length && !dryRun) {
+                    throw httpError(err.statusCode || 400, `${where}: ${err.message} (${results.length} table(s) imported before the failure: ${results.map(r => r.table).join(', ')})`);
+                }
+                throw httpError(err.statusCode || 400, `${where}: ${err.message}`);
+            }
+        }
+    } finally {
+        await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (dryRun) {
+        return {
+            dryRun: true, archive: true, format: 'zip', tableCount: results.length,
+            totalRows: results.reduce((n, r) => n + (r.totalRows || 0), 0), tables: results,
+        };
+    }
+    return {
+        archive: true, format: 'zip', tableCount: results.length,
+        inserted: results.reduce((n, r) => n + (r.inserted || 0), 0), tables: results,
+    };
+}
+
 export const IMPORT_MODES = ['create', 'append', 'replace', 'auto'];
 
 /**
@@ -833,8 +991,12 @@ export const IMPORT_MODES = ['create', 'append', 'replace', 'auto'];
  * `prepare(conn)` runs first on the connection (e.g. to load httpfs and the
  * import secret for s3:// sources).
  */
-export async function importFile(file, { format, table, mode = 'create', dryRun = false, addColumns = true, remote = false, prepare = null } = {}) {
+export async function importFile(file, { format, table, mode = 'create', dryRun = false, addColumns = true, remote = false, prepare = null, preview = true } = {}) {
     if (!IMPORT_MODES.includes(mode)) throw httpError(400, `mode must be one of: ${IMPORT_MODES.join(', ')}`);
+    if (format === 'zip') {
+        if (remote) throw httpError(400, 'ZIP archives cannot be imported from object storage; download the archive and import it from the console');
+        return importArchive(file, { mode, dryRun, addColumns });
+    }
     const reader = importReader(format, file, { remote });
     return withConnection(async (conn) => {
         if (prepare) await prepare(conn);
@@ -863,8 +1025,10 @@ export async function importFile(file, { format, table, mode = 'create', dryRun 
         const totalRows = Number(await scalar(conn, `SELECT count(*) FROM ${reader}`));
 
         if (dryRun) {
-            const sample = await rows(conn,
-                `SELECT ${incoming.map((c, i) => `left(CAST(${quoteIdent(c.name)} AS VARCHAR), ${IMPORT_PREVIEW_CHARS}) AS c${i}`).join(', ')} FROM ${reader} LIMIT ${IMPORT_PREVIEW_ROWS}`);
+            const sample = preview
+                ? await rows(conn,
+                    `SELECT ${incoming.map((c, i) => `left(CAST(${quoteIdent(c.name)} AS VARCHAR), ${IMPORT_PREVIEW_CHARS}) AS c${i}`).join(', ')} FROM ${reader} LIMIT ${IMPORT_PREVIEW_ROWS}`)
+                : [];
             return {
                 dryRun: true, format, mode, table, totalRows, columns: incoming,
                 preview: sample.map(r => incoming.map((_, i) => (r[`c${i}`] === null || r[`c${i}`] === undefined ? null : String(r[`c${i}`])))),

@@ -1836,6 +1836,11 @@ app.post('/tables/:tableName/import', async (req, res) => {
         const q = req.query;
         const flag = (v, dflt) => (v === undefined || v === null || v === '' ? dflt : !(v === false || /^(0|false|no)$/i.test(String(v))));
         const sourceRequest = !q.format && contentTypeFormat(contentType) === 'json' ? await readSourceRequest(file, size) : null;
+        const rejectArchive = () => {
+            const err = new Error('ZIP archives contain several tables; import them from the admin console (Tables & Data → Import), or send one table\'s file.');
+            err.statusCode = 400;
+            throw err;
+        };
         let options;
         if (sourceRequest) {
             const parsed = parseImportSource(sourceRequest.source);
@@ -1844,11 +1849,13 @@ app.post('/tables/:tableName/import', async (req, res) => {
                 err.statusCode = 403;
                 throw err;
             }
+            const format = detectImportFormat(sourceRequest.format ? String(sourceRequest.format) : '', parsed.key.replace(/[*?[\]{}]+$/, ''));
+            if (format === 'zip') rejectArchive();
             options = {
                 source: parsed.source,
                 remote: true,
                 prepare: prepareS3Import,
-                format: detectImportFormat(sourceRequest.format ? String(sourceRequest.format) : '', parsed.key.replace(/[*?[\]{}]+$/, '')),
+                format,
                 mode: String(sourceRequest.mode ?? q.mode ?? 'auto'),
                 addColumns: flag(sourceRequest.addColumns ?? q.addColumns, true),
                 dryRun: flag(sourceRequest.dryRun ?? q.dryRun, false),
@@ -1860,9 +1867,11 @@ app.post('/tables/:tableName/import', async (req, res) => {
                 err.statusCode = 400;
                 throw err;
             }
+            const format = detectImportFormat(explicit);
+            if (format === 'zip') rejectArchive();
             options = {
                 source: file,
-                format: detectImportFormat(explicit),
+                format,
                 mode: String(q.mode || 'auto'),
                 addColumns: flag(q.addColumns, true),
                 dryRun: flag(q.dryRun, false),

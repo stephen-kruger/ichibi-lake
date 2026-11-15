@@ -10,7 +10,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseImportSource, importAllowList, isImportSourceAllowed, buildImportSecretSql, S3_IMPORT_SECRET_NAME } from '../src/storage.js';
 import { contentTypeFormat, readSourceRequest } from '../src/import.js';
-import { detectImportFormat, importReader } from '../src/console/data.js';
+import { detectImportFormat, importReader, planZipImport } from '../src/console/data.js';
+import { ZipWriter } from '../src/zip.js';
 
 let passed = 0, failed = 0;
 async function test(name, fn) {
@@ -19,6 +20,18 @@ async function test(name, fn) {
 }
 
 const rejects400 = (raw) => assert.throws(() => parseImportSource(raw), (e) => e.statusCode === 400, `expected 400 for ${JSON.stringify(raw)}`);
+
+/** Build a ZIP archive on disk for the planZipImport() tests. */
+async function makeZip(entries) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ichibi-import-zip-'));
+    const file = path.join(dir, 'archive.zip');
+    const parts = [];
+    const zip = new ZipWriter(async (chunk) => { parts.push(Buffer.from(chunk)); });
+    for (const [name, data, opts] of entries) await zip.add(name, data, opts);
+    await zip.finish();
+    await fs.writeFile(file, Buffer.concat(parts));
+    return { file, dir };
+}
 
 async function run() {
     console.log('\n▸ import: object-storage sources');
@@ -89,6 +102,8 @@ async function run() {
         assert.equal(detectImportFormat('ndjson'), 'json');
         assert.equal(detectImportFormat('JSONL'), 'json');
         assert.equal(detectImportFormat('tsv'), 'csv');
+        assert.equal(detectImportFormat('zip'), 'zip');
+        assert.equal(detectImportFormat('', 'backup.ZIP'), 'zip');
         assert.throws(() => detectImportFormat('xlsx'), (e) => e.statusCode === 400);
     });
     await test('only a small JSON object with a "source" key is a load-from-object-storage request', async () => {
@@ -101,6 +116,74 @@ async function run() {
             assert.equal(await readSourceRequest(...await write('d', '{"id":1}')), null, 'a one-row object without "source" is data');
             const [big] = await write('e', `{"source":"s3://b/x","pad":"${'x'.repeat(70 * 1024)}"}`);
             assert.equal(await readSourceRequest(big, 70 * 1024 + 30), null, 'large bodies are data');
+        } finally {
+            await fs.rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    console.log('\n▸ import: ZIP archives');
+    await test('manifest files map back to table names; unlisted files use their file names', async () => {
+        const manifest = {
+            format: 'csv',
+            tables: [
+                { table: 'restored_orders', file: 'sanitised-name.csv' },
+                { table: 'restored_people', file: 'people.csv' },
+            ],
+        };
+        const { file, dir } = await makeZip([
+            ['sanitised-name.csv', 'id\n1\n'],
+            ['people.csv', 'id\n2\n'],
+            ['extra.csv', 'id\n3\n'],
+            ['nested/events.ndjson', '{"id":4}\n'],
+            ['manifest.json', JSON.stringify(manifest)],
+            ['__MACOSX/._junk', 'junk'],
+            ['.DS_Store', 'junk'],
+        ]);
+        try {
+            const picks = await planZipImport(file);
+            assert.deepEqual(picks.map(p => `${p.table}:${p.format}`),
+                ['restored_orders:csv', 'restored_people:csv', 'extra:csv', 'events:json']);
+        } finally {
+            await fs.rm(dir, { recursive: true, force: true });
+        }
+    });
+    await test('without a manifest, formats come from extensions', async () => {
+        const { file, dir } = await makeZip([
+            ['orders.csv', 'id\n1\n'],
+            ['facts.parquet', 'PAR1'],
+            ['events.ndjson', '{"id":2}\n'],
+        ]);
+        try {
+            const picks = await planZipImport(file);
+            assert.deepEqual(picks.map(p => `${p.table}:${p.format}`), ['orders:csv', 'facts:parquet', 'events:json']);
+        } finally {
+            await fs.rm(dir, { recursive: true, force: true });
+        }
+    });
+    await test('a manifest cannot point two files at one table, or at a missing file', async () => {
+        const duplicate = await makeZip([
+            ['a.csv', 'id\n1\n'], ['b.csv', 'id\n2\n'],
+            ['manifest.json', JSON.stringify({ format: 'csv', tables: [{ table: 'same', file: 'a.csv' }, { table: 'same', file: 'b.csv' }] })],
+        ]);
+        try {
+            await assert.rejects(planZipImport(duplicate.file), /more than one file/);
+        } finally {
+            await fs.rm(duplicate.dir, { recursive: true, force: true });
+        }
+        const missing = await makeZip([
+            ['a.csv', 'id\n1\n'],
+            ['manifest.json', JSON.stringify({ format: 'csv', tables: [{ table: 'x', file: 'missing.csv' }] })],
+        ]);
+        try {
+            await assert.rejects(planZipImport(missing.file), /no such file/);
+        } finally {
+            await fs.rm(missing.dir, { recursive: true, force: true });
+        }
+    });
+    await test('an archive with no importable data files is refused', async () => {
+        const { file, dir } = await makeZip([['__MACOSX/._junk', 'junk'], ['.DS_Store', 'junk']]);
+        try {
+            await assert.rejects(planZipImport(file), /no importable files/);
         } finally {
             await fs.rm(dir, { recursive: true, force: true });
         }

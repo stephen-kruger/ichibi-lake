@@ -769,54 +769,114 @@
      * The file is sent again for the real import, so nothing is staged on the server.
      */
     async function importDialog(ctx, { table = null, tables = null } = {}) {
-        const file = h('input', { type: 'file', accept: '.csv,.tsv,.txt,.parquet,.pq,.json,.ndjson,.jsonl' });
+        const file = h('input', { type: 'file', accept: '.csv,.tsv,.txt,.parquet,.pq,.json,.ndjson,.jsonl,.zip' });
         const format = h('select', {},
             h('option', { value: '' }, 'Detect from file name'),
-            h('option', { value: 'csv' }, 'CSV'), h('option', { value: 'parquet' }, 'Parquet'), h('option', { value: 'json' }, 'JSON / NDJSON'));
+            h('option', { value: 'csv' }, 'CSV'), h('option', { value: 'parquet' }, 'Parquet'),
+            h('option', { value: 'json' }, 'JSON / NDJSON'), h('option', { value: 'zip' }, 'ZIP archive (several tables)'));
+        const isArchive = (f) => /\.zip$/i.test(f?.name || '');
         const modeNew = h('input', { type: 'radio', name: 'import-mode', value: 'create', checked: !table });
         const modeAppend = h('input', { type: 'radio', name: 'import-mode', value: 'append', checked: !!table });
+        const modeReplace = h('input', { type: 'radio', name: 'import-mode', value: 'replace' });
         const newName = h('input', { type: 'text', placeholder: 'new_table_name' });
         const target = table
             ? h('input', { type: 'text', value: table, readOnly: true })
             : h('select', {}, (tables || []).map(t => h('option', { value: t }, t)));
         const addColumns = h('input', { type: 'checkbox', checked: true });
-        file.addEventListener('change', () => { if (file.files[0] && !newName.value) newName.value = suggestTableName(file.files[0].name); });
         const newField = field('New table name', newName, 'Letters, digits and underscores; must not start with "_".');
         const existingField = field('Existing table', target);
         const addField = h('label', { class: 'checkbox' }, addColumns, 'Add columns that the table does not have yet (otherwise they are skipped)');
+        const replaceLabel = h('label', {}, modeReplace, 'Replace existing table(s)');
+        const zipNote = h('div', { class: 'callout info' },
+            'A ZIP archive imports one table per file. Table names come from manifest.json (written by Export) or from the file names.');
         const syncMode = () => {
-            const append = modeAppend.checked;
-            newField.hidden = append;
-            existingField.hidden = !append;
+            if (isArchive(file.files[0])) format.value = 'zip';
+            const archive = isArchive(file.files[0]) || format.value === 'zip';
+            const append = modeAppend.checked || (archive && modeReplace.checked);
+            newField.hidden = append || archive;
+            existingField.hidden = !append || archive;
             addField.hidden = !append;
+            replaceLabel.hidden = !archive;
+            zipNote.hidden = !archive;
         };
+        file.addEventListener('change', () => {
+            const f = file.files[0];
+            if (!f) return;
+            if (isArchive(f)) {
+                format.value = 'zip';
+                newName.value = '';
+                modeNew.checked = true;
+            } else {
+                if (format.value === 'zip') format.value = '';
+                if (modeReplace.checked) {
+                    modeReplace.checked = false;
+                    if (table) modeAppend.checked = true; else modeNew.checked = true;
+                }
+                if (!newName.value) newName.value = suggestTableName(f.name);
+            }
+            syncMode();
+        });
+        format.addEventListener('change', syncMode);
         modeNew.addEventListener('change', syncMode);
         modeAppend.addEventListener('change', syncMode);
+        modeReplace.addEventListener('change', syncMode);
         syncMode();
         const ok = await modal({
             title: table ? `Import into ${table}` : 'Import data',
             body: h('div', { class: 'row-gap' },
-                field('File', file, 'CSV (header and types detected automatically), Parquet, or JSON (an array or one object per line).'),
+                field('File', file, 'CSV (header and types detected automatically), Parquet, JSON (an array or one object per line), or a ZIP archive from Export.'),
                 field('Format', format),
                 h('div', { class: 'radio-row' },
-                    h('label', {}, modeNew, 'Create a new table'),
-                    h('label', {}, modeAppend, 'Append to an existing table')),
-                newField, existingField, addField),
+                    h('label', {}, modeNew, 'Create new table(s)'),
+                    h('label', {}, modeAppend, 'Append to existing table(s)'),
+                    replaceLabel),
+                zipNote, newField, existingField, addField),
             actions: [{ label: 'Cancel', value: false }, { label: 'Preview', value: true, primary: true }],
             wide: true,
         });
         if (!ok) return;
         const f = file.files[0];
         if (!f) return toast('Choose a file to import.', 'error');
-        if (modeAppend.checked && !target.value) return toast('There is no table to append to.', 'error');
+        const archive = isArchive(f);
+        if (format.value === 'zip' && !archive) return toast('Choose a .zip file, or pick another format.', 'error');
+        const mode = archive && modeReplace.checked ? 'replace' : modeAppend.checked ? 'append' : 'create';
+        if (mode === 'append' && !archive && !target.value) return toast('There is no table to append to.', 'error');
         const opts = {
-            format: format.value,
-            mode: modeAppend.checked ? 'append' : 'create',
-            table: modeAppend.checked ? target.value : newName.value.trim(),
+            format: archive ? 'zip' : format.value,
+            mode,
+            table: archive ? '' : mode === 'append' ? target.value : newName.value.trim(),
             addColumns: addColumns.checked,
         };
         const preview = await withBusy(null, () => uploadImport(f, { ...opts, dryRun: true }));
         if (!preview) return;
+
+        if (preview.archive) {
+            const entries = preview.tables || [];
+            const shown = entries.slice(0, 200);
+            const confirmed = await modal({
+                title: `Import ${preview.totalRows.toLocaleString()} row(s) into ${preview.tableCount} table(s)?`,
+                body: h('div', { class: 'row-gap' },
+                    h('div', {}, `${f.name} · ZIP · ${preview.tableCount} file(s) · ${preview.totalRows.toLocaleString()} row(s)`),
+                    h('div', { class: 'table-wrap' }, h('table', {},
+                        h('thead', {}, h('tr', {}, h('th', {}, 'File'), h('th', {}, 'Table'), h('th', {}, 'Format'), h('th', {}, 'Rows'), h('th', {}, 'Columns'))),
+                        h('tbody', {}, shown.map(t => h('tr', {},
+                            h('td', { class: 'mono' }, t.file), h('td', { class: 'mono' }, t.table), h('td', {}, String(t.format).toUpperCase()),
+                            h('td', {}, (t.totalRows ?? 0).toLocaleString()), h('td', {}, String(t.columns?.length ?? 0))))))),
+                    shown.length < entries.length ? h('div', { class: 'muted small' }, `Showing the first ${shown.length} of ${entries.length}.`) : null,
+                    h('div', { class: 'help' }, mode === 'create' ? 'Existing tables are not overwritten.'
+                        : mode === 'replace' ? 'Existing tables are replaced, one table at a time.'
+                            : 'Rows are appended to existing tables.')),
+                actions: [{ label: 'Cancel', value: false }, { label: `Import ${preview.tableCount} table(s)`, value: true, primary: true }],
+                wide: true,
+            });
+            if (!confirmed) return;
+            const result = await withBusy(null, () => uploadImport(f, opts));
+            if (!result) return;
+            for (const t of result.tables || []) gridState.delete(t.table);
+            toast(`Imported ${result.inserted.toLocaleString()} row(s) into ${result.tableCount} table(s)`, 'success');
+            ctx.navigate('tables');
+            return;
+        }
 
         const planByName = new Map((preview.plan?.columns || []).map(c => [c.name.toLowerCase(), c]));
         const describe = (c) => {

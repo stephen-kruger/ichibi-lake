@@ -1,4 +1,4 @@
-# ichibi-lake Gateway v1.7.1.3
+# ichibi-lake Gateway v1.7.1.4
 
 ![ichibi-lake](graphics/ichibi-lake-2.jpg "iChibi Lake")
 
@@ -136,7 +136,7 @@ The gateway runs two DuckDB instances: a **primary** instance (connection pool) 
 | `JSON_BODY_LIMIT` | `50mb` | Max JSON request body size (e.g. `2gb`, `50mb`) |
 | `MAX_BATCH_SIZE` | `10000` | Max rows per `/upload` request; prevents OOM. Also editable live in the console. |
 | `INGEST_CONFLICT_RETRIES` | `10` | Attempts for an upsert/dedupe batch that loses a DuckLake commit race with a concurrent write to the same table, before it fails with HTTP 409 ([§9.2](#92-upserts--deduplication-key-columns)). Also editable live in the console. |
-| `IMPORT_MAX_MB` | `1024` | Largest file accepted by `POST /tables/:tableName/import` and the console import (HTTP 413 above it). Also editable live in the console. |
+| `IMPORT_MAX_MB` | `1024` | Largest file accepted by `POST /tables/:tableName/import` and the console import (HTTP 413 above it). A console ZIP import may expand to 10× this. Also editable live in the console. |
 | `IMPORT_TMP_DIR` | *OS temp dir*`/ichibi-import` | Where uploaded import files are staged (deleted after each request) |
 | `IMPORT_ALLOWED_SOURCES` | *(empty)* | Comma-separated `s3://bucket/prefix/` entries any writer may import from ([§9.4](#94-bulk-import-files--object-storage)). Other `s3://` sources need a superuser key. |
 | `IDEMPOTENCY_TTL_HOURS` | `24` | How long an `Idempotency-Key` result is replayed ([§9.5](#95-idempotent-retries)). Also editable live in the console. |
@@ -506,7 +506,7 @@ The image is **self-contained**: besides the gateway it bundles Postgres 18 (the
 | Tag | Published for |
 | :--- | :--- |
 | `ghcr.io/stephen-kruger/ichibi-lake:latest` | the latest commit on `main` |
-| `ghcr.io/stephen-kruger/ichibi-lake:1.7.1.3` | the git tag `v1.7.1.3` (releases) |
+| `ghcr.io/stephen-kruger/ichibi-lake:1.7.1.4` | the git tag `v1.7.1.4` (releases) |
 | `ghcr.io/stephen-kruger/ichibi-lake:sha-<commit>` | every published commit |
 
 **Standalone.** Mount a volume at `/data`: lake files, blobs, console storage settings, Postgres and Kafka all live there.
@@ -521,7 +521,7 @@ or in a compose file:
 ```yaml
 services:
   ichibi-lake:
-    image: ghcr.io/stephen-kruger/ichibi-lake:1.7.1.3
+    image: ghcr.io/stephen-kruger/ichibi-lake:1.7.1.4
     ports: [ "3000:3000" ]
     environment:
       - API_KEYS=change-me
@@ -969,7 +969,7 @@ Both formats accept `"maxRows": <n>` in the body to lower (never raise) the cap.
 | :--- | :--- | :--- |
 | `POST` | `/tables/:tableName/import` | Load a CSV, Parquet, NDJSON or JSON-array file (raw request body), or objects from S3 |
 
-**Uploading a file.** Send the file itself as the request body (not multipart). The gateway streams it to a temp file (`IMPORT_TMP_DIR`), so the size is bounded by `IMPORT_MAX_MB` (HTTP 413 above it), not by memory or `JSON_BODY_LIMIT`, then loads it with DuckDB: `read_csv` (header, delimiter and types auto-detected), `read_parquet` or `read_json_auto` (a JSON array or one object per line). The format comes from `?format=csv|parquet|json|ndjson`, or else from the `Content-Type` (`text/csv`, `application/vnd.apache.parquet`, `application/json`, `application/x-ndjson`).
+**Uploading a file.** Send the file itself as the request body (not multipart). The gateway streams it to a temp file (`IMPORT_TMP_DIR`), so the size is bounded by `IMPORT_MAX_MB` (HTTP 413 above it), not by memory or `JSON_BODY_LIMIT`, then loads it with DuckDB: `read_csv` (header, delimiter and types auto-detected), `read_parquet` or `read_json_auto` (a JSON array or one object per line). The format comes from `?format=csv|parquet|json|ndjson`, or else from the `Content-Type` (`text/csv`, `application/vnd.apache.parquet`, `application/json`, `application/x-ndjson`). ZIP archives are console-only (below), because one archive holds several tables.
 
 ```sh
 curl -X POST "http://ichibi-lake:3333/tables/sales/import" \
@@ -1403,7 +1403,7 @@ Resetting a setting removes the override and returns to the `docker/.env` value 
 - **Tables** (admins): create tables with a column builder, rename them (table ACLs, RBAC table permissions and pruning rules follow the new name; API clients using the old name will fail), and drop them, which requires typing the table name. Tables referenced by a property graph cannot be renamed or dropped, and their columns cannot be renamed or dropped, until the graph is removed.
 - **Export** (all console users): **Export** on a table's page downloads it as Parquet, CSV or NDJSON, optionally only the rows matching the grid's current filters and search, in its sort order, with an optional row limit. It uses the same engine and limits as `GET /tables/:tableName/export` ([§8.1](#81-exporting-tables)): streamed, capped at `EXPORT_MAX_ROWS`, at most `EXPORT_CONCURRENCY` at once. Exports are recorded in the audit log.
 - **Export several tables** (all console users): **Export** on the table list downloads the ticked tables (all by default; filter the list and use **Select all** / **Select none**) as one ZIP file, `lake-export-<UTC time>.zip`, with a Parquet, CSV or NDJSON file per table and a `manifest.json` listing each table's row count and whether it was truncated. All tables are read in **one transaction**, so the files are consistent with each other even while data is being written. CSV and NDJSON files are compressed in the ZIP; Parquet files are stored as they are (already compressed). The ZIP is streamed, with Parquet tables staged one at a time in `EXPORT_TMP_DIR`. The whole download takes one `EXPORT_CONCURRENCY` slot, and `EXPORT_MAX_ROWS` and `EXPORT_TIMEOUT_MS` apply **per table**. System tables are never included. Recorded in the audit log as `tables.export`. Console API: `GET /console/api/data/export?format=parquet|csv|ndjson&tables=a,b` (omit `tables` for every user table). For lakes of tens of GB, back up the storage and the Postgres catalog instead of downloading through the browser.
-- **Import** (admins): **Import** on the table list (new table or append) or on a table's page (append) loads a **CSV** (header, delimiter and column types detected automatically), **Parquet** or **JSON** file (an array of objects, or one object per line). **Preview** reads the file without writing anything and shows the detected columns and types, the row count, the first 20 rows and, when appending, what happens to each column: *matches*, *cast to* the table's type, *widened* (STRUCT), *column will be added*, or *skipped*, plus columns missing from the file (left NULL; `created`/`updated` timestamp columns are filled with the import time). Appending follows the same schema-evolution rules as `POST /upload`; untick **Add columns** to skip new columns instead. The insert is a single statement, so a row that cannot be converted fails the whole import and no rows are added. Files are limited to `IMPORT_MAX_MB` (default 1024 MB, editable on the **Ingestion** page), streamed to a temp file (`IMPORT_TMP_DIR`, default the OS temp dir) and deleted afterwards; nothing is kept between Preview and Import (the browser sends the file again), so it works behind a load balancer. Imported tables, like console-created ones, have no ACL row. Imports are recorded in the audit log.
+- **Import** (admins): **Import** on the table list (new table or append) or on a table's page (append) loads a **CSV** (header, delimiter and column types detected automatically), **Parquet**, **JSON** file (an array of objects, or one object per line), or a **ZIP archive** such as one produced by **Export**. A ZIP imports one table per file: table names and the export format come from the archive's `manifest.json` when present, otherwise from each file's name and extension. ZIP modes are create, append or replace for every table; each table is imported in its own transaction, so if a later file fails the error names the tables already imported. **Preview** reads the file without writing anything and shows the detected columns and types, the row count, the first 20 rows and, when appending, what happens to each column: *matches*, *cast to* the table's type, *widened* (STRUCT), *column will be added*, or *skipped*, plus columns missing from the file (left NULL; `created`/`updated` timestamp columns are filled with the import time); for a ZIP it lists every file with its target table, format, row count and column count. Appending follows the same schema-evolution rules as `POST /upload`; untick **Add columns** to skip new columns instead. The insert is a single statement, so a row that cannot be converted fails the whole import and no rows are added. Files are limited to `IMPORT_MAX_MB` (default 1024 MB, editable on the **Ingestion** page; a ZIP may expand to 10× that), streamed to a temp file (`IMPORT_TMP_DIR`, default the OS temp dir) and deleted afterwards; nothing is kept between Preview and Import (the browser sends the file again), so it works behind a load balancer. For an exact round trip use Parquet or NDJSON (CSV applies formula protection on export). Imported tables, like console-created ones, have no ACL row. Imports are recorded in the audit log.
 - **Not shown**: system tables (prefixed `_`, e.g. RBAC users, ACLs, console logins and settings) never appear here; they are managed on their own pages. Tables created from the console have no ACL row, so only RBAC superusers can reach them through the REST API until an ACL is set (`PATCH /tables/:name/acl`).
 
 Every change (cell edits, inserts, deletes, schema and table changes) is recorded in the audit log with the table, row and column, but not the cell values.
@@ -1592,7 +1592,7 @@ npm run test:dates             # Browser-local DATE/TIMESTAMP display: parsing, 
 npm run test:sql-guard         # Read-only / introspection guard for user-supplied SQL (no Docker needed)
 npm run test:sql-tables        # Table extraction for table-scoped SQL, against DuckDB's parser (no Docker needed)
 npm run test:storage           # Object-storage config, S3 secret SQL and maintenance settings (no Docker needed)
-npm run test:zip               # Streaming ZIP writer used by multi-table exports (no Docker needed)
+npm run test:zip               # Streaming ZIP writer and importer/reader used by multi-table exports and imports (no Docker needed)
 npm run test:storage-config    # Storage page: saved settings, confirm/revert after failed starts, form validation (no Docker needed)
 npm run test:maintenance       # Data inlining and scheduled lake maintenance (file counts drop), against the running stack
 npm run test:orderby           # DuckLake ORDER BY corruption regression (no Docker needed)

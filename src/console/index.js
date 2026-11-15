@@ -783,8 +783,12 @@ export function createConsoleRouter() {
             await receiveUpload(req, file);
             const result = await data.importFile(file, options);
             if (!options.dryRun) {
-                await audit(req, 'table.import', `${result.table}: ${result.inserted} row(s) from ${filename || 'upload'} (${format}, ${options.mode})` +
-                    (result.added?.length ? `; added column(s) ${result.added.join(', ')}` : ''));
+                if (result.archive) {
+                    await audit(req, 'tables.import', `${result.tableCount} table(s): ${result.tables.map(t => t.table).join(', ').slice(0, 500)} from ${filename || 'upload'} (zip, ${options.mode})`);
+                } else {
+                    await audit(req, 'table.import', `${result.table}: ${result.inserted} row(s) from ${filename || 'upload'} (${format}, ${options.mode})` +
+                        (result.added?.length ? `; added column(s) ${result.added.join(', ')}` : ''));
+                }
             }
             res.json({ success: true, ...result });
         } finally {
