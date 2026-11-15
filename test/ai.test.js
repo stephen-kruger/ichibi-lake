@@ -9,7 +9,7 @@ import http from 'node:http';
 
 // Settings snapshot docker/.env values at import time, so set the key first.
 process.env.OPENAI_API_KEY = 'sk-test-1234567890abcdef';
-const { extractParams, bindParams, plainValue, aiConfig, isConfigured, testSettings, settingsView, AI_SETTINGS, terms, scoreTable, schemaText, pickExamples, paramLiteral, normaliseParamDefs, functionSignature, PARAM_TYPES, inlineParams, normaliseChart } = await import('../src/console/ai.js');
+const { extractParams, bindParams, plainValue, aiConfig, isConfigured, testSettings, settingsView, AI_SETTINGS, terms, scoreTable, schemaText, inferRelationships, pickExamples, paramLiteral, normaliseParamDefs, functionSignature, PARAM_TYPES, inlineParams, normaliseChart } = await import('../src/console/ai.js');
 const { SECTIONS, getSettingDef, normaliseSettingValue } = await import('../src/console/registry.js');
 
 let passed = 0, failed = 0;
@@ -265,6 +265,25 @@ async function run() {
     await test('a schema that fits is listed in full', () => {
         const text = schemaText([table('a', ['x', 'y']), table('b', ['z'])], 'anything');
         assert.match(text, /^- a \(10 rows\): x VARCHAR, y VARCHAR\n- b \(10 rows\): z VARCHAR$/);
+    });
+    await test('declared keys and likely relationships are shown in the schema', () => {
+        const tables = [
+            { name: 'customers', rows: 2, keys: ['id'], columns: ['id BIGINT', 'name VARCHAR'] },
+            { name: 'orders', rows: 3, keys: ['id'], columns: ['id BIGINT', 'customer_id BIGINT', 'total DECIMAL(10,2)'] },
+        ];
+        assert.deepEqual(inferRelationships(tables), ['orders.customer_id -> customers.id']);
+        const text = schemaText(tables, 'orders');
+        assert.match(text, /^- customers \(2 rows\) \[keys: id\]: id BIGINT, name VARCHAR/);
+        assert.match(text, /Likely relationships \(inferred from column names; DuckLake does not enforce foreign keys\):\n- orders\.customer_id -> customers\.id/);
+        assert.deepEqual(inferRelationships([table('orders', ['order_id'])]), [], 'no target table, no relationship');
+        assert.deepEqual(inferRelationships([
+            { name: 'meters', rows: 1, keys: ['meter_code'], columns: ['meter_code VARCHAR'] },
+            { name: 'readings', rows: 1, columns: ['meter_id BIGINT'] },
+        ]), ['readings.meter_id -> meters.meter_code'], 'a declared key is the join target');
+        assert.deepEqual(inferRelationships([
+            { name: 'addresses', rows: 1, keys: ['id'], columns: ['id BIGINT'] },
+            { name: 'orders', rows: 1, columns: ['address_id BIGINT'] },
+        ]), ['orders.address_id -> addresses.id'], 'plural -es table names match');
     });
     await test('a large schema keeps columns for the relevant tables and names for the rest', () => {
         const wide = (name) => table(name, Array.from({ length: 300 }, (_, i) => `column_number_${i}`));

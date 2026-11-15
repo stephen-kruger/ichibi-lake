@@ -35,7 +35,7 @@ import { randomBytes } from 'crypto';
 import { execute, serializeSql, findLakeTable, streamUserSql } from '../db.js';
 import { assertReadOnlySql } from '../sql-guard.js';
 import { analyzeUserSql } from '../sql-tables.js';
-import { getTableKeys } from '../table-keys.js';
+import { getTableKeys, KEYS_TABLE } from '../table-keys.js';
 import { SETTINGS, normaliseSettingValue, maskSecret } from './registry.js';
 import * as store from './store.js';
 import { listTables, quoteIdent, quoteLiteral, isSystemTable, httpError, cleanDuckDbError } from './data.js';
@@ -46,6 +46,8 @@ const AI_KEYS = new Set(AI_SETTINGS.map(s => s.key));
 const DISPLAY_MAX_ROWS = 1000;       // rows returned to the browser per result
 const MODEL_CELL_CHARS = 200;        // characters per cell sent to the model
 const SCHEMA_PROMPT_CHARS = 24000;   // budget for the table list in the system prompt
+const SCHEMA_RELATION_MAX = 80;      // inferred relationships listed in the system prompt
+const SQL_DIALECT = 'DuckDB';        // the only dialect the model may write
 const EXAMPLE_COUNT = 4;             // saved functions shown as worked examples
 const EXAMPLE_SQL_CHARS = 1500;      // per example; longer ones are skipped
 const CALLABLE_COUNT = 25;           // saved functions offered to the model as run_function targets
@@ -632,15 +634,39 @@ export async function exportFunctionCsv(id, params, res) {
 
 // --- Asking the model ------------------------------------------------------------------
 
+/**
+ * Declared key columns per table ({ tableName: [columns] }), read in one query
+ * so the prompt can show them. Empty when no keys are declared (or on an
+ * older lake without the system table).
+ */
+async function declaredKeys() {
+    const out = new Map();
+    try {
+        const rows = await execute(`SELECT table_name, key_columns FROM ${KEYS_TABLE} ORDER BY updated_at DESC`);
+        const seen = new Set();
+        for (const r of rows) {
+            const name = String(r.table_name);
+            if (seen.has(name)) continue;   // newest row wins, including a cleared key list
+            seen.add(name);
+            try {
+                const keys = JSON.parse(r.key_columns || '[]');
+                if (Array.isArray(keys) && keys.length) out.set(name, keys.map(String));
+            } catch { /* ignore a malformed history row */ }
+        }
+    } catch { /* no key metadata */ }
+    return out;
+}
+
 async function lakeSchema() {
     const cols = await execute(
         `SELECT table_name, column_name, data_type FROM information_schema.columns
          WHERE table_catalog = 'ducklake' AND table_schema = 'main' ORDER BY table_name, ordinal_position`);
     const counts = new Map((await listTables()).map(t => [t.name, t.rows]));
+    const keys = await declaredKeys();
     const tables = new Map();
     for (const c of cols) {
         if (isSystemTable(c.table_name)) continue;
-        if (!tables.has(c.table_name)) tables.set(c.table_name, { name: c.table_name, rows: counts.get(c.table_name) ?? null, columns: [] });
+        if (!tables.has(c.table_name)) tables.set(c.table_name, { name: c.table_name, rows: counts.get(c.table_name) ?? null, keys: keys.get(c.table_name) || [], columns: [] });
         // Written as they must appear in SQL: quoted unless a plain lowercase word.
         const col = /^[a-z_][a-z0-9_]*$/.test(c.column_name) ? c.column_name : quoteIdent(c.column_name);
         tables.get(c.table_name).columns.push(`${col} ${c.data_type}`);
@@ -687,6 +713,73 @@ export function scoreTable(table, qTerms, questionText = '') {
     return score;
 }
 
+/** Crude English singular for table-name matching (orders -> order). */
+function singular(word) {
+    if (word.length > 3 && word.endsWith('ies')) return `${word.slice(0, -3)}y`;
+    if (word.length > 4 && /(ses|xes|zes|ches|shes)$/.test(word)) return word.slice(0, -2);
+    if (word.length > 3 && word.endsWith('s') && !/(ss|us|is)$/.test(word)) return word.slice(0, -1);
+    return word;
+}
+
+/** The SQL name in a "name TYPE" column definition, quoted or not. */
+function columnName(def) {
+    const text = String(def).trim();
+    if (!text.startsWith('"')) return text.split(/\s+/)[0];
+    let name = '';
+    for (let i = 1; i < text.length; i++) {
+        if (text[i] !== '"') { name += text[i]; continue; }
+        if (text[i + 1] === '"') { name += '"'; i++; continue; }
+        break;
+    }
+    return name;
+}
+
+/**
+ * Likely join relationships: a column named <table>_id, <table>_key or
+ * <table>_uuid that points at another table's declared key or id column.
+ * DuckLake has no foreign keys, so these are inferred from naming and shown
+ * to the model as hints, never as constraints.
+ */
+export function inferRelationships(tables, limit = SCHEMA_RELATION_MAX) {
+    const byName = new Map();
+    const bySingular = new Map();
+    for (const t of tables) {
+        const lower = String(t.name).toLowerCase();
+        byName.set(lower, t);
+        const s = singular(lower);
+        if (!bySingular.has(s)) bySingular.set(s, t);
+    }
+    const out = [];
+    const seen = new Set();
+    for (const t of tables) {
+        for (const def of t.columns || []) {
+            const name = columnName(def);
+            const m = /^(.+?)_(id|key|uuid)$/i.exec(name);
+            if (!m) continue;
+            const base = m[1].toLowerCase();
+            const target = byName.get(base) || byName.get(`${base}s`) || bySingular.get(base);
+            if (!target || target.name.toLowerCase() === t.name.toLowerCase()) continue;
+            const targetNames = (target.columns || []).map(columnName);
+            const lowerNames = targetNames.map(n => n.toLowerCase());
+            const declared = (target.keys || []).find(k => lowerNames.includes(String(k).toLowerCase()));
+            const ref = declared || targetNames[lowerNames.indexOf('id')];
+            if (!ref) continue;
+            const line = `${t.name}.${name} -> ${target.name}.${ref}`;
+            if (seen.has(line)) continue;
+            seen.add(line);
+            out.push(line);
+            if (out.length >= limit) return out;
+        }
+    }
+    return out;
+}
+
+function relationshipText(tables) {
+    const relationships = inferRelationships(tables);
+    if (!relationships.length) return '';
+    return `\nLikely relationships (inferred from column names; DuckLake does not enforce foreign keys):\n${relationships.map(r => `- ${r}`).join('\n')}`;
+}
+
 /**
  * Table list for the system prompt. Everything with full column lists when it
  * fits SCHEMA_PROMPT_CHARS; otherwise the tables that best match the question
@@ -696,10 +789,12 @@ export function scoreTable(table, qTerms, questionText = '') {
 export function schemaText(tables, question = '') {
     if (!tables.length) return 'There are no user tables yet.';
     const rows = (t) => (t.rows === null ? '' : ` (${Number(t.rows).toLocaleString('en-US')} rows)`);
-    const fullLine = (t) => `- ${t.name}${rows(t)}: ${t.columns.join(', ')}`;
+    const keys = (t) => (t.keys?.length ? ` [keys: ${t.keys.join(', ')}]` : '');
+    const fullLine = (t) => `- ${t.name}${rows(t)}${keys(t)}: ${t.columns.join(', ')}`;
     const nameLine = (t) => `- ${t.name}${rows(t)}, ${t.columns.length} columns`;
+    const relationships = relationshipText(tables);
     const full = tables.map(fullLine).join('\n');
-    if (full.length <= SCHEMA_PROMPT_CHARS) return full;
+    if (full.length + relationships.length <= SCHEMA_PROMPT_CHARS) return `${full}${relationships}`;
 
     const qTerms = terms(question);
     const ranked = tables.map((t, i) => ({ t, i, score: scoreTable(t, qTerms, question) }))
@@ -715,7 +810,7 @@ export function schemaText(tables, question = '') {
     const parts = ['The schema is too large to list in full.'];
     if (detailed.length) parts.push('Tables that look relevant to the question, with their columns:', detailed.map(fullLine).join('\n'));
     if (rest.length) parts.push(`${detailed.length ? 'Other tables' : 'Tables'} (call describe_table for their columns):`, rest.sort((a, b) => a.name.localeCompare(b.name)).map(nameLine).join('\n'));
-    return parts.join('\n');
+    return `${parts.join('\n')}${relationships}`;
 }
 
 /**
@@ -773,8 +868,10 @@ function systemPrompt(tables, cfg, { question = '', examples = [], callable = []
         : 'For privacy you are never shown data values: tool results give only column names and row counts. Write the query that answers the question; the user sees its result.';
     return `You are the data analyst built into the admin console of ichibi-lake, a data lake gateway. Data is stored with DuckLake (Parquet files plus a Postgres catalog) and queried with DuckDB. You answer questions about the data by writing and running SQL with the run_sql tool.
 
+SQL dialect: ${SQL_DIALECT}. Write ${SQL_DIALECT} SQL only: PostgreSQL, MySQL, SQLite, T-SQL and other dialect syntax (for example TOP, backtick identifiers or GETDATE()) is invalid here.
+
 Rules for SQL:
-- Dialect: DuckDB SQL. Exactly one read-only SELECT per run_sql call (WITH ... SELECT is fine).
+- Exactly one read-only SELECT per run_sql call (WITH ... SELECT is fine).
 - Use only the tables listed below, by bare name. Double-quote identifiers that are not plain lowercase words or that are SQL keywords.
 - Not allowed: DDL or DML, table functions in FROM (read_csv, read_parquet, range, glob, ...), information_schema and duckdb_* catalogs, system tables (names starting with "_").
 - A guard rejects these words anywhere outside string literals and quoted identifiers: CREATE DROP INSERT UPDATE DELETE ALTER ATTACH DETACH COPY TRUNCATE MERGE REPLACE GRANT REVOKE VACUUM CHECKPOINT INSTALL LOAD EXPORT IMPORT CALL PRAGMA SET RESET USE. For example use regexp_replace() instead of replace(), and quote a column called "set".
@@ -791,6 +888,10 @@ Charts: the console can also draw the last result as a chart. When a chart shows
 Current time (UTC): ${new Date().toISOString()}
 
 ${examplesText(examples)}${callableText(callable)}
+How to read the schema below:
+- Every table has its row count, declared key columns ([keys: ...]) and every column with its DuckDB type.
+- Likely relationships (table.column -> table.column) are inferred from column names. DuckLake enforces no foreign keys: declared keys are maintained by ingestion, and relationships are hints, not constraints. Check that the columns and types fit before using a join, and call describe_table when unsure.
+
 Tables in the lake:
 ${schemaText(tables, question)}`;
 }
@@ -816,7 +917,7 @@ const TOOLS = [
         type: 'function',
         function: {
             name: 'run_sql',
-            description: 'Run one read-only DuckDB SELECT over the lake tables and return the column names, row count and the first rows.',
+            description: 'Run one read-only SELECT in the DuckDB SQL dialect over the lake tables and return the column names, row count and the first rows.',
             parameters: {
                 type: 'object',
                 properties: {
@@ -1035,6 +1136,7 @@ const PROPOSE_TOOL = {
 };
 
 const SUGGEST_PROMPT = `You turn a DuckDB SQL query into a reusable saved function with parameters.
+The dialect is DuckDB: keep the query's DuckDB syntax (do not rewrite it as PostgreSQL, MySQL, SQLite or T-SQL).
 
 Replace the hard-coded values a user would want to change between runs (dates and times, ids, names, categories, thresholds, LIMIT counts) with {{name}} placeholders. Leave everything else exactly as it is: the same tables, columns, joins, grouping and ordering. Do not parameterise identifiers (table or column names), keywords or SQL functions, and do not add parameters the query does not need; a query with no such values gets no parameters.
 
