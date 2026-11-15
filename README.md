@@ -1,4 +1,4 @@
-# ichibi-lake Gateway v1.7.1.2
+# ichibi-lake Gateway v1.7.1.3
 
 ![ichibi-lake](graphics/ichibi-lake-2.jpg "iChibi Lake")
 
@@ -506,7 +506,7 @@ The image is **self-contained**: besides the gateway it bundles Postgres 18 (the
 | Tag | Published for |
 | :--- | :--- |
 | `ghcr.io/stephen-kruger/ichibi-lake:latest` | the latest commit on `main` |
-| `ghcr.io/stephen-kruger/ichibi-lake:1.7.1.2` | the git tag `v1.7.1.2` (releases) |
+| `ghcr.io/stephen-kruger/ichibi-lake:1.7.1.3` | the git tag `v1.7.1.3` (releases) |
 | `ghcr.io/stephen-kruger/ichibi-lake:sha-<commit>` | every published commit |
 
 **Standalone.** Mount a volume at `/data`: lake files, blobs, console storage settings, Postgres and Kafka all live there.
@@ -521,7 +521,7 @@ or in a compose file:
 ```yaml
 services:
   ichibi-lake:
-    image: ghcr.io/stephen-kruger/ichibi-lake:1.7.1.2
+    image: ghcr.io/stephen-kruger/ichibi-lake:1.7.1.3
     ports: [ "3000:3000" ]
     environment:
       - API_KEYS=change-me
